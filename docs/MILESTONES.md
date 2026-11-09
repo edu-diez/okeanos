@@ -312,6 +312,25 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
+## Milestone 14 — Apple Silicon support
+
+**Scope:**
+- Native `aarch64-apple-darwin` target build via osxcross (or macOS CI runners), producing a native Apple Silicon binary.
+- macOS-specific packaging/signing notes; static analysis that the dependency tree remains pure Rust where possible (no C deps where avoidable).
+
+**Out of scope:** Cross-compilation from Linux runners without the macOS SDK (osxcross toolchain provisioning only); TUI visual changes.
+
+**Acceptance criteria:**
+- `cargo build --release --target aarch64-apple-darwin` succeeds in CI.
+- The Apple Silicon binary starts, parses CLI args, and prints `--help`/`--version`.
+- No new C dependencies introduced beyond those required by the osxcross toolchain itself.
+
+**Testing requirements:** CI build check for the `aarch64-apple-darwin` target only (no runtime execution on Linux runners).
+
+**Definition of Done:** CI green for the Apple Silicon target; milestone tagged.
+
+---
+
 ## Milestone summary table
 
 | Milestone | Deliverable | Sessions (est.) | Builds on |
@@ -330,3 +349,4 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 11 | TUI shell | 2–3 | M2, M4, M5 |
 | 12 | Git snapshots + undo/redo | 2 | M6 |
 | 13 | Headless/RPC | 2 | M2, M8, M11 |
+| 14 | Apple Silicon support | 1–2 | M0 |
