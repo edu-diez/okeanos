@@ -1,0 +1,250 @@
+# ARCHITECTURE.md — Rust CLI TUI Agent Harness
+
+**Status:** Phase 4 — architecture (docs only, no implementation code)  
+**Owner:** Workflow manager / architecture  
+**Related:** PRODUCT_SPEC.md, DESIGN.md, Phase 2 tech-selection research
+
+---
+
+## Major subsystems
+
+| Subsystem | Responsibility | Key traits/interfaces |
+|-----------|----------------|-----------------------|
+| **CLI entry** (`src/main.rs`) | Argument parsing (clap), mode selection (interactive/headless/RPC), binary startup/shutdown, signal handling (tokio `signal`), graceful shutdown orchestration. | `Cli` (clap derive), `Mode` enum, `ShutdownHandler` |
+| **Config** (`src/config/`) | XDG global config + project-local config walk-up, TOML parsing, env var / file secret substitution, defaults, validation. | `Config`, `ConfigLayer`, `SecretRef` |
+| **ReAct loop** (`src/harness/react.rs`) | Core control flow: think → call tool → observe → repeat; context-cap enforcement; bounded retries; error-in-context. | `Harness`, `ReactLoop`, `LoopDecision` |
+| **Model abstraction** (`src/model/`) | Provider-agnostic chat completions + streaming; capability negotiation; OpenAI-compatible/OpenRouter at launch; mock provider for tests. | `Model` trait, `ModelCapabilities`, `OpenAICompatible` provider, `MockModel` |
+| **Tool system** (`src/tool/`) | JSON-schema function calling; text-based tool calling for models without native FC; tool registry; execution with permission checks; lenient parse + validate-before-execute; edit format (diff/patch + whole-file fallback); interruptible tool execution. | `Tool` trait, `ToolSpec` (JSON schema), `ToolRegistry`, `TextToolParser`, `EditFormat`, `ToolExecutor` |
+| **Permission layer** (`src/perm/`) | Safe-by-default boundary: allow-list, confirm-before-write/delete/network, local process execution sandboxing. | `Policy`, `Permission`, `ApprovalDecision` |
+| **Tool execution** (`src/tool/execute/`) | Interruptible local process execution; streaming output; configurable timeout; SIGTERM→grace→SIGKILL on cancel; SIGKILL on timeout; drain-after-exit; head/tail output truncation counted vs cap. | `ToolExecutor`, `ProcessHandle`, `StreamBuffer` |
+| **Edit format** (`src/tool/edit/`) | Diff/patch default for frontier; whole-file/str_replace fallback for small models; per-model edit-format hint; preflight-validate patches before applying; never silently truncate or partially apply. | `EditFormat`, `PatchValidator`, `PatchApplier` |
+| **Cost budget** (`src/cost/`) | Opt-in hard session cost cap (USD); per-turn soft warning threshold; fail closed on unknown pricing; refuse new tool calls exceeding cap; let in-flight work finish. | `CostBudget`, `CostTracker` |
+| **Conversation & context** (`src/context/`) | Message history, tiered system prompt + `skills/` concatenation, hard context cap, context-cap error, approximate token counting, cost estimation, selective file inclusion, history-turn capping per tier, context window warnings before cap. | `Conversation`, `ContextCap`, `TokenCounter`, `CostEstimate`, `Tier`, `SelectiveContext`, `ContextWarnings` |
+| **Session resume** (`src/session/`) | Append-only JSONL log, session header (id, cwd, version), resume by session ID, project-scoped session directory, corrupted-line tolerance. | `SessionLog`, `SessionHeader`, `ResumeStore` |
+| **Session log** (`src/session/`) | Append-only JSONL log of messages, tool calls, results, approvals, snapshot events; session header with id/cwd/version; resume by session ID; project-scoped storage. | `SessionLog`, `SessionHeader`, `ResumeStore` |
+| **Git snapshots** (`src/snapshot/`) | gix-based git snapshots before destructive actions and on `/undo`/`/redo` boundaries; snapshot store. | `SnapshotStore`, `UndoRedo` |
+| **TUI** (`src/ui/`) | Terminal rendering per DESIGN.md; ratatui + crossterm; themes from `assets/themes/`. | `TerminalApp`, `Theme`, components (conversation, tool panel, modal, status bar, …) |
+| **Headless/RPC** (`src/headless.rs`) | JSON event emitter shared with TUI; stdio or JSON-RPC transport; identical event stream to TUI (DESIGN.md §7). | `HeadlessDriver`, `JsonRpcServer` (feature-gated) |
+| **Logging** | `tracing` spans/events; JSON subscriber via tracing-subscriber; `RUST_LOG` filtering. | — |
+
+## Ownership boundaries
+
+- **Harness owns:** ReAct loop state, context cap, retry policy, dispatch to tools/models, approval gating. It is the single source of truth for task progress.
+- **Model owns:** Provider-specific request/response shaping, auth headers, SSE stream parsing, capability negotiation, text-based tool output parsing. The harness never touches provider internals directly.
+- **Model capabilities own:** Declared per-model capabilities (tool_calling, structured_output, thinking, max_context, max_output, temperature_supported). Explicit TOML override for local/self-hosted models; fail closed on missing required capability.
+- **Text tool parsing owns:** Parsing raw model output into tool invocations for models without native function calling; lenient repair of common quote/bracket errors.
+- **Selective context owns:** Choosing which files to include based on task relevance (symbol scanning via ripgrep, pure Rust); capping history turns per model tier.
+- **Edit format owns:** Diff/patch vs whole-file decision per model tier; preflight validation of patches before applying; never silently truncates or partially applies.
+- **Tool execution owns:** Streaming output capture, timeout enforcement, cancellation signal handling (SIGTERM→grace→SIGKILL), drain-after-exit; no tool execution blocks the ReAct loop indefinitely.
+- **Cost budget owns:** Session cost cap enforcement (USD), per-turn soft warnings, fail-closed on unknown pricing; refuses new tool calls exceeding cap, lets in-flight work finish.
+- **Tool owns:** Its own JSON schema, argument validation, execution, and result shaping. The permission layer wraps tool execution; tools do not bypass it.
+- **Permission layer owns:** The allow-list and approval decisions. No tool executes a write/delete/network operation without policy approval.
+- **Session log owns:** Append-only durability. It is write-only after creation; snapshots reference log positions.
+- **Snapshot store owns:** Git object writes via gix; undo/redo cursor. It never mutates the working tree outside policy-approved operations.
+- **TUI owns:** Rendering only. It consumes the event stream produced by the harness/headless layer and displays it. It does not drive the ReAct loop.
+- **Headless/RPC owns:** Transport serialization (JSON over stdout/stdio/HTTP). Same event structs as the TUI renderer.
+
+## Public vs private state
+
+**Public (cross-subsystem, serialized):**
+- `Message` (role, content, tool_calls, tool_call_id, ts)
+- `ToolCall` / `ToolResult` (id, name, args, output, ok, duration_ms, truncated)
+- `ApprovalRequest` / `Approval` (id, tool, args, decision)
+- `Todo` (id, title, done)
+- `Status` (model, tokens_in/out, cost, elapsed, retries, mode)
+- `Config` (model, provider, context_cap, max_iterations, max_elapsed_sec, allow_list)
+- `ModelCapabilities` (tool_calling, structured_output, thinking, max_context, max_output, temperature_supported, tier)
+- `Tier` (small / frontier) — selects prompt template, tool subset, generation params
+- `EditFormatHint` (diff / whole_file / str_replace) — per-model edit format selection
+- `CostBudget` (session_cap_usd, per_turn_warning_usd, spent_usd) — opt-in cost enforcement
+- `ToolResult` (id, name, args, output, ok, duration_ms, truncated, exit_code, timed_out, cancelled)
+- Snapshot refs and log positions
+- Session header (`id`, `cwd`, `version`, `started_at`)
+- `ThinkingEvent` (optional, separate from visible message stream)
+
+**Private (encapsulated within subsystem):**
+- Harness: retry counters, in-flight ReAct iteration, loop-control flags, iteration counter, elapsed timer
+- Config: resolved config layers, secret substitution cache
+- Model: HTTP client, auth token, SSE buffer, provider config, capabilities, thinking buffer
+- Permission: allow-list entries, session allow-always grants
+- Context: rolling token estimate, cap threshold, model metadata table, tier, selected files, history turn cap, warning threshold
+- Text tool parser: lenient parse state, repair rules
+- Tool execution: streaming buffer, process handle, timeout state, cancellation token
+- Cost budget: session spent, cap threshold, warning threshold
+- TUI: scroll offsets, cursor blink state, focus ring, animation frame
+- Session log: file handle, buffer flush state, session id
+- Snapshot store: git repo handle, undo/redo cursor index
+- Shutdown: signal registration, drain state, flush timeout
+
+## Data flow
+
+```
+User prompt / RPC request
+        │
+        ▼
+CLI entry ──► Config load (global + project) ──► Mode (interactive | headless | rpc)
+        │
+        ▼
+Harness (ReAct loop)
+        ├─► Context (tiered prompt + skills/ + history + selective files, cap check, warnings)
+        ├─► Model (chat completion / stream; capabilities; thinking channel) ◄──┐
+        │                                                                       │
+        ├─► Text tool parsing (for models without native FC)                    │
+        │         └─► Validate parsed calls against schema before execution     │
+        │                                                                       │
+        ├─► Edit format (diff/patch or whole-file per tier; preflight validate) │
+        │                                                                       │
+        ├─► Permission (allow-list / approve)       │
+        │         ├─► Tool (execute, JSON schema or text-parsed)   │
+        │         │         └─► Tool execution (streaming, timeout, cancel)   │
+        │         └─► run: local process at boundary │
+        │                                           │
+        ├─► Cost budget (check before tool call; refuse if over cap)            │
+        ├─► Session log (append JSONL)              │
+        ├─► Snapshot store (git, before destructive)│
+        └─► Event stream (TUI + headless JSON)      │
+                                                        │
+        ▼                                               │
+TUI renderer (ratatui) ────────────────────────────────┘
+Headless/RPC (JSON over stdout/stdio/HTTP)
+```
+
+- The ReAct loop emits events to a single broadcast channel.
+- The TUI subscribes and renders; the headless driver serializes the same events to JSON.
+- Approval requests pause the loop; the loop resumes on an `Approval` event (from TUI modal or RPC).
+- Context cap errors propagate as a terminal `error` event; the loop stops cleanly.
+
+## Service boundaries
+
+- **Model service boundary:** `Model` trait is the only seam. Providers implement it; the harness depends on the trait, not on `reqwest` types directly (adapters convert). `Model` trait is text-in/text-out as primitive; native JSON tool calling is an optional capability, not a requirement.
+- **Model capability boundary:** `ModelCapabilities` is declared per-model (TOML override for local models); harness never guesses capabilities for self-hosted models.
+- **Text tool parsing boundary:** Raw model output is parsed into tool invocations leniently, then validated against the tool schema before execution. Invalid calls return structured errors; never execute unvalidated calls.
+- **Tool service boundary:** `Tool` trait + `ToolRegistry`. Built-in tools live in `src/tool/builtin/`; user tools register at runtime. Tool subset selected by model tier.
+- **Permission boundary:** `Policy::check(operation)` gates every write/delete/network/process call. The `run` tool executes local processes here, with allow-list on commands and args.
+- **Config boundary:** Config is loaded once at startup (global + project layers), validated, then treated as read-only. Secrets are substituted at load time and never logged.
+- **Shutdown boundary:** Signal handler owns SIGINT/SIGTERM; it flushes the session log, drains the ReAct loop, teardowns the TUI, then exits. No subsystem may block shutdown indefinitely.
+- **Transport boundary:** Headless/RPC transports (stdio JSON-RPC, optional HTTP) sit behind `HeadlessDriver`; the TUI has no transport dependency.
+- **Persistence boundary:** `SessionLog` and `SnapshotStore` are the only subsystems that touch the filesystem/git outside the permission layer.
+
+## Folder structure
+
+```
+okeanos/
+├── .github/               # CI workflows (build, test, clippy, fmt)
+├── assets/
+│   └── themes/
+│       ├── dark.toml      # design tokens, dark canvas
+│       └── light.toml     # design tokens, light canvas
+├── docs/
+│   ├── DESIGN.md          # Phase 1 visual design (art direction, tokens, parity map)
+│   ├── PRODUCT_SPEC.md    # Phase 3 product definition
+│   ├── ARCHITECTURE.md    # Phase 4 architecture (this file)
+│   ├── MILESTONES.md      # Phase 5 roadmap
+│   └── AGENTS.md          # Phase 6 agent instructions
+├── src/
+│   ├── main.rs            # CLI entry, mode selection, signals, shutdown orchestration
+│   ├── lib.rs             # harness crate root (public API)
+│   ├── cli.rs             # clap derive definitions
+│   ├── config/
+│   │   ├── mod.rs         # Config, ConfigLayer, load/walk-up
+│   │   └── secret.rs      # {env:VAR} / {file:path} substitution
+│   ├── harness/
+│   │   ├── mod.rs
+│   │   ├── react.rs       # ReAct loop, LoopDecision, iteration/elapsed limits
+│   │   ├── policy.rs      # approval policy wiring
+│   │   └── error.rs       # HarnessError (thiserror)
+│   ├── model/
+│   │   ├── mod.rs
+│   │   ├── trait.rs       # Model trait, ModelCapabilities, Tier
+│   │   ├── openai.rs      # OpenAI-compatible/OpenRouter provider
+│   │   ├── metadata.rs    # per-model context window + cost table + tier defaults
+│   │   ├── text_tool.rs   # lenient text-based tool call parsing for non-native FC models
+│   │   └── mock.rs        # MockModel (test-only, cfg(test) or test feature)
+│   ├── tool/
+│   │   ├── mod.rs
+│   │   ├── trait.rs       # Tool trait, ToolSpec
+│   │   ├── registry.rs    # ToolRegistry (tool subset by tier)
+│   │   ├── edit/          # diff/patch + whole-file fallback, preflight validation
+│   │   ├── execute/       # interruptible process execution, streaming, timeout
+│   │   └── builtin/
+│   │       ├── todo.rs
+│   │       ├── read.rs
+│   │       ├── write.rs
+│   │       ├── delete.rs
+│   │       ├── run.rs     # local process at permission boundary
+│   │       └── grep.rs
+│   ├── cost/
+│   │   └── budget.rs      # session cost cap, per-turn warnings, fail-closed pricing
+│   ├── perm/
+│   │   ├── mod.rs
+│   │   ├── policy.rs      # Policy, allow-list
+│   │   └── approval.rs    # ApprovalDecision, session grants
+│   ├── context/
+│   │   ├── mod.rs
+│   │   ├── conversation.rs
+│   │   ├── cap.rs         # hard context cap, ContextCap error
+│   │   ├── tokens.rs      # approximate token counter, CostEstimate
+│   │   ├── tier.rs        # model tier → prompt template + tool subset + generation params
+│   │   ├── selective.rs   # selective file inclusion (ripgrep symbol scan, pure Rust)
+│   │   └── warnings.rs    # context window warnings before hard cap
+│   ├── session/
+│   │   ├── log.rs         # append-only JSONL
+│   │   ├── header.rs      # session id, cwd, version
+│   │   └── resume.rs      # --resume <id>, project-scoped storage
+│   ├── snapshot/
+│   │   ├── mod.rs
+│   │   ├── store.rs       # gix-based snapshot store
+│   │   └── undo_redo.rs
+│   ├── ui/
+│   │   ├── mod.rs
+│   │   ├── theme.rs       # design tokens from assets/themes/
+│   │   ├── layout.rs      # responsive grid per DESIGN.md §4
+│   │   └── components/    # conversation, tool_panel, modal, status_bar, …
+│   ├── headless.rs        # JSON event emitter, stdio/JSON-RPC transports
+│   └── events.rs          # shared event structs (Message, ToolCall, Approval, …)
+├── tests/                 # integration tests (mock provider, harness logic)
+├── Cargo.toml
+├── rust-toolchain.toml
+├── .gitignore
+└── LICENSE
+```
+
+## Security model
+
+1. **Safe by default:** No write, delete, or network operation executes without policy approval. Read-only operations (read, grep, todo list) run without confirmation.
+2. **Allow-list:** Commands (for `run`), hosts (for model provider), and file paths are checked against an allow-list; defaults deny.
+3. **Confirm-before:** write/delete/network require explicit allow (TUI modal or RPC approval). `allow-always` grants are session-scoped and recorded in the session log.
+4. **Permission boundary for processes:** The `run` tool executes local processes inside the permission layer, with command/arg allow-listing and no shell interpolation where avoidable.
+5. **No secrets in logs:** `tracing` events must not log API keys, auth headers, or tool args containing secrets; args are redacted by default in log output.
+6. **Git sandbox:** Snapshots are taken only inside the session's working directory; gix never runs arbitrary git commands outside policy.
+7. **Static binary reduces supply-chain surface:** No libgit2/openssl FFI (gix + rustls), minimizing native dependencies.
+
+## Dependency rules
+
+- **Primary crates (Phase 2 recommendation):** ratatui + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC).
+- **No C dependencies** in the primary tree: avoid git2, openssl, rapidjson. Build with `--target x86_64-unknown-linux-musl` for full static.
+- **Feature flags:** `rpc` (jsonrpsee HTTP/WebSocket), `mcp` (lazy MCP client, deferred), `mock-provider` (test-only MockModel), `simd-json` (performance opt, deferred).
+- **Config crate rule:** `toml` is added only for config parsing; it sits in the CLI/config layer, never in the harness `lib`.
+- **Layering rule:** `src/lib` (harness) depends only on model/tool/perm/context/session/snapshot/events — never on `ui`, `headless`, or `cli`. UI and headless depend on the harness, not vice versa.
+- **No circular dependencies** between subsystems.
+
+## Testing strategy
+
+| Layer | Tooling | Scope |
+|-------|---------|-------|
+| Unit | `cargo test`, mock provider | ReAct loop, approval policy, context cap, tool execution, snapshot undo/redo, config load + secret substitution, token counter, model capability negotiation, text tool parsing, tier selection, edit format validation, tool execution interrupt/cancel — no network |
+| Integration | `tests/` | CLI modes, headless JSON event parity with TUI events, session log append, snapshot round-trip, `--resume` restore, graceful shutdown flush, small-model text-based tool calling, interruptible tool execution, cost cap enforcement |
+| TUI snapshot | golden buffer files | Rendered frame at 80×24 and 120×40; resize reflow; modal re-center |
+| Visual audit | automated contrast check | WCAG AA/AAA ratios per DESIGN.md §2 on both canvases |
+| Reduced motion | config toggle | No time-dependent frame changes when disabled |
+| Event parity | harness test harness | Every TUI state transition has a matching JSON event (DESIGN.md §7) |
+| Clippy/fmt | CI | `cargo clippy -- -D warnings`, `cargo fmt --check` |
+
+## Scalability considerations
+
+- **Context:** Hard cap at MVP (no compaction). Selective file inclusion and history-turn capping are tier-aware (small models get fewer files and turns). If compaction is added later, it lives in `src/context/` behind the `ContextCap` seam; the ReAct loop treats it as a context-source change, not a rewrite.
+- **Concurrency:** Single-threaded tokio `current_thread` for the ReAct loop. Parallel tool execution can be added later behind the `ToolRegistry` without changing the loop signature.
+- **Providers:** New providers implement `Model` + declare `ModelCapabilities`; no changes to harness logic. Provider selection is config-driven (feature flags at build time, env/CLI at runtime). Local/self-hosted models require explicit TOML capability override.
+- **Tools:** New tools implement `Tool` and register in the registry. Tool subset is selected by model tier; small models get a minimal subset. No harness changes.
+- **Transport:** stdio JSON-RPC first; HTTP/WebSocket via `jsonrpsee` behind the `rpc` feature. Adding a transport means implementing `HeadlessDriver`, not touching the loop.
+- **Session log:** Append-only JSONL is unbounded by design at MVP; rotation/archiving can be added in `src/session/` without affecting the loop.
