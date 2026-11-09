@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap (docs only, no implementation code)  
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0)  
 **Owner:** Workflow manager  
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -9,6 +9,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 ---
 
 ## Milestone 0 — Scaffolding & CLI
+
+**Status:** complete — tagged v0.1.0-milestone-0  
 
 **Scope:**
 - Rust workspace, `Cargo.toml` with Phase 2 stack (tokio `current_thread`, reqwest+rustls, clap derive, thiserror/anyhow, serde_json, tracing JSON).

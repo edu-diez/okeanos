@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # musl targets build reqwest/rustls → ring, which needs a C compiler.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Provision musl cross C toolchains so the musl targets can compile ring
+      # (required by reqwest's rustls-tls backend).
+      - name: Install musl cross toolchains
+        run: |
+          curl -fsSL https://musl.cc/x86_64-linux-musl-cross.tgz | tar -xz -C "$HOME"
+          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar -xz -C "$HOME"
+          echo "$HOME/x86_64-linux-musl-cross/bin:$HOME/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+
+      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo build --release --target aarch64-unknown-linux-musl
