@@ -1,7 +1,7 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0)  
-**Owner:** Workflow manager  
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1)
+**Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
 Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, introduces at most 2–3 subsystems, and produces a single testable deliverable. **No milestone starts until the previous one is tagged and CI-green.** Every feature from PRODUCT_SPEC.md is included — none deferred to post-MVP.
@@ -33,6 +33,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 1 — Config & secrets
 
+**Status:** complete — tagged v0.1.0-milestone-1
+
 **Scope:**
 - XDG global config (`~/.config/okeanos/config.toml`) + optional project-local config (`okeanos.toml` walked up from git root).
 - TOML parsing via `toml` crate (CLI/config layer only, never in harness `lib`).
@@ -49,7 +51,15 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for config layering, secret substitution, missing-secret failure, invalid-TOML rejection. No network.
 
-**Definition of Done:** CI green including config validation; milestone tagged.
+**Definition of Done:** CI green including config validation; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (13 config unit tests)
+- `cargo build --release` produces a single binary
+- Config loads from global + project layers with project override
+- `{env:VAR}` / `{file:path}` substitution verified; missing secret fails closed with clear error
+- Invalid TOML rejected with clear message
+- Tagged v0.1.0-milestone-1
 
 ---
 

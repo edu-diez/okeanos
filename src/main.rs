@@ -16,6 +16,9 @@ async fn main() -> anyhow::Result<()> {
     let mode = cli.mode();
     tracing::info!(mode = ?mode, "okeanos starting");
 
+    let _config = okeanos::config::Config::load().context("failed to load configuration")?;
+    tracing::info!("configuration loaded");
+
     match mode {
         Mode::Interactive => run_interactive(&cli).await,
         Mode::Headless => run_headless(&cli).await,
