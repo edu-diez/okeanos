@@ -18,11 +18,15 @@ jobs:
 
       # Provision musl cross C toolchains so the musl targets can compile ring
       # (required by reqwest's rustls-tls backend).
-      - name: Install musl cross toolchains
-        run: |
-          curl -fsSL https://musl.cc/x86_64-linux-musl-cross.tgz | tar -xz -C "$HOME"
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz | tar -xz -C "$HOME"
-          echo "$HOME/x86_64-linux-musl-cross/bin:$HOME/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      # musl.cc is unreliable from GitHub Actions; use a maintained action instead.
+      - name: Install musl cross toolchain (x86_64)
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: x86_64-unknown-linux-musl
+      - name: Install musl cross toolchain (aarch64)
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-unknown-linux-musl
 
       - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
