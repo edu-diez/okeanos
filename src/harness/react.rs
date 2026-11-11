@@ -140,9 +140,9 @@ impl<M: Model> ReactLoop<M> {
             }
             #[cfg(windows)]
             {
-                tokio::signal::windows::ctrl_c()
-                    .expect("failed to install Ctrl-C handler")
-                    .await;
+                let mut ctrl_c =
+                    tokio::signal::windows::ctrl_c().expect("failed to install Ctrl-C handler");
+                ctrl_c.recv().await;
             }
             if let Some(tx) = shutdown_tx_clone {
                 let _ = tx.send(()).await;
