@@ -2,37 +2,144 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  check:
+    name: Check (fmt, clippy, test)
     runs-on: ubuntu-latest
-    env:
-      # musl targets build reqwest/rustls → ring, which needs a C compiler.
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      # Provision musl cross C toolchains so the musl targets can compile ring
-      # (required by reqwest's rustls-tls backend).
-      # musl.cc is unreliable from GitHub Actions; use a maintained action instead.
-      - name: Install musl cross toolchain (x86_64)
-        uses: taiki-e/setup-cross-toolchain-action@v1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          target: x86_64-unknown-linux-musl
-      - name: Install musl cross toolchain (aarch64)
-        uses: taiki-e/setup-cross-toolchain-action@v1
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          target: aarch64-unknown-linux-musl
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - name: Check formatting
+        run: cargo fmt --check --all
 
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
-      - run: cargo build --release
-      - run: cargo build --release --target x86_64-unknown-linux-musl
-      - run: cargo build --release --target aarch64-unknown-linux-musl
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features
+
+  build-matrix:
+    name: Build ${{ matrix.os }} (${{ matrix.target }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: okeanos-x86_64-unknown-linux-gnu
+            musl: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: okeanos-x86_64-unknown-linux-musl
+            musl: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: okeanos-x86_64-apple-darwin
+            musl: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: okeanos-aarch64-apple-darwin
+            musl: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: okeanos-x86_64-pc-windows-msvc
+            musl: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain (Linux musl only)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          BINARY="okeanos"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            BINARY="${BINARY}.exe"
+          fi
+          ARTIFACT_DIR="target/${{ matrix.target }}/release"
+          mkdir -p artifacts
+          cp "${ARTIFACT_DIR}/${BINARY}" "artifacts/${BINARY}"
+          # Add shell completion and man page if they exist later
+          # For now just the binary
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts/
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build-matrix
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: okeanos-*
+          merge-multiple: false
+
+      - name: Verify artifacts
+        run: |
+          ls -la release-assets/
+          for dir in release-assets/okeanos-*/; do
+            echo "Checking $dir"
+            ls -la "$dir"
+            file "$dir"/okeanos* 2>/dev/null || true
+          done
+
+      - name: Create checksums
+        run: |
+          cd release-assets
+          for dir in okeanos-*/; do
+            (cd "$dir" && sha256sum okeanos* > SHA256SUMS.txt 2>/dev/null || shasum -a 256 okeanos* > SHA256SUMS.txt)
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/okeanos-*/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
