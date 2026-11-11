@@ -180,7 +180,7 @@ fn get_cache_dir() -> Result<PathBuf, CacheError> {
 mod tests {
     use super::*;
     use crate::model::ModelTier;
-    use crate::model::discovery::{DiscoveredModel, ModelPricing, minimal_fallback_models};
+    use crate::model::discovery::{DiscoveredModel, ModelPricing};
     use tempfile::tempdir;
 
     fn create_test_model(id: &str, tier: ModelTier) -> DiscoveredModel {
