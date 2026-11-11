@@ -3,7 +3,7 @@
 //! Milestone 1: config layering + secret substitution.
 
 pub mod cli;
-pub mod config;
+pub mod events;
 pub mod harness;
 
 pub use harness::error::HarnessError;

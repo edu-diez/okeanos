@@ -12,13 +12,11 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub use secret::substitute;
-
 /// Top-level configuration, populated from layered TOML files.
 ///
 /// All fields are optional so that partial configs are valid; missing fields
 /// are filled in by subsystem defaults later in the pipeline.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub model: Option<ModelSection>,
@@ -32,6 +30,38 @@ pub struct Config {
     pub cost: Option<CostSection>,
 }
 
+// Custom Debug impl that redacts sensitive fields (api_key)
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("model", &self.model)
+            .field(
+                "provider",
+                &self.provider.as_ref().map(RedactedProviderSection),
+            )
+            .field("context", &self.context)
+            .field("permissions", &self.permissions)
+            .field("cost", &self.cost)
+            .finish()
+    }
+}
+
+struct RedactedProviderSection<'a>(&'a ProviderSection);
+
+impl std::fmt::Debug for RedactedProviderSection<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSection")
+            .field("kind", &self.0.kind)
+            .field("base_url", &self.0.base_url)
+            .field(
+                "api_key",
+                &self.0.api_key.as_ref().map(|_| "***REDACTED***"),
+            )
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ModelSection {
     pub name: Option<String>,
@@ -40,8 +70,10 @@ pub struct ModelSection {
     pub max_output: Option<usize>,
     pub temperature: Option<f64>,
     pub edit_format: Option<String>,
+    pub skills_dir: Option<PathBuf>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProviderSection {
     pub kind: Option<String>,
@@ -56,6 +88,7 @@ pub struct ContextSection {
     pub max_elapsed_sec: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PermissionsSection {
     pub allow_list: Option<Vec<String>>,
@@ -100,9 +133,9 @@ pub enum ConfigError {
 impl Config {
     /// Load the global (XDG) config, overlay the project-local config, substitute
     /// secrets, and validate.
-    pub fn load() -> Result<Self, ConfigError> {
+    pub fn load(root: Option<&Path>) -> Result<Self, ConfigError> {
         let global = discover_global_config();
-        let project = discover_project_config();
+        let project = discover_project_config(root);
         Self::load_from(global.as_deref(), project.as_deref())
     }
 
@@ -131,7 +164,84 @@ impl Config {
             message: format!("failed to deserialize configuration: {e}"),
         })?;
 
+        // Validate after deserialization
+        config.validate()?;
+
         Ok(config)
+    }
+
+    /// Validate configuration values after deserialization.
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(ctx) = &self.context {
+            if let Some(cap) = ctx.cap
+                && cap == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "context.cap must be > 0".to_string(),
+                });
+            }
+            if let Some(max_iter) = ctx.max_iterations
+                && max_iter == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "context.max_iterations must be > 0".to_string(),
+                });
+            }
+            if let Some(max_elapsed) = ctx.max_elapsed_sec
+                && max_elapsed == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "context.max_elapsed_sec must be > 0".to_string(),
+                });
+            }
+        }
+
+        if let Some(cost) = &self.cost {
+            if let Some(session_cap) = cost.session_cap_usd
+                && session_cap < 0.0
+            {
+                return Err(ConfigError::Validation {
+                    message: "cost.session_cap_usd must be >= 0".to_string(),
+                });
+            }
+            if let Some(per_turn) = cost.per_turn_warning_usd
+                && per_turn < 0.0
+            {
+                return Err(ConfigError::Validation {
+                    message: "cost.per_turn_warning_usd must be >= 0".to_string(),
+                });
+            }
+        }
+
+        if let Some(model) = &self.model {
+            if let Some(tier) = &model.tier
+                && !matches!(tier.as_str(), "small" | "frontier")
+            {
+                return Err(ConfigError::Validation {
+                    message: format!("model.tier must be 'small' or 'frontier', got '{tier}'"),
+                });
+            }
+            if let Some(edit_format) = &model.edit_format
+                && !matches!(edit_format.as_str(), "diff" | "whole_file" | "str_replace")
+            {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "model.edit_format must be 'diff', 'whole_file', or 'str_replace', got '{edit_format}'"
+                    ),
+                });
+            }
+        }
+
+        if let Some(provider) = &self.provider
+            && let Some(kind) = &provider.kind
+            && kind != "openai-compatible"
+        {
+            return Err(ConfigError::Validation {
+                message: format!("provider.kind must be 'openai-compatible', got '{kind}'"),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -149,13 +259,15 @@ fn discover_global_config() -> Option<PathBuf> {
     if path.is_file() { Some(path) } else { None }
 }
 
-/// Discover the project-local config by walking up from CWD to the git root.
+/// Discover the project-local config by walking up from `start_dir` (or CWD) to the git root.
 ///
-/// Returns the first `okeanos.toml` found (closest to CWD). Walking stops at
+/// Returns the first `okeanos.toml` found (closest to `start_dir`). Walking stops at
 /// the directory containing a `.git` entry (the git root) or at the filesystem
 /// root.
-fn discover_project_config() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
+fn discover_project_config(start_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut dir = start_dir
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_dir().ok())?;
     loop {
         let candidate = dir.join("okeanos.toml");
         if candidate.is_file() {
@@ -239,6 +351,7 @@ fn substitute_secrets(value: &mut toml::Value, key_path: &str) -> Result<(), Con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::secret::substitute;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -503,5 +616,287 @@ api_key = "{{file:{}}}"
         }
         assert!(found.is_some());
         assert!(found.unwrap().ends_with(".config/okeanos/config.toml"));
+    }
+
+    #[test]
+    fn test_discover_project_config_from_root() {
+        let dir = tmp_dir();
+        let project_root = dir.join("project");
+        let subdir = project_root.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        write_file(
+            &project_root.join("okeanos.toml"),
+            "[provider]\nkind = \"test\"\n",
+        );
+        write_file(&project_root.join(".git"), ""); // marker file
+
+        let found = discover_project_config(Some(&subdir));
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), project_root.join("okeanos.toml"));
+    }
+
+    #[test]
+    fn test_validation_context_cap_zero_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[context]
+cap = 0
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("context.cap must be > 0"));
+    }
+
+    #[test]
+    fn test_validation_context_max_iterations_zero_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[context]
+max_iterations = 0
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("context.max_iterations must be > 0"));
+    }
+
+    #[test]
+    fn test_validation_context_max_elapsed_sec_zero_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[context]
+max_elapsed_sec = 0
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("context.max_elapsed_sec must be > 0"));
+    }
+
+    #[test]
+    fn test_validation_cost_session_cap_negative_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[cost]
+session_cap_usd = -1.0
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cost.session_cap_usd must be >= 0"));
+    }
+
+    #[test]
+    fn test_validation_cost_per_turn_warning_negative_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[cost]
+per_turn_warning_usd = -0.5
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cost.per_turn_warning_usd must be >= 0"));
+    }
+
+    #[test]
+    fn test_validation_model_tier_invalid_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+tier = "invalid"
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("model.tier must be 'small' or 'frontier'"));
+    }
+
+    #[test]
+    fn test_validation_model_tier_small_ok() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+tier = "small"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("valid tier should load");
+        assert_eq!(
+            config.model.as_ref().and_then(|m| m.tier.as_deref()),
+            Some("small")
+        );
+    }
+
+    #[test]
+    fn test_validation_model_tier_frontier_ok() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+tier = "frontier"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("valid tier should load");
+        assert_eq!(
+            config.model.as_ref().and_then(|m| m.tier.as_deref()),
+            Some("frontier")
+        );
+    }
+
+    #[test]
+    fn test_validation_model_edit_format_invalid_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+edit_format = "invalid"
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("model.edit_format must be 'diff', 'whole_file', or 'str_replace'"));
+    }
+
+    #[test]
+    fn test_validation_model_edit_format_diff_ok() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+edit_format = "diff"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("valid edit_format should load");
+        assert_eq!(
+            config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
+            Some("diff")
+        );
+    }
+
+    #[test]
+    fn test_validation_model_edit_format_whole_file_ok() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+edit_format = "whole_file"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("valid edit_format should load");
+        assert_eq!(
+            config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
+            Some("whole_file")
+        );
+    }
+
+    #[test]
+    fn test_validation_model_edit_format_str_replace_ok() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+edit_format = "str_replace"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("valid edit_format should load");
+        assert_eq!(
+            config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
+            Some("str_replace")
+        );
+    }
+
+    #[test]
+    fn test_validation_provider_kind_invalid_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[provider]
+kind = "invalid"
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("provider.kind must be 'openai-compatible'"));
+    }
+
+    #[test]
+    fn test_validation_provider_kind_openai_compatible_ok() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[provider]
+kind = "openai-compatible"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("valid kind should load");
+        assert_eq!(
+            config.provider.as_ref().and_then(|p| p.kind.as_deref()),
+            Some("openai-compatible")
+        );
+    }
+
+    #[test]
+    fn test_skills_dir_in_model_section() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+skills_dir = ".okeanos/skills"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("skills_dir should load");
+        assert_eq!(
+            config
+                .model
+                .as_ref()
+                .and_then(|m| m.skills_dir.as_deref().map(|p| p.to_str().unwrap())),
+            Some(".okeanos/skills")
+        );
     }
 }

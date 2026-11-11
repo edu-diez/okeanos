@@ -4,6 +4,8 @@ use okeanos::HarnessError;
 use okeanos::cli::{Cli, Mode};
 use tracing_subscriber::EnvFilter;
 
+mod config;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -16,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
     let mode = cli.mode();
     tracing::info!(mode = ?mode, "okeanos starting");
 
-    let _config = okeanos::config::Config::load().context("failed to load configuration")?;
+    let _config =
+        config::Config::load(cli.root.as_deref()).context("failed to load configuration")?;
     tracing::info!("configuration loaded");
 
     match mode {

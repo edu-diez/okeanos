@@ -11,6 +11,13 @@ pub struct Cli {
 
     #[arg(long, conflicts_with = "interactive")]
     pub headless: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Project root directory (defaults to CWD)"
+    )]
+    pub root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

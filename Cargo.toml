@@ -21,4 +21,23 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
+# Optional dependencies (feature-flagged)
+gix = { version = "0.70", optional = true }
+ratatui = { version = "0.28", optional = true }
+crossterm = { version = "0.28", optional = true }
+jsonrpsee = { version = "0.22", optional = true }
+# ripgrep library crates (pure Rust, no C deps) for selective context / symbol scanning
+grep-regex = { version = "0.1", optional = true }
+grep-searcher = { version = "0.1", optional = true }
+grep-matcher = { version = "0.1", optional = true }
+tempfile = { version = "3.15", optional = true }
+
+[features]
+default = []
+rpc = ["jsonrpsee"]
+mcp = []
+mock-provider = []
+simd-json = []
+grep = ["grep-regex", "grep-searcher", "grep-matcher"]
+
 [workspace]
