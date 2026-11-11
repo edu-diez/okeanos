@@ -4,6 +4,7 @@ use crate::context::{Conversation, ConversationError};
 use crate::events::{
     Event, EventSender, Message, MessageRole, ToolCall, ToolCallStatus, ToolResult,
 };
+use crate::model::text_tool::{TextToolError, TextToolParser};
 use crate::model::{GenerationParams, Model, ModelError, ModelMessage, ModelResponse};
 use crate::tool::ToolRegistry;
 use anyhow::Context as _;
@@ -204,7 +205,7 @@ impl<M: Model> ReactLoop<M> {
     /// Run a single ReAct iteration: think → tool → observe.
     async fn iterate(&mut self) -> Result<LoopDecision, ReactError> {
         // THINK: Get model completion
-        let model_messages = self.conversation.to_model_messages();
+        let model_messages = self.build_model_messages();
         let response = self.call_model(&model_messages).await?;
 
         // Add assistant message to conversation
@@ -222,7 +223,7 @@ impl<M: Model> ReactLoop<M> {
         })
         .await;
 
-        // If there are tool calls, execute them
+        // If there are native tool calls, execute them.
         if let Some(tool_calls) = response.tool_calls {
             if tool_calls.is_empty() {
                 // No tool calls - check if the model is done
@@ -248,14 +249,48 @@ impl<M: Model> ReactLoop<M> {
             }
 
             // After tool execution, continue to next iteration
-            Ok(LoopDecision::Continue)
-        } else {
-            // No tool calls - check for completion
-            if self.is_completion_response(&response.content) {
-                Ok(LoopDecision::Complete(response.content))
-            } else {
-                Ok(LoopDecision::Continue)
+            return Ok(LoopDecision::Continue);
+        }
+
+        // No native tool calls. For models without native function calling,
+        // try text-based tool calling: parse raw model output into tool
+        // invocations, validate against schema, then execute.
+        if !self.model.capabilities().tool_calling {
+            match TextToolParser::parse(&response.content) {
+                Ok(calls) => {
+                    if !calls.is_empty() {
+                        let validated = TextToolParser::validate(&calls, &self.tools)
+                            .map_err(|e| ReactError::Tool(format!("text tool call failed: {e}")))?;
+                        for (i, call) in validated.into_iter().enumerate() {
+                            let tool_call = ToolCall {
+                                id: format!("text-call-{}-{}", self.iteration, i),
+                                name: call.name,
+                                args: call.args,
+                                status: ToolCallStatus::Pending,
+                            };
+                            let result = self.execute_tool(tool_call).await?;
+
+                            self.conversation
+                                .add_tool_message(result.output.clone(), result.id.clone())
+                                .context("failed to add tool result")?;
+
+                            self.emit_tool_result(result).await;
+                        }
+                        return Ok(LoopDecision::Continue);
+                    }
+                }
+                Err(TextToolError::NoToolCalls) => {}
+                Err(e) => {
+                    return Err(ReactError::Tool(format!("text tool call failed: {e}")));
+                }
             }
+        }
+
+        // No tool calls - check for completion
+        if self.is_completion_response(&response.content) {
+            Ok(LoopDecision::Complete(response.content))
+        } else {
+            Ok(LoopDecision::Continue)
         }
     }
 
@@ -265,6 +300,27 @@ impl<M: Model> ReactLoop<M> {
         self.model
             .complete(messages, &self.config.generation_params)
             .await
+    }
+
+    /// Build the model messages, injecting a text-based tool schema into the
+    /// system prompt when the model does not support native function calling.
+    fn build_model_messages(&self) -> Vec<ModelMessage> {
+        let mut messages = self.conversation.to_model_messages();
+
+        // For models without native tool calling, inject a text-based schema
+        // description into the system prompt so the model knows how to invoke
+        // tools via text.
+        if !self.model.capabilities().tool_calling {
+            let specs = self.tools.specs();
+            if !specs.is_empty() {
+                let snippet = TextToolParser::generate_system_prompt_snippet(&specs);
+                if let Some(system_msg) = messages.first_mut() {
+                    system_msg.content.push_str(&snippet);
+                }
+            }
+        }
+
+        messages
     }
 
     /// Execute a tool call.
@@ -384,6 +440,7 @@ mod tests {
     use super::*;
     use crate::model::{MockModel, ModelTier};
     use crate::tool::ToolRegistry;
+    use crate::tool::todo::TodoTool;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -466,5 +523,61 @@ mod tests {
         // Since todo tool isn't registered, we expect a tool error
         // But the loop should handle it gracefully
         assert!(result.is_err() || result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_text_based_tool_call_executes() {
+        // Small model has no native tool calling -> text-based path is used.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Let me create a todo.\n<tool_call name=\"todo\">\n{\"action\": \"add\", \"title\": \"Test task\"}\n</tool_call>",
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Create a todo".into()).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_text_based_tool_call_invalid() {
+        // Invalid text tool call: missing required "action" field.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Create a todo".into()).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::Tool(msg) => assert!(msg.contains("text tool call failed")),
+            _ => panic!("expected text tool call error"),
+        }
     }
 }

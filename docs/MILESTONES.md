@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -116,6 +116,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 4 — Tool system + text-based tool calling
 
+**Status:** complete — tagged v0.1.0-milestone-4  
+
 **Scope:**
 - `Tool` trait (JSON-schema input/output) + `ToolRegistry`.
 - Built-in `todo` tool (add/complete/list).
@@ -131,7 +133,15 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for `Tool` trait, `ToolRegistry`, `TextToolParser`, lenient parsing, schema validation before execution. No network.
 
-**Definition of Done:** CI green; no unvalidated tool call executes; milestone tagged.
+**Definition of Done:** CI green; no unvalidated tool call executes; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes
+- `cargo build --release` produces a single binary
+- `todo` add/complete/list executes and returns structured results
+- Text-based tool calls parse leniently and validate against schema before execution
+- Invalid tool calls return structured errors; never execute unvalidated calls
+- Tagged v0.1.0-milestone-4
 
 ---
 

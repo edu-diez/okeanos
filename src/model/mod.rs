@@ -8,6 +8,7 @@ pub mod classifier;
 pub mod discovery;
 pub mod mock;
 pub mod model_trait;
+pub mod text_tool;
 
 pub use cache::ModelCache;
 pub use classifier::{
