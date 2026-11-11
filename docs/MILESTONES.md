@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -175,6 +175,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 6 — Built-in tools + interruptible execution
 
+**Status:** complete — tagged v0.1.0-milestone-6  
+
 **Scope:**
 - Built-in tools: `read`, `write`, `delete`, `run` (local process at permission boundary), `grep`.
 - Tool output truncation: max bytes per result, head/tail with overflow indicator, counts against context cap.
@@ -189,7 +191,18 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for each built-in tool under policy, truncation behavior, tool execution interrupt/cancel. No network.
 
-**Definition of Done:** CI green; policy-boundary verified; interruptible execution verified; milestone tagged.
+**Definition of Done:** CI green; policy-boundary verified; interruptible execution verified; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (163 unit tests)
+- `cargo build --release` produces a single binary
+- All 5 built-in tools (read, write, delete, run, grep) implement the `Tool` trait and execute under policy
+- `read`/`grep` output truncated with head/tail overflow indicator at MAX_OUTPUT_BYTES
+- `run` tool streams output incrementally, supports per-invocation `timeout_secs`, kills on timeout (SIGKILL), drains output after exit, returns exit_code/timed_out/cancelled
+- `run` uses `kill_on_drop(true)` and process groups for cancellation cleanup
+- Tool execution interruptible via ReAct loop `select!` on shutdown signal
+- Unit tests for each built-in tool under policy, truncation behavior, tool execution interrupt/cancel
+- Tagged v0.1.0-milestone-6
 
 ---
 

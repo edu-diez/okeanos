@@ -76,6 +76,37 @@ pub enum ToolError {
     NotFound(String),
 }
 
+/// Result of a tool execution.
+///
+/// Contains the tool's output plus metadata about how the execution
+/// concluded (exit code, timeout, cancellation, truncation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionResult {
+    /// The tool's output text.
+    pub output: String,
+    /// Process exit code (only set for `run` tool; `None` for other tools or if killed by signal).
+    pub exit_code: Option<i32>,
+    /// Whether execution was terminated due to a timeout.
+    pub timed_out: bool,
+    /// Whether execution was cancelled (e.g., by user interrupt).
+    pub cancelled: bool,
+    /// Whether the output was truncated due to size limits.
+    pub truncated: bool,
+}
+
+impl ToolExecutionResult {
+    /// Create a successful result with just output.
+    pub fn output(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            exit_code: None,
+            timed_out: false,
+            cancelled: false,
+            truncated: false,
+        }
+    }
+}
+
 /// The Tool trait — all tools implement this.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -83,7 +114,10 @@ pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
     /// Execute the tool with the given arguments.
-    async fn execute(&self, args: Value) -> Result<String, ToolError>;
+    ///
+    /// Returns a [`ToolExecutionResult`] containing the output plus
+    /// metadata (exit code, timeout, cancellation, truncation).
+    async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError>;
 }
 
 /// Registry of available tools.
@@ -179,12 +213,12 @@ mod tests {
             )
         }
 
-        async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {
             let message = args
                 .get("message")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::InvalidArgs("missing message".into()))?;
-            Ok(message.to_string())
+            Ok(ToolExecutionResult::output(message.to_string()))
         }
     }
 
@@ -209,7 +243,7 @@ mod tests {
         let tool = EchoTool;
         let result = tool.execute(json!({"message": "hello"})).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "hello");
+        assert_eq!(result.unwrap().output, "hello");
     }
 
     #[tokio::test]

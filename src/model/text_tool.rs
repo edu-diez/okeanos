@@ -616,7 +616,7 @@ pub fn parse_and_validate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::tool_trait::{Tool, ToolError};
+    use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult};
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -639,12 +639,13 @@ mod tests {
             )
         }
 
-        async fn execute(&self, args: Value) -> Result<String, ToolError> {
-            Ok(args
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string())
+        async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {
+            Ok(ToolExecutionResult::output(
+                args.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
         }
     }
 
@@ -668,8 +669,8 @@ mod tests {
             )
         }
 
-        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-            Ok("ok".to_string())
+        async fn execute(&self, _args: Value) -> Result<ToolExecutionResult, ToolError> {
+            Ok(ToolExecutionResult::output("ok".to_string()))
         }
     }
 

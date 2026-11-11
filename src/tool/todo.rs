@@ -1,6 +1,6 @@
 //! Built-in todo tool.
 
-use crate::tool::tool_trait::{Tool, ToolError, ToolSpec};
+use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -114,22 +114,28 @@ impl Tool for TodoTool {
         )
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {
         let parsed: TodoArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArgs(format!("invalid args: {}", e)))?;
 
         match parsed {
             TodoArgs::Add { title } => {
                 let item = self.list.add(title);
-                Ok(serde_json::to_string(&item).unwrap())
+                Ok(ToolExecutionResult::output(
+                    serde_json::to_string(&item).unwrap(),
+                ))
             }
             TodoArgs::Complete { id } => {
                 let item = self.list.complete(&id)?;
-                Ok(serde_json::to_string(&item).unwrap())
+                Ok(ToolExecutionResult::output(
+                    serde_json::to_string(&item).unwrap(),
+                ))
             }
             TodoArgs::List => {
                 let items = self.list.list();
-                Ok(serde_json::to_string(&items).unwrap())
+                Ok(ToolExecutionResult::output(
+                    serde_json::to_string(&items).unwrap(),
+                ))
             }
         }
     }
@@ -147,7 +153,7 @@ mod tests {
             .execute(json!({"action": "add", "title": "Test task"}))
             .await;
         assert!(result.is_ok());
-        let item: TodoItem = serde_json::from_str(&result.unwrap()).unwrap();
+        let item: TodoItem = serde_json::from_str(&result.unwrap().output).unwrap();
         assert_eq!(item.title, "Test task");
         assert!(!item.done);
     }
@@ -159,13 +165,13 @@ mod tests {
             .execute(json!({"action": "add", "title": "Test task"}))
             .await
             .unwrap();
-        let item: TodoItem = serde_json::from_str(&add_result).unwrap();
+        let item: TodoItem = serde_json::from_str(&add_result.output).unwrap();
 
         let complete_result = tool
             .execute(json!({"action": "complete", "id": item.id}))
             .await;
         assert!(complete_result.is_ok());
-        let completed: TodoItem = serde_json::from_str(&complete_result.unwrap()).unwrap();
+        let completed: TodoItem = serde_json::from_str(&complete_result.unwrap().output).unwrap();
         assert!(completed.done);
     }
 
@@ -181,7 +187,7 @@ mod tests {
 
         let result = tool.execute(json!({"action": "list"})).await;
         assert!(result.is_ok());
-        let items: Vec<TodoItem> = serde_json::from_str(&result.unwrap()).unwrap();
+        let items: Vec<TodoItem> = serde_json::from_str(&result.unwrap().output).unwrap();
         assert_eq!(items.len(), 2);
     }
 

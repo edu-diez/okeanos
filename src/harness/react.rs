@@ -210,7 +210,7 @@ impl<M: Model> ReactLoop<M> {
             }
 
             // Run one iteration
-            match self.iterate().await? {
+            match self.iterate(&mut shutdown_rx).await? {
                 LoopDecision::Continue => {
                     self.iteration += 1;
                     continue;
@@ -226,7 +226,10 @@ impl<M: Model> ReactLoop<M> {
     }
 
     /// Run a single ReAct iteration: think → tool → observe.
-    async fn iterate(&mut self) -> Result<LoopDecision, ReactError> {
+    async fn iterate(
+        &mut self,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<LoopDecision, ReactError> {
         // THINK: Get model completion
         let model_messages = self.build_model_messages();
         let response = self.call_model(&model_messages).await?;
@@ -260,7 +263,7 @@ impl<M: Model> ReactLoop<M> {
 
             // Execute each tool call
             for tool_call in tool_calls {
-                let result = self.execute_tool(tool_call).await?;
+                let result = self.execute_tool(tool_call, shutdown_rx).await?;
 
                 // Add tool result to conversation
                 self.conversation
@@ -291,7 +294,7 @@ impl<M: Model> ReactLoop<M> {
                                 args: call.args,
                                 status: ToolCallStatus::Pending,
                             };
-                            let result = self.execute_tool(tool_call).await?;
+                            let result = self.execute_tool(tool_call, shutdown_rx).await?;
 
                             self.conversation
                                 .add_tool_message(result.output.clone(), result.id.clone())
@@ -352,7 +355,15 @@ impl<M: Model> ReactLoop<M> {
     /// event and pauses, waiting for a matching `Approval` decision on the
     /// approval receiver. The loop resumes only on `Allow` or `AllowAlways`;
     /// `Deny` aborts execution with a structured error.
-    async fn execute_tool(&mut self, tool_call: ToolCall) -> Result<ToolResult, ReactError> {
+    ///
+    /// Tool execution is interruptible: if a shutdown signal is received on
+    /// `shutdown_rx`, execution is aborted and [`ReactError::Interrupted`]
+    /// is returned.
+    async fn execute_tool(
+        &mut self,
+        tool_call: ToolCall,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<ToolResult, ReactError> {
         // Resolve the tool and clone its spec so the policy check doesn't
         // hold an immutable borrow across the mutable approval wait.
         let tool = self
@@ -414,27 +425,29 @@ impl<M: Model> ReactLoop<M> {
 
         let start = Instant::now();
 
-        // Execute the tool
-        let output = tool
-            .execute(tool_call.args.clone())
-            .await
-            .map_err(|e| ReactError::Tool(format!("tool execution failed: {e}")))?;
+        // Execute the tool, interruptible by shutdown signal.
+        let exec_result = tokio::select! {
+            biased;
+            result = tool.execute(tool_call.args.clone()) => result,
+            _ = shutdown_rx.recv() => {
+                return Err(ReactError::Interrupted);
+            }
+        }
+        .map_err(|e| ReactError::Tool(format!("tool execution failed: {e}")))?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
-
-        let ok = true; // Tool execution succeeded (error would have been caught above)
 
         let result = ToolResult {
             id: tool_call.id,
             name: tool_call.name,
             args: tool_call.args,
-            output,
-            ok,
+            output: exec_result.output,
+            ok: true,
             duration_ms,
-            truncated: false,
-            exit_code: None,
-            timed_out: false,
-            cancelled: false,
+            truncated: exec_result.truncated,
+            exit_code: exec_result.exit_code,
+            timed_out: exec_result.timed_out,
+            cancelled: exec_result.cancelled,
         };
 
         // Emit tool call completed event
@@ -442,11 +455,7 @@ impl<M: Model> ReactLoop<M> {
             id: result.id.clone(),
             name: result.name.clone(),
             args: result.args.clone(),
-            status: if ok {
-                ToolCallStatus::Ok
-            } else {
-                ToolCallStatus::Error
-            },
+            status: ToolCallStatus::Ok,
         })
         .await;
 
@@ -543,7 +552,7 @@ mod tests {
     use crate::model::{MockModel, ModelTier};
     use crate::tool::ToolRegistry;
     use crate::tool::todo::TodoTool;
-    use crate::tool::tool_trait::{Tool, ToolCategory, ToolError, ToolSpec};
+    use crate::tool::tool_trait::{Tool, ToolCategory, ToolError, ToolExecutionResult, ToolSpec};
     use async_trait::async_trait;
     use serde_json::Value;
     use std::sync::Arc;
@@ -708,8 +717,8 @@ mod tests {
             .with_category(ToolCategory::Write)
         }
 
-        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
-            Ok("written".to_string())
+        async fn execute(&self, _args: Value) -> Result<ToolExecutionResult, ToolError> {
+            Ok(ToolExecutionResult::output("written".to_string()))
         }
     }
 
