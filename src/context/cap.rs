@@ -26,7 +26,7 @@ pub struct ContextCap {
     /// Warning threshold as a fraction of max_tokens (e.g., 0.85 = warn at 85%).
     pub warning_threshold: f64,
     /// Token counter to use for estimation.
-    token_counter: TokenCounter,
+    pub token_counter: TokenCounter,
 }
 
 impl Default for ContextCap {

@@ -22,6 +22,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 async-trait = "0.1"
 futures = "0.3"
+regex = "1.10"
+once_cell = "1.19"
+dirs = "5.0"
+chrono = { version = "0.4", features = ["serde"] }
 
 # Optional dependencies (feature-flagged)
 gix = { version = "0.70", optional = true }

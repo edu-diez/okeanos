@@ -71,6 +71,31 @@ pub struct ModelSection {
     pub temperature: Option<f64>,
     pub edit_format: Option<String>,
     pub skills_dir: Option<PathBuf>,
+    /// Explicit model capabilities override (required for local/self-hosted models).
+    /// If not provided, capabilities are inferred from known model names.
+    #[serde(default)]
+    pub capabilities: Option<ModelCapabilitiesSection>,
+}
+
+/// Explicit model capabilities declaration for local/self-hosted models.
+/// Required for models not in the known providers table.
+/// Fail closed if required capabilities are missing for self-hosted models.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ModelCapabilitiesSection {
+    /// Model supports native JSON function calling.
+    pub tool_calling: Option<bool>,
+    /// Model supports structured output (e.g., JSON schema constrained generation).
+    pub structured_output: Option<bool>,
+    /// Model supports a separate thinking/reasoning channel.
+    pub thinking: Option<bool>,
+    /// Maximum context window in tokens.
+    pub max_context: Option<usize>,
+    /// Maximum output tokens per completion.
+    pub max_output: Option<usize>,
+    /// Model supports temperature parameter.
+    pub temperature_supported: Option<bool>,
+    /// Model tier for tiered prompts and tool selection.
+    pub tier: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -214,6 +239,77 @@ impl Config {
         }
 
         if let Some(model) = &self.model {
+            // If model name is explicitly set and it's not a known model, require explicit capabilities
+            let is_known_model = model.name.as_ref().is_some_and(|n| {
+                matches!(
+                    n.as_str(),
+                    "gpt-4o"
+                        | "gpt-4o-mini"
+                        | "gpt-4-turbo"
+                        | "gpt-3.5-turbo"
+                        | "claude-3-5-sonnet"
+                        | "claude-3-haiku"
+                )
+            });
+
+            if model.name.is_some() && !is_known_model {
+                // For unknown/local models (explicitly named but not recognized), require explicit capabilities
+                if model.capabilities.is_none() {
+                    return Err(ConfigError::Validation {
+                        message:
+                            "model.capabilities must be explicitly set for local/self-hosted models"
+                                .to_string(),
+                    });
+                }
+
+                let caps = model.capabilities.as_ref().unwrap();
+
+                if caps.tool_calling.is_none() {
+                    return Err(ConfigError::Validation {
+                        message: "model.capabilities.tool_calling must be explicitly set for local/self-hosted models".to_string(),
+                    });
+                }
+                if caps.structured_output.is_none() {
+                    return Err(ConfigError::Validation {
+                        message: "model.capabilities.structured_output must be explicitly set for local/self-hosted models".to_string(),
+                    });
+                }
+                if caps.thinking.is_none() {
+                    return Err(ConfigError::Validation {
+                        message: "model.capabilities.thinking must be explicitly set for local/self-hosted models".to_string(),
+                    });
+                }
+                // Check max_context from capabilities section or model section
+                let max_context = caps.max_context.or(model.max_context);
+                if max_context.is_none() || max_context.unwrap_or(0) == 0 {
+                    return Err(ConfigError::Validation {
+                        message: "model.capabilities.max_context (or model.max_context) must be explicitly set and > 0 for local/self-hosted models".to_string(),
+                    });
+                }
+                // Check max_output from capabilities section or model section
+                let max_output = caps.max_output.or(model.max_output);
+                if max_output.is_none() || max_output.unwrap_or(0) == 0 {
+                    return Err(ConfigError::Validation {
+                        message: "model.capabilities.max_output (or model.max_output) must be explicitly set and > 0 for local/self-hosted models".to_string(),
+                    });
+                }
+                if caps.temperature_supported.is_none() {
+                    return Err(ConfigError::Validation {
+                        message: "model.capabilities.temperature_supported must be explicitly set for local/self-hosted models".to_string(),
+                    });
+                }
+                if let Some(t) = &caps.tier
+                    && !matches!(t.as_str(), "small" | "frontier")
+                {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "model.capabilities.tier must be 'small' or 'frontier', got '{t}'"
+                        ),
+                    });
+                }
+            }
+
+            // Validate tier if provided
             if let Some(tier) = &model.tier
                 && !matches!(tier.as_str(), "small" | "frontier")
             {
@@ -221,6 +317,7 @@ impl Config {
                     message: format!("model.tier must be 'small' or 'frontier', got '{tier}'"),
                 });
             }
+            // Validate edit_format if provided
             if let Some(edit_format) = &model.edit_format
                 && !matches!(edit_format.as_str(), "diff" | "whole_file" | "str_replace")
             {
@@ -242,6 +339,149 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Convert config sections to ModelCapabilities, with fallback to known model defaults.
+    /// If `api_key` is provided and no explicit capabilities are set, attempts to discover
+    /// model metadata from OpenRouter (async version recommended for discovery).
+    pub fn to_model_capabilities(&self, _api_key: Option<&str>) -> crate::model::ModelCapabilities {
+        use crate::model::{ModelCapabilities, ModelTier};
+
+        let mut caps = ModelCapabilities::default();
+
+        // Start with tier-based defaults
+        let tier = self
+            .model
+            .as_ref()
+            .and_then(|m| m.tier.as_deref())
+            .and_then(|t| t.parse::<ModelTier>().ok())
+            .unwrap_or(ModelTier::Frontier);
+        caps.tier = tier;
+
+        // Apply explicit capabilities if provided
+        if let Some(model) = &self.model {
+            if let Some(c) = &model.capabilities {
+                if let Some(v) = c.tool_calling {
+                    caps.tool_calling = v;
+                }
+                if let Some(v) = c.structured_output {
+                    caps.structured_output = v;
+                }
+                if let Some(v) = c.thinking {
+                    caps.thinking = v;
+                }
+                if let Some(v) = c.max_context {
+                    caps.max_context = v;
+                }
+                if let Some(v) = c.max_output {
+                    caps.max_output = v;
+                }
+                if let Some(v) = c.temperature_supported {
+                    caps.temperature_supported = v;
+                }
+                if let Some(t) = &c.tier
+                    && let Ok(parsed_tier) = t.parse::<ModelTier>()
+                {
+                    caps.tier = parsed_tier;
+                }
+            }
+
+            // Override with model section values if set
+            if let Some(v) = model.max_context {
+                caps.max_context = v;
+            }
+            if let Some(v) = model.max_output {
+                caps.max_output = v;
+            }
+
+            // If no explicit capabilities, use auto-classification (with discovery if API key available)
+            if model.capabilities.is_none() {
+                if let Some(name) = &model.name {
+                    // Use async discovery - for sync context, fall back to static classification
+                    // In async contexts, callers should use discover_and_classify directly
+                    let classification = crate::model::classify_model(name);
+                    caps = crate::model::default_capabilities_for_tier(classification.tier);
+
+                    // If API key is provided, we could enhance this with discovered capabilities
+                    // but that requires async. For now, we use static classification.
+                    // The async discovery is available via crate::model::discover_and_classify
+                } else {
+                    // No name provided, use tier from model section or default
+                    caps = crate::model::default_capabilities_for_tier(caps.tier);
+                }
+            }
+        }
+
+        caps
+    }
+
+    /// Async version that uses OpenRouter discovery when API key is available.
+    pub async fn to_model_capabilities_async(
+        &self,
+        api_key: Option<&str>,
+    ) -> crate::model::ModelCapabilities {
+        use crate::model::{ModelCapabilities, ModelTier};
+
+        let mut caps = ModelCapabilities::default();
+
+        let tier = self
+            .model
+            .as_ref()
+            .and_then(|m| m.tier.as_deref())
+            .and_then(|t| t.parse::<ModelTier>().ok())
+            .unwrap_or(ModelTier::Frontier);
+        caps.tier = tier;
+
+        if let Some(model) = &self.model {
+            if let Some(c) = &model.capabilities {
+                if let Some(v) = c.tool_calling {
+                    caps.tool_calling = v;
+                }
+                if let Some(v) = c.structured_output {
+                    caps.structured_output = v;
+                }
+                if let Some(v) = c.thinking {
+                    caps.thinking = v;
+                }
+                if let Some(v) = c.max_context {
+                    caps.max_context = v;
+                }
+                if let Some(v) = c.max_output {
+                    caps.max_output = v;
+                }
+                if let Some(v) = c.temperature_supported {
+                    caps.temperature_supported = v;
+                }
+                if let Some(t) = &c.tier
+                    && let Ok(parsed_tier) = t.parse::<ModelTier>()
+                {
+                    caps.tier = parsed_tier;
+                }
+            }
+
+            if let Some(v) = model.max_context {
+                caps.max_context = v;
+            }
+            if let Some(v) = model.max_output {
+                caps.max_output = v;
+            }
+
+            if model.capabilities.is_none() {
+                if let Some(name) = &model.name {
+                    // Use async discovery with cache
+                    let classification = crate::model::discover_and_classify(name, api_key).await;
+                    caps = crate::model::default_capabilities_for_tier(classification.tier);
+
+                    // Override with discovered capabilities if available
+                    // We'd need to fetch the full DiscoveredModel for this
+                    // For now, tier is the main signal
+                } else {
+                    caps = crate::model::default_capabilities_for_tier(caps.tier);
+                }
+            }
+        }
+
+        caps
     }
 }
 
@@ -898,5 +1138,138 @@ skills_dir = ".okeanos/skills"
                 .and_then(|m| m.skills_dir.as_deref().map(|p| p.to_str().unwrap())),
             Some(".okeanos/skills")
         );
+    }
+
+    #[test]
+    fn test_model_capabilities_section_known_model() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+name = "gpt-4o"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("known model should load");
+        let caps = config.to_model_capabilities(None);
+        assert!(caps.tool_calling);
+        assert!(caps.structured_output);
+        assert_eq!(caps.max_context, 200000); // Frontier default from classifier
+        assert_eq!(caps.tier, crate::model::ModelTier::Frontier);
+    }
+
+    #[test]
+    fn test_model_capabilities_section_explicit_override() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+name = "my-local-model"
+tier = "small"
+max_context = 8192
+max_output = 2048
+[model.capabilities]
+tool_calling = false
+structured_output = false
+thinking = false
+temperature_supported = true
+tier = "small"
+"#,
+        );
+        let config =
+            Config::load_from(None, Some(&path)).expect("explicit capabilities should load");
+        let caps = config.to_model_capabilities(None);
+        assert!(!caps.tool_calling);
+        assert!(!caps.structured_output);
+        assert!(!caps.thinking);
+        assert_eq!(caps.max_context, 8192);
+        assert_eq!(caps.max_output, 2048);
+        assert_eq!(caps.tier, crate::model::ModelTier::Small);
+    }
+
+    #[test]
+    fn test_model_capabilities_section_local_model_requires_explicit() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+name = "my-local-model"
+tier = "small"
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("model.capabilities must be explicitly set"));
+    }
+
+    #[test]
+    fn test_model_capabilities_section_local_model_partial_explicit_fails() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+name = "my-local-model"
+tier = "small"
+[model.capabilities]
+tool_calling = false
+# missing other required fields
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("model.capabilities.structured_output must be explicitly set"));
+    }
+
+    #[test]
+    fn test_model_capabilities_section_tier_override() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+name = "gpt-4o"
+[model.capabilities]
+tier = "small"
+"#,
+        );
+        let config = Config::load_from(None, Some(&path)).expect("tier override should load");
+        let caps = config.to_model_capabilities(None);
+        // Explicit tier in capabilities should override known model tier
+        assert_eq!(caps.tier, crate::model::ModelTier::Small);
+    }
+
+    #[test]
+    fn test_model_capabilities_invalid_tier_in_capabilities() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        write_file(
+            &path,
+            r#"
+[model]
+name = "my-local-model"
+[model.capabilities]
+tool_calling = false
+structured_output = false
+thinking = false
+max_context = 4096
+max_output = 2048
+temperature_supported = true
+tier = "invalid"
+"#,
+        );
+        let result = Config::load_from(None, Some(&path));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("model.capabilities.tier must be 'small' or 'frontier'"));
     }
 }

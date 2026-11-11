@@ -1,9 +1,12 @@
 //! Conversation context management.
 //!
 //! Handles the system prompt, skills directory concatenation,
-//! message history, and context cap enforcement.
+//! message history, token counting, cost estimation, hard context cap enforcement,
+//! tiered prompts, selective file inclusion, and thinking channel handling.
 
 use crate::context::cap::{ContextCap, ContextCapError, ContextWarning};
+use crate::context::selective::{IncludedFile, SelectiveContextConfig};
+use crate::context::tier::TierConfig;
 use crate::context::tokens::{CostEstimate, TokenCounter};
 use crate::events::Message;
 use crate::model::{ModelCapabilities, ModelTier};
@@ -51,7 +54,13 @@ pub struct Conversation {
     token_counter: TokenCounter,
     /// Model capabilities for tier-aware behavior.
     capabilities: ModelCapabilities,
-    /// Total estimated tokens in context (system + messages).
+    /// Tier configuration (prompt template, tool subset, generation params).
+    tier_config: TierConfig,
+    /// Selective context configuration.
+    selective_config: SelectiveContextConfig,
+    /// Included relevant files for context.
+    included_files: Vec<IncludedFile>,
+    /// Total estimated tokens in context (system + messages + files).
     estimated_tokens: usize,
     /// Current cost estimate.
     cost_estimate: CostEstimate,
@@ -60,6 +69,8 @@ pub struct Conversation {
 impl Conversation {
     /// Create a new conversation with the given system prompt and context cap.
     pub fn new(system_prompt: String, cap: ContextCap, capabilities: ModelCapabilities) -> Self {
+        let tier_config = TierConfig::from_capabilities(&capabilities);
+        let selective_config = tier_config.selective_context.clone();
         let token_counter = TokenCounter;
         let system_tokens = token_counter.count_message("system", &system_prompt);
 
@@ -69,6 +80,9 @@ impl Conversation {
             cap,
             token_counter,
             capabilities,
+            tier_config,
+            selective_config,
+            included_files: Vec::new(),
             estimated_tokens: system_tokens,
             cost_estimate: CostEstimate::default(),
         }
@@ -114,6 +128,21 @@ impl Conversation {
     /// Get the model capabilities.
     pub fn capabilities(&self) -> &ModelCapabilities {
         &self.capabilities
+    }
+
+    /// Get the tier configuration.
+    pub fn tier_config(&self) -> &TierConfig {
+        &self.tier_config
+    }
+
+    /// Get the selective context configuration.
+    pub fn selective_config(&self) -> &SelectiveContextConfig {
+        &self.selective_config
+    }
+
+    /// Get the included files.
+    pub fn included_files(&self) -> &[IncludedFile] {
+        &self.included_files
     }
 
     /// Get the current estimated token count.
@@ -214,36 +243,6 @@ impl Conversation {
         Ok(())
     }
 
-    /// Get all messages including system prompt as ModelMessages.
-    pub fn to_model_messages(&self) -> Vec<crate::model::ModelMessage> {
-        let mut result = Vec::with_capacity(self.messages.len() + 1);
-
-        // System prompt first
-        result.push(crate::model::ModelMessage {
-            role: crate::model::ModelRole::System,
-            content: self.system_prompt.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-
-        // Then conversation history
-        for msg in &self.messages {
-            result.push(crate::model::ModelMessage {
-                role: match msg.role {
-                    crate::events::MessageRole::User => crate::model::ModelRole::User,
-                    crate::events::MessageRole::Assistant => crate::model::ModelRole::Assistant,
-                    crate::events::MessageRole::Tool => crate::model::ModelRole::Tool,
-                    crate::events::MessageRole::System => crate::model::ModelRole::System,
-                },
-                content: msg.content.clone(),
-                tool_calls: msg.tool_calls.clone(),
-                tool_call_id: msg.tool_call_id.clone(),
-            });
-        }
-
-        result
-    }
-
     /// Clear history but keep system prompt.
     pub fn clear_history(&mut self) {
         self.messages.clear();
@@ -256,6 +255,121 @@ impl Conversation {
     /// Get the number of messages in history (excluding system).
     pub fn message_count(&self) -> usize {
         self.messages.len()
+    }
+
+    /// Set included files for selective context.
+    pub fn set_included_files(&mut self, files: Vec<IncludedFile>) {
+        self.included_files = files;
+        self.recalculate_tokens();
+    }
+
+    /// Recalculate total estimated tokens (system + messages + files).
+    fn recalculate_tokens(&mut self) {
+        let system_tokens = self
+            .token_counter
+            .count_message("system", &self.system_prompt);
+        let message_tokens: usize = self
+            .messages
+            .iter()
+            .map(|m| {
+                self.token_counter
+                    .count_message(&m.role.to_string(), &m.content)
+            })
+            .sum();
+        let file_tokens: usize = self.included_files.iter().map(|f| f.tokens).sum();
+        self.estimated_tokens = system_tokens + message_tokens + file_tokens;
+    }
+
+    /// Get context usage breakdown for status display.
+    pub fn context_breakdown(&self) -> (usize, usize, usize) {
+        let system_tokens = self
+            .token_counter
+            .count_message("system", &self.system_prompt);
+        let history_tokens: usize = self
+            .messages
+            .iter()
+            .map(|m| {
+                self.token_counter
+                    .count_message(&m.role.to_string(), &m.content)
+            })
+            .sum();
+        let file_tokens: usize = self.included_files.iter().map(|f| f.tokens).sum();
+        (system_tokens, history_tokens, file_tokens)
+    }
+
+    /// Get messages for model, applying history turn cap and thinking channel rules.
+    pub fn to_model_messages(&self) -> Vec<crate::model::ModelMessage> {
+        let mut result = Vec::with_capacity(self.messages.len() + 1 + self.included_files.len());
+
+        // System prompt first
+        result.push(crate::model::ModelMessage {
+            role: crate::model::ModelRole::System,
+            content: self.system_prompt.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        // Add included files as context (after system prompt)
+        if !self.included_files.is_empty() {
+            let file_context = crate::context::selective::build_file_context(&self.included_files);
+            if !file_context.is_empty() {
+                result.push(crate::model::ModelMessage {
+                    role: crate::model::ModelRole::System,
+                    content: file_context,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+
+        // Apply history turn cap per tier
+        let max_turns = self.tier_config.max_history_turns;
+        let messages_to_include = if self.messages.len() > max_turns * 2 {
+            // Each turn = user + assistant pair, so max_turns * 2 messages
+            &self.messages[self.messages.len() - max_turns * 2..]
+        } else {
+            &self.messages[..]
+        };
+
+        // Then conversation history
+        for msg in messages_to_include {
+            let model_msg = crate::model::ModelMessage {
+                role: match msg.role {
+                    crate::events::MessageRole::User => crate::model::ModelRole::User,
+                    crate::events::MessageRole::Assistant => crate::model::ModelRole::Assistant,
+                    crate::events::MessageRole::Tool => crate::model::ModelRole::Tool,
+                    crate::events::MessageRole::System => crate::model::ModelRole::System,
+                },
+                content: msg.content.clone(),
+                tool_calls: msg.tool_calls.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+            };
+
+            // For small-context models, don't replay thinking channel
+            if !self.tier_config.replay_thinking {
+                // Thinking is stored separately in ModelMessage, not in content
+                // This is handled by the model provider when sending requests
+            }
+
+            result.push(model_msg);
+        }
+
+        result
+    }
+
+    /// Check if a tool is allowed for this conversation's tier.
+    pub fn allows_tool(&self, tool_name: &str) -> bool {
+        self.tier_config.allows_tool(tool_name)
+    }
+
+    /// Get allowed tool names for this tier.
+    pub fn allowed_tools(&self) -> Vec<String> {
+        self.tier_config.allowed_tool_names()
+    }
+
+    /// Get generation parameters for this tier.
+    pub fn generation_params(&self) -> crate::model::GenerationParams {
+        self.tier_config.generation_params.clone()
     }
 }
 
@@ -327,6 +441,7 @@ pub fn build_system_prompt(
 fn system_prompt_for_tier(tier: ModelTier) -> &'static str {
     match tier {
         ModelTier::Small => include_str!("../../assets/prompts/small_system_prompt.txt"),
+        ModelTier::Mid => include_str!("../../assets/prompts/mid_system_prompt.txt"),
         ModelTier::Frontier => include_str!("../../assets/prompts/frontier_system_prompt.txt"),
     }
 }

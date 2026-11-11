@@ -1,14 +1,13 @@
 use anyhow::Context as _;
 use clap::Parser;
 use okeanos::cli::{Cli, Mode};
+use okeanos::config::Config;
 use okeanos::context::Conversation;
 use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop};
 use okeanos::model::{MockModel, ModelTier};
 use okeanos::tool::{TodoList, TodoTool};
 use tracing_subscriber::EnvFilter;
-
-mod config;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -22,8 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let mode = cli.mode();
     tracing::info!(mode = ?mode, "okeanos starting");
 
-    let config =
-        config::Config::load(cli.root.as_deref()).context("failed to load configuration")?;
+    let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
     tracing::info!("configuration loaded");
 
     match mode {
@@ -39,7 +37,7 @@ async fn run_interactive(_cli: &Cli) -> anyhow::Result<()> {
     .context("interactive mode is not yet implemented (Milestone 11)")
 }
 
-async fn run_headless(cli: &Cli, _config: &config::Config) -> anyhow::Result<()> {
+async fn run_headless(cli: &Cli, _config: &Config) -> anyhow::Result<()> {
     // Get the prompt from CLI
     let prompt = cli.prompt.clone().unwrap_or_else(|| {
         eprintln!("Error: prompt is required in headless mode");

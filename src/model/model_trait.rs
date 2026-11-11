@@ -23,14 +23,19 @@ pub struct ModelCapabilities {
     pub tier: ModelTier,
 }
 
-/// Model size tier, determines prompt template and tool subset.
+/// Model capability tier, determines prompt template, tool subset, and generation params.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelTier {
-    /// Small local models (4k–8k context, no native function calling)
+    /// Fast/small models: <10B params, 4k–32k context, limited/no native FC.
+    /// Examples: Llama 8B, Gemma 2B/9B, Phi-4, Qwen 7B/14B, Haiku.
     #[default]
     Small,
-    /// Frontier models with large context and native function calling
+    /// Balanced/mid-tier models: 10B–70B params, 32k–128k context, native FC.
+    /// Examples: Llama 3 70B, Mistral Large, Command R+, Sonnet.
+    Mid,
+    /// Frontier models: >70B params, 128k+ context, full capabilities.
+    /// Examples: GPT-4o, GPT-5, Claude Opus, Gemini Ultra.
     Frontier,
 }
 
@@ -38,6 +43,7 @@ impl std::fmt::Display for ModelTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModelTier::Small => write!(f, "small"),
+            ModelTier::Mid => write!(f, "mid"),
             ModelTier::Frontier => write!(f, "frontier"),
         }
     }
@@ -47,7 +53,8 @@ impl std::str::FromStr for ModelTier {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "small" => Ok(ModelTier::Small),
+            "small" | "fast" => Ok(ModelTier::Small),
+            "mid" | "balanced" => Ok(ModelTier::Mid),
             "frontier" => Ok(ModelTier::Frontier),
             _ => Err(format!("invalid tier: {}", s)),
         }
@@ -182,6 +189,12 @@ pub fn default_generation_params(tier: ModelTier) -> GenerationParams {
             stop_sequences: None,
             top_p: Some(0.9),
         },
+        ModelTier::Mid => GenerationParams {
+            temperature: Some(0.5),
+            max_tokens: Some(4096),
+            stop_sequences: None,
+            top_p: Some(0.95),
+        },
         ModelTier::Frontier => GenerationParams {
             temperature: Some(0.7),
             max_tokens: Some(8192),
@@ -195,6 +208,7 @@ pub fn default_generation_params(tier: ModelTier) -> GenerationParams {
 pub fn system_prompt_template(tier: ModelTier) -> &'static str {
     match tier {
         ModelTier::Small => include_str!("../../assets/prompts/small_system_prompt.txt"),
+        ModelTier::Mid => include_str!("../../assets/prompts/mid_system_prompt.txt"),
         ModelTier::Frontier => include_str!("../../assets/prompts/frontier_system_prompt.txt"),
     }
 }

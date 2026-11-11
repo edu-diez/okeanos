@@ -1,11 +1,22 @@
 //! Model abstraction layer.
 //!
 //! Provides the `Model` trait (text-in/text-out primitive), capability
-//! negotiation, and a mock provider for testing.
+//! negotiation, automatic tier classification, and a mock provider for testing.
 
+pub mod cache;
+pub mod classifier;
+pub mod discovery;
 pub mod mock;
 pub mod model_trait;
 
+pub use cache::ModelCache;
+pub use classifier::{
+    ModelClassification, classify_model, default_capabilities_for_tier, discover_and_classify,
+    merge_capabilities,
+};
+pub use discovery::{
+    DiscoveredModel, DiscoveryError, fetch_openrouter_models, minimal_fallback_models,
+};
 pub use mock::MockModel;
 pub use model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
