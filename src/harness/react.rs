@@ -10,7 +10,6 @@ use anyhow::Context as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::signal;
 use tokio::sync::mpsc;
 
 /// Errors from the ReAct loop.
@@ -119,11 +118,7 @@ impl<M: Model> ReactLoop<M> {
         // Emit initial status
         self.emit_status().await;
 
-        // Set up signal handling for SIGINT
-        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
-            .context("failed to install SIGINT handler")?;
-
-        // Create shutdown channel if not provided
+        // Set up cross-platform signal handling for Ctrl-C / SIGINT
         let (shutdown_tx, mut shutdown_rx) = self
             .shutdown_rx
             .take()
@@ -136,7 +131,19 @@ impl<M: Model> ReactLoop<M> {
         // Spawn signal handler
         let shutdown_tx_clone = shutdown_tx.clone();
         tokio::spawn(async move {
-            sigint.recv().await;
+            #[cfg(unix)]
+            {
+                let mut sigint =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .expect("failed to install SIGINT handler");
+                sigint.recv().await;
+            }
+            #[cfg(windows)]
+            {
+                tokio::signal::windows::ctrl_c()
+                    .expect("failed to install Ctrl-C handler")
+                    .await;
+            }
             if let Some(tx) = shutdown_tx_clone {
                 let _ = tx.send(()).await;
             }
