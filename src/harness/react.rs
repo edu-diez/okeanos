@@ -375,8 +375,7 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::Event;
-    use crate::model::{MockModel, ModelCapabilities, ModelTier};
+    use crate::model::{MockModel, ModelTier};
     use crate::tool::ToolRegistry;
     use std::sync::Arc;
 
@@ -449,10 +448,10 @@ mod tests {
         ));
 
         let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         // Note: todo tool would be registered here in real implementation
         let config = ReactConfig::default();
-        let (event_tx, mut event_rx) = crate::events::event_channel();
+        let (event_tx, _event_rx) = crate::events::event_channel();
 
         let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
         let result = loop_.run("Test prompt".into()).await;

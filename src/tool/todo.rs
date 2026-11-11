@@ -201,7 +201,7 @@ mod tests {
         list.add("Task 2".into());
 
         let tool1 = TodoTool::new(list.clone());
-        let tool2 = TodoTool::new(list);
+        let _tool2 = TodoTool::new(list);
 
         // They share the same list
         let items = tool1.list.list();
