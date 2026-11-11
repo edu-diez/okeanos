@@ -24,6 +24,17 @@ pub enum MessageRole {
     Tool,
 }
 
+impl std::fmt::Display for MessageRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageRole::User => write!(f, "user"),
+            MessageRole::Assistant => write!(f, "assistant"),
+            MessageRole::System => write!(f, "system"),
+            MessageRole::Tool => write!(f, "tool"),
+        }
+    }
+}
+
 /// A token delta from streaming model output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Token {

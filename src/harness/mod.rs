@@ -1,4 +1,9 @@
-//! Harness core (ReAct loop, context, ...). Stubbed in Milestone 0.
-//! Only the error type lives here; the loop is added in Milestone 2+.
+//! Harness core (ReAct loop, context, ...).
 
 pub mod error;
+pub mod policy;
+pub mod react;
+
+pub use error::HarnessError;
+pub use policy::{Policy, PolicyDecision};
+pub use react::{LoopDecision, ReactConfig, ReactError, ReactLoop};
