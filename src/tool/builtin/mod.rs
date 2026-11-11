@@ -65,7 +65,7 @@ mod tests {
     #[test]
     fn test_truncate_output_under_limit() {
         let input = "hello world";
-        let (result, truncated) = truncate_output(&input, 100);
+        let (result, truncated) = truncate_output(input, 100);
         assert!(!truncated);
         assert_eq!(result, input);
     }
@@ -73,7 +73,7 @@ mod tests {
     #[test]
     fn test_truncate_output_over_limit() {
         let input = "a".repeat(5000);
-        let (result, truncated) = truncate_output(&input, 100);
+        let (result, truncated) = truncate_output(input.as_str(), 100);
         assert!(truncated);
         assert!(result.contains("[output truncated"));
         assert!(result.len() <= 200); // head + indicator + tail + overhead
@@ -82,7 +82,7 @@ mod tests {
     #[test]
     fn test_truncate_output_exact_limit() {
         let input = "a".repeat(100);
-        let (result, truncated) = truncate_output(&input, 100);
+        let (result, truncated) = truncate_output(input.as_str(), 100);
         assert!(!truncated);
         assert_eq!(result.len(), 100);
     }
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn test_truncate_output_utf8_safe() {
         let input = "héllo wörld 🦀".repeat(500);
-        let (result, truncated) = truncate_output(&input, 50);
+        let (result, truncated) = truncate_output(input.as_str(), 50);
         assert!(truncated);
         // Should not panic on UTF-8 boundaries
         assert!(result.is_char_boundary(0));

@@ -77,6 +77,11 @@ impl Tool for WriteTool {
     }
 }
 
+/// Create all directories in `path` if they don't exist.
+fn fs_create_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,9 +158,4 @@ mod tests {
         let result = tool.execute(json!({"content": "hello"})).await;
         assert!(result.is_err());
     }
-}
-
-/// Create all directories in `path` if they don't exist.
-fn fs_create_dir_all(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
 }
