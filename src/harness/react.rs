@@ -798,11 +798,11 @@ mod tests {
         // Wait for the approval request event.
         let mut req_id = None;
         for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv() {
-                if let crate::events::Event::ApprovalRequest(req) = event {
-                    req_id = Some(req.id);
-                    break;
-                }
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::ApprovalRequest(req) = event
+            {
+                req_id = Some(req.id);
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -857,11 +857,11 @@ mod tests {
         // Wait for the approval request event.
         let mut req_id = None;
         for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv() {
-                if let crate::events::Event::ApprovalRequest(req) = event {
-                    req_id = Some(req.id);
-                    break;
-                }
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::ApprovalRequest(req) = event
+            {
+                req_id = Some(req.id);
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -930,11 +930,11 @@ mod tests {
         // First write: wait for approval request, grant AllowAlways.
         let mut req_id = None;
         for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv() {
-                if let crate::events::Event::ApprovalRequest(req) = event {
-                    req_id = Some(req.id);
-                    break;
-                }
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::ApprovalRequest(req) = event
+            {
+                req_id = Some(req.id);
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -952,13 +952,12 @@ mod tests {
         // AllowAlways grants session-wide permission.
         let mut second_req = None;
         for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv() {
-                if let crate::events::Event::ApprovalRequest(req) = event {
-                    if req.id != req_id {
-                        second_req = Some(req.id);
-                        break;
-                    }
-                }
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::ApprovalRequest(req) = event
+                && req.id != req_id
+            {
+                second_req = Some(req.id);
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
