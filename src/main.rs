@@ -4,9 +4,10 @@ use okeanos::cli::{Cli, Mode};
 use okeanos::config::Config;
 use okeanos::context::Conversation;
 use okeanos::events::Event;
-use okeanos::harness::{ReactConfig, ReactLoop};
+use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::model::{MockModel, ModelTier};
 use okeanos::tool::{TodoList, TodoTool};
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main(flavor = "current_thread")]
@@ -37,7 +38,7 @@ async fn run_interactive(_cli: &Cli) -> anyhow::Result<()> {
     .context("interactive mode is not yet implemented (Milestone 11)")
 }
 
-async fn run_headless(cli: &Cli, _config: &Config) -> anyhow::Result<()> {
+async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
     // Get the prompt from CLI
     let prompt = cli.prompt.clone().unwrap_or_else(|| {
         eprintln!("Error: prompt is required in headless mode");
@@ -63,6 +64,18 @@ async fn run_headless(cli: &Cli, _config: &Config) -> anyhow::Result<()> {
     let mut tools = okeanos::tool::ToolRegistry::new();
     tools.register(TodoTool::new(todo_list));
 
+    // Build permission policy from config (global + project allow-list).
+    let allow_list = config
+        .permissions
+        .as_ref()
+        .and_then(|p| p.allow_list.clone())
+        .unwrap_or_else(|| vec!["todo".to_string()]);
+    let policy = Policy::new(allow_list);
+
+    // Channel for external approval decisions (TUI modal, RPC `approve`/`deny`).
+    let (approval_tx, approval_rx) = mpsc::channel(16);
+    let _ = approval_tx; // reserved for external approval sources in later milestones
+
     // Configure ReAct loop
     let react_config = ReactConfig {
         max_iterations: 10,
@@ -70,8 +83,10 @@ async fn run_headless(cli: &Cli, _config: &Config) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    // Create and run the ReAct loop
-    let loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx);
+    // Create and run the ReAct loop with policy + approval wiring.
+    let loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
+        .with_policy(policy)
+        .with_approval_receiver(approval_rx);
 
     // Spawn event logger
     let logger_handle = tokio::spawn(async move {

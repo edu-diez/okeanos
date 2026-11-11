@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -160,7 +160,16 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for policy decisions (allow/deny/allow-always), approval pause/resume. No network.
 
-**Definition of Done:** CI green; no tool executes a guarded operation without policy approval; milestone tagged.
+**Definition of Done:** CI green; no tool executes a guarded operation without policy approval; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes
+- `cargo build --release` produces a single binary
+- `todo` add/complete/list executes without approval (allow-list + Read category)
+- Stubbed `write` tool is blocked until approval is granted (allow / deny / allow-always)
+- Loop pauses on `ApprovalRequest` and resumes on `Approval` decision
+- Policy decisions (allow/deny/allow-always) unit tested; approval pause/resume unit tested
+- Tagged v0.1.0-milestone-5
 
 ---
 

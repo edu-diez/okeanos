@@ -7,6 +7,22 @@ use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
 
+/// Category of a tool operation, used by the permission layer to decide
+/// whether an operation needs approval before execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCategory {
+    /// Read-only operation (read, grep, todo list, etc.) — safe by default.
+    #[default]
+    Read,
+    /// Write/modify operation (write, edit, etc.) — requires confirmation.
+    Write,
+    /// Delete operation — requires confirmation.
+    Delete,
+    /// Network operation — requires confirmation.
+    Network,
+}
+
 /// JSON Schema for tool input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolSpec {
@@ -14,10 +30,12 @@ pub struct ToolSpec {
     pub description: String,
     pub input_schema: Value,
     pub output_schema: Option<Value>,
+    /// Operation category for permission gating.
+    pub category: ToolCategory,
 }
 
 impl ToolSpec {
-    /// Create a new tool spec.
+    /// Create a new tool spec (defaults to `Read` category).
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -28,12 +46,19 @@ impl ToolSpec {
             description: description.into(),
             input_schema,
             output_schema: None,
+            category: ToolCategory::Read,
         }
     }
 
     /// Create a tool spec with output schema.
     pub fn with_output_schema(mut self, output_schema: Value) -> Self {
         self.output_schema = Some(output_schema);
+        self
+    }
+
+    /// Set the tool's operation category.
+    pub fn with_category(mut self, category: ToolCategory) -> Self {
+        self.category = category;
         self
     }
 }

@@ -2,7 +2,8 @@
 
 use crate::context::{Conversation, ConversationError};
 use crate::events::{
-    Event, EventSender, Message, MessageRole, ToolCall, ToolCallStatus, ToolResult,
+    Approval, ApprovalDecision, ApprovalRequest, Event, EventSender, Message, MessageRole,
+    ToolCall, ToolCallStatus, ToolResult,
 };
 use crate::model::text_tool::{TextToolError, TextToolParser};
 use crate::model::{GenerationParams, Model, ModelError, ModelMessage, ModelResponse};
@@ -12,6 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+use super::policy::{Policy, PolicyDecision};
 
 /// Errors from the ReAct loop.
 #[derive(Debug, Error)]
@@ -80,6 +83,8 @@ pub struct ReactLoop<M: Model> {
     iteration: usize,
     start_time: Instant,
     shutdown_rx: Option<mpsc::Receiver<()>>,
+    policy: Policy,
+    approval_rx: Option<mpsc::Receiver<Approval>>,
 }
 
 impl<M: Model> ReactLoop<M> {
@@ -100,12 +105,30 @@ impl<M: Model> ReactLoop<M> {
             iteration: 0,
             start_time: Instant::now(),
             shutdown_rx: None,
+            policy: Policy::new(vec![]),
+            approval_rx: None,
         }
     }
 
     /// Set the shutdown signal receiver.
     pub fn with_shutdown(mut self, rx: mpsc::Receiver<()>) -> Self {
         self.shutdown_rx = Some(rx);
+        self
+    }
+
+    /// Set the permission policy used to gate tool execution.
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Set the approval decision receiver.
+    ///
+    /// When a tool requires approval, the loop emits an `ApprovalRequest`
+    /// event and waits on this channel for a matching `Approval` decision
+    /// before resuming.
+    pub fn with_approval_receiver(mut self, rx: mpsc::Receiver<Approval>) -> Self {
+        self.approval_rx = Some(rx);
         self
     }
 
@@ -323,8 +346,58 @@ impl<M: Model> ReactLoop<M> {
         messages
     }
 
-    /// Execute a tool call.
-    async fn execute_tool(&self, tool_call: ToolCall) -> Result<ToolResult, ReactError> {
+    /// Execute a tool call, gated by the permission policy.
+    ///
+    /// If the policy requires approval, the loop emits an `ApprovalRequest`
+    /// event and pauses, waiting for a matching `Approval` decision on the
+    /// approval receiver. The loop resumes only on `Allow` or `AllowAlways`;
+    /// `Deny` aborts execution with a structured error.
+    async fn execute_tool(&mut self, tool_call: ToolCall) -> Result<ToolResult, ReactError> {
+        // Resolve the tool and clone its spec so the policy check doesn't
+        // hold an immutable borrow across the mutable approval wait.
+        let tool = self
+            .tools
+            .get(&tool_call.name)
+            .ok_or_else(|| ReactError::Tool(format!("unknown tool: {}", tool_call.name)))?;
+        let spec = tool.spec();
+
+        // Gate execution behind the permission policy.
+        match self.policy.check(&tool_call.name, &spec) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Deny => {
+                return Err(ReactError::Tool(format!(
+                    "permission denied: {}",
+                    tool_call.name
+                )));
+            }
+            PolicyDecision::RequireApproval => {
+                // Emit approval request and pause the loop until a decision arrives.
+                let approval_id = format!("approval-{}", self.iteration);
+                self.emit_approval_request(ApprovalRequest {
+                    id: approval_id.clone(),
+                    tool: tool_call.name.clone(),
+                    args: tool_call.args.clone(),
+                })
+                .await;
+
+                let decision = self.wait_for_approval(&approval_id).await?;
+
+                match decision {
+                    ApprovalDecision::Allow => {}
+                    ApprovalDecision::AllowAlways => {
+                        self.policy.allow_always(&tool_call.name);
+                    }
+                    ApprovalDecision::Deny => {
+                        return Err(ReactError::Tool(format!(
+                            "permission denied: {}",
+                            tool_call.name
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Re-fetch the tool (the borrow was dropped above).
         let tool = self
             .tools
             .get(&tool_call.name)
@@ -380,6 +453,30 @@ impl<M: Model> ReactLoop<M> {
         Ok(result)
     }
 
+    /// Wait for an `Approval` decision matching `approval_id` on the approval
+    /// receiver. Returns `Err` if no receiver is configured or the channel
+    /// closes before a matching decision arrives.
+    async fn wait_for_approval(
+        &mut self,
+        approval_id: &str,
+    ) -> Result<ApprovalDecision, ReactError> {
+        let Some(rx) = &mut self.approval_rx else {
+            return Err(ReactError::Tool(
+                "approval required for tool but no approval receiver configured".to_string(),
+            ));
+        };
+
+        while let Some(approval) = rx.recv().await {
+            if approval.id == approval_id {
+                return Ok(approval.decision);
+            }
+        }
+
+        Err(ReactError::Stopped {
+            reason: "approval channel closed before decision".into(),
+        })
+    }
+
     /// Check if the model's response indicates task completion.
     fn is_completion_response(&self, content: &str) -> bool {
         // Simple heuristic: check for completion markers
@@ -403,6 +500,11 @@ impl<M: Model> ReactLoop<M> {
     /// Emit a tool result event.
     async fn emit_tool_result(&self, result: ToolResult) {
         let _ = self.event_tx.send(Event::ToolResult(result));
+    }
+
+    /// Emit an approval request event.
+    async fn emit_approval_request(&self, req: ApprovalRequest) {
+        let _ = self.event_tx.send(Event::ApprovalRequest(req));
     }
 
     /// Emit a status event.
@@ -441,6 +543,9 @@ mod tests {
     use crate::model::{MockModel, ModelTier};
     use crate::tool::ToolRegistry;
     use crate::tool::todo::TodoTool;
+    use crate::tool::tool_trait::{Tool, ToolCategory, ToolError, ToolSpec};
+    use async_trait::async_trait;
+    use serde_json::Value;
     use std::sync::Arc;
 
     #[tokio::test]
@@ -579,5 +684,331 @@ mod tests {
             ReactError::Tool(msg) => assert!(msg.contains("text tool call failed")),
             _ => panic!("expected text tool call error"),
         }
+    }
+
+    // ---- WriteTool stub for approval tests ----
+
+    struct WriteTool;
+
+    #[async_trait]
+    impl Tool for WriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(
+                "write",
+                "Write a file",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }),
+            )
+            .with_category(ToolCategory::Write)
+        }
+
+        async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+            Ok("written".to_string())
+        }
+    }
+
+    /// Helper: build a loop with a policy that only allows `todo`, plus an
+    /// approval channel for write/delete/network tools.
+    fn build_approval_loop(
+        model: Arc<MockModel>,
+        conversation: Conversation,
+        tools: ToolRegistry,
+        config: ReactConfig,
+    ) -> (
+        ReactLoop<MockModel>,
+        crate::events::EventReceiver,
+        mpsc::Sender<crate::events::Approval>,
+    ) {
+        let (event_tx, event_rx) = crate::events::event_channel();
+        let (approval_tx, approval_rx) = mpsc::channel(16);
+        let policy = Policy::new(vec!["todo".into()]);
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_policy(policy)
+            .with_approval_receiver(approval_rx);
+        (loop_, event_rx, approval_tx)
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_todo_without_approval() {
+        // todo is on the allow-list -> executes without approval.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Let me create a todo.\n<tool_call name=\"todo\">\n{\"action\": \"add\", \"title\": \"Test task\"}\n</tool_call>",
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+
+        let (loop_, _event_rx, _approval_tx) =
+            build_approval_loop(model, conversation, tools, config);
+        let result = loop_.run("Create a todo".into()).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_write_blocked_until_approval_allowed() {
+        // write requires approval; loop pauses on ApprovalRequest, resumes
+        // when Allow is received.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me write a file",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(WriteTool);
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+
+        let (loop_, mut event_rx, approval_tx) =
+            build_approval_loop(model, conversation, tools, config);
+
+        // Run the loop in a background task; it will pause at approval.
+        let loop_handle = tokio::spawn(async move { loop_.run("Write a file".into()).await });
+
+        // Wait for the approval request event.
+        let mut req_id = None;
+        for _ in 0..200 {
+            if let Ok(event) = event_rx.try_recv() {
+                if let crate::events::Event::ApprovalRequest(req) = event {
+                    req_id = Some(req.id);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let req_id = req_id.expect("expected approval request event");
+
+        // Grant approval -> loop should resume and complete.
+        approval_tx
+            .send(crate::events::Approval {
+                id: req_id,
+                decision: crate::events::ApprovalDecision::Allow,
+            })
+            .await
+            .expect("failed to send approval");
+
+        let result = loop_handle.await.expect("loop task panicked");
+        assert!(
+            result.is_ok(),
+            "loop should complete after approval: {result:?}"
+        );
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_write_denied() {
+        // write requires approval; Deny aborts the loop with a structured error.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me write a file",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(WriteTool);
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+
+        let (loop_, mut event_rx, approval_tx) =
+            build_approval_loop(model, conversation, tools, config);
+
+        let loop_handle = tokio::spawn(async move { loop_.run("Write a file".into()).await });
+
+        // Wait for the approval request event.
+        let mut req_id = None;
+        for _ in 0..200 {
+            if let Ok(event) = event_rx.try_recv() {
+                if let crate::events::Event::ApprovalRequest(req) = event {
+                    req_id = Some(req.id);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let req_id = req_id.expect("expected approval request event");
+
+        // Deny approval -> loop should fail with permission denied.
+        approval_tx
+            .send(crate::events::Approval {
+                id: req_id,
+                decision: crate::events::ApprovalDecision::Deny,
+            })
+            .await
+            .expect("failed to send denial");
+
+        let result = loop_handle.await.expect("loop task panicked");
+        assert!(result.is_err(), "loop should fail on denial: {result:?}");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("permission denied"),
+            "expected permission denied error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_write_allow_always() {
+        // AllowAlways grants session-wide permission; subsequent write calls
+        // proceed without another approval request.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me write a file",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "/tmp/a.txt", "content": "a"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me write another file",
+            vec![crate::events::ToolCall {
+                id: "call-2".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "/tmp/b.txt", "content": "b"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(WriteTool);
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+
+        let (loop_, mut event_rx, approval_tx) =
+            build_approval_loop(model, conversation, tools, config);
+
+        let loop_handle = tokio::spawn(async move { loop_.run("Write files".into()).await });
+
+        // First write: wait for approval request, grant AllowAlways.
+        let mut req_id = None;
+        for _ in 0..200 {
+            if let Ok(event) = event_rx.try_recv() {
+                if let crate::events::Event::ApprovalRequest(req) = event {
+                    req_id = Some(req.id);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let req_id = req_id.expect("expected first approval request event");
+
+        approval_tx
+            .send(crate::events::Approval {
+                id: req_id.clone(),
+                decision: crate::events::ApprovalDecision::AllowAlways,
+            })
+            .await
+            .expect("failed to send allow-always");
+
+        // Second write: should NOT produce another ApprovalRequest because
+        // AllowAlways grants session-wide permission.
+        let mut second_req = None;
+        for _ in 0..200 {
+            if let Ok(event) = event_rx.try_recv() {
+                if let crate::events::Event::ApprovalRequest(req) = event {
+                    if req.id != req_id {
+                        second_req = Some(req.id);
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            second_req.is_none(),
+            "second write should not require another approval after AllowAlways"
+        );
+
+        let result = loop_handle.await.expect("loop task panicked");
+        assert!(result.is_ok(), "loop should complete: {result:?}");
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_no_approval_receiver_errors() {
+        // Without an approval receiver, a tool requiring approval returns an
+        // error instead of hanging.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me write a file",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                args: serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(WriteTool);
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+        let policy = Policy::new(vec!["todo".into()]);
+
+        // No approval receiver configured.
+        let loop_ =
+            ReactLoop::new(model, conversation, tools, config, event_tx).with_policy(policy);
+        let result = loop_.run("Write a file".into()).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("approval required")
+                || err.to_string().contains("permission denied"),
+            "expected approval error, got: {err}"
+        );
     }
 }
