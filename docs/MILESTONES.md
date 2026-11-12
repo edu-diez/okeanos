@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -33,8 +33,10 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 0.5 — CLI UX Essentials
 
+**Status:** complete — tagged v0.1.0-milestone-0.5
+
 **Scope:**
-- Shell completions: `--generate-completions bash|zsh|fish`.
+- Shell completions: `--generate-completions bash|zsh|fish|power-shell|elvish`.
 - Verbose/quiet flags: `-v` (info), `-vv` (debug), `-q` (warn only) controlling `tracing` filter.
 - Dry-run mode: `--dry-run` shows execution plan (tools that would run, files that would change) without executing.
 - Model override: `--model <name>` and `--provider <base_url>` flags overriding config.
@@ -47,7 +49,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 **Out of scope:** TUI, ReAct loop, tools, git snapshots, RPC.
 
 **Acceptance criteria:**
-- `okeanos --generate-completions bash` outputs valid completion script.
+- `okeanos completions bash` outputs valid completion script.
 - `-v`/`-vv`/`-q` adjust log output visibly.
 - `--dry-run` prints planned tool calls and exits 0.
 - `--model`/`--temperature` override config values in headless run.
@@ -58,7 +60,20 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for CLI arg parsing, dry-run plan generation, config validation logic. Integration test for `init` + `config validate` round-trip.
 
-**Definition of Done:** CI green; all new CLI flags functional; milestone tagged.
+**Definition of Done:** CI green; all new CLI flags functional; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (184 unit tests)
+- `cargo build --release` produces a single binary
+- Shell completions generate valid scripts for bash, zsh, fish, power-shell, elvish
+- `-v`/`-vv`/`-q` adjust tracing filter (warn/info/debug)
+- `--dry-run` prints execution plan and exits 0
+- `--model`/`--provider`/`--temperature`/`--max-tokens` override config values in headless run
+- `okeanos init` creates valid `okeanos.toml` that loads without error
+- `okeanos config validate` catches invalid TOML and missing secrets
+- `okeanos doctor` reports ✓/✗ for API key, config, deps
+- `okeanos sessions` shows table with ID, started-at, project, events
+- Tagged v0.1.0-milestone-0.5
 
 ---
 
