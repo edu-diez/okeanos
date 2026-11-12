@@ -6,6 +6,7 @@ use okeanos::context::Conversation;
 use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::model::{MockModel, ModelTier};
+use okeanos::session::{SessionManager, replay_events};
 use okeanos::tool::{TodoList, TodoTool};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -39,11 +40,75 @@ async fn run_interactive(_cli: &Cli) -> anyhow::Result<()> {
 }
 
 async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
-    // Get the prompt from CLI
-    let prompt = cli.prompt.clone().unwrap_or_else(|| {
-        eprintln!("Error: prompt is required in headless mode");
-        std::process::exit(1);
-    });
+    // Determine project root (CWD or --root)
+    let project_root = cli
+        .root
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let project_root =
+        std::fs::canonicalize(project_root).context("failed to resolve project root")?;
+
+    // Determine CWD
+    let cwd = std::env::current_dir().context("failed to get CWD")?;
+
+    // Create session manager
+    let mut session_manager =
+        SessionManager::new(&project_root).context("failed to create session manager")?;
+
+    // Handle resume or start new session
+    let (session_id, restored_messages, restored_todos, resume_warnings) =
+        if let Some(resume_id) = &cli.resume {
+            // Resume existing session
+            eprintln!("Resuming session: {}", resume_id);
+            let restored = session_manager
+                .load_session(resume_id)
+                .context("failed to load session for resume")?;
+
+            // Replay events to restore state
+            let (messages, todos) = replay_events(&restored.1);
+
+            // Print any warnings from loading
+            for warning in &restored.2 {
+                eprintln!("[WARN] Session load: {}", warning);
+            }
+
+            // Start a new session for continued logging (append mode not supported, create new)
+            // We'll log to a new session file but include a reference to the parent
+            let new_session_id = session_manager
+                .start_session(&cwd, &project_root)
+                .context("failed to start new session for resume")?;
+
+            (new_session_id, messages, todos, restored.2)
+        } else {
+            // Start new session
+            let session_id = session_manager
+                .start_session(&cwd, &project_root)
+                .context("failed to start session")?;
+
+            // If prompt is not provided, we'll error later
+            (session_id, Vec::new(), TodoList::new(), Vec::new())
+        };
+
+    eprintln!("Session ID: {}", session_id);
+
+    // Print resume warnings
+    for warning in &resume_warnings {
+        eprintln!("[WARN] {}", warning);
+    }
+
+    // Get the prompt from CLI (not needed for resume if we're just continuing, but required for new sessions)
+    let prompt = if cli.resume.is_some() {
+        // For resume, prompt is optional - we continue from where we left off
+        // But we still need something to send to the model to continue
+        cli.prompt
+            .clone()
+            .unwrap_or_else(|| "Continue from previous session.".to_string())
+    } else {
+        cli.prompt.clone().unwrap_or_else(|| {
+            eprintln!("Error: prompt is required in headless mode");
+            std::process::exit(1);
+        })
+    };
 
     // Create event channel for logging
     let (event_tx, mut event_rx) = okeanos::events::event_channel();
@@ -57,10 +122,36 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
     ));
 
     // Build conversation with system prompt
-    let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+    let mut conversation = Conversation::from_tier(ModelTier::Small, 4096);
 
-    // Create tool registry with todo tool
-    let todo_list = TodoList::new();
+    // Restore conversation messages if resuming
+    for msg in restored_messages {
+        // Add messages to conversation without emitting events (they're already in session log)
+        // We need to add them directly to the conversation
+        match msg.role {
+            okeanos::events::MessageRole::User => {
+                conversation.add_user_message(msg.content).ok();
+            }
+            okeanos::events::MessageRole::Assistant => {
+                conversation
+                    .add_assistant_message(msg.content, msg.tool_calls)
+                    .ok();
+            }
+            okeanos::events::MessageRole::Tool => {
+                if let Some(tool_call_id) = msg.tool_call_id {
+                    conversation
+                        .add_tool_message(msg.content, tool_call_id)
+                        .ok();
+                }
+            }
+            okeanos::events::MessageRole::System => {
+                // System messages are handled separately
+            }
+        }
+    }
+
+    // Create tool registry with todo tool (using restored todo list)
+    let todo_list = restored_todos;
     let mut tools = okeanos::tool::ToolRegistry::new();
     tools.register(TodoTool::new(todo_list));
 
@@ -83,10 +174,11 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    // Create and run the ReAct loop with policy + approval wiring.
+    // Create and run the ReAct loop with policy + approval wiring + session logging.
     let loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
-        .with_approval_receiver(approval_rx);
+        .with_approval_receiver(approval_rx)
+        .with_session(session_manager);
 
     // Spawn event logger
     let logger_handle = tokio::spawn(async move {
@@ -123,6 +215,10 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
 
     // Run the loop
     let result = loop_.run(prompt).await;
+
+    // Ensure session is flushed and closed
+    // Note: The session is moved into the loop, so we can't access it here directly.
+    // The loop's drop/end will handle flushing.
 
     // Wait for logger to finish
     let _ = logger_handle.await;

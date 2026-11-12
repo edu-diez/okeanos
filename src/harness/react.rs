@@ -10,6 +10,7 @@ use crate::model::text_tool::{TextToolError, TextToolParser};
 use crate::model::{
     GenerationParams, Model, ModelError, ModelMessage, ModelResponse, ModelRole, ModelTier,
 };
+use crate::session::SessionManager;
 use crate::tool::ToolRegistry;
 use anyhow::Context as _;
 use std::sync::Arc;
@@ -117,6 +118,8 @@ pub struct ReactLoop<M: Model> {
     shutdown_rx: Option<mpsc::Receiver<()>>,
     policy: Policy,
     approval_rx: Option<mpsc::Receiver<Approval>>,
+    /// Optional session manager for logging events to session log.
+    session: Option<SessionManager>,
 }
 
 impl<M: Model> ReactLoop<M> {
@@ -140,7 +143,14 @@ impl<M: Model> ReactLoop<M> {
             shutdown_rx: None,
             policy: Policy::new(vec![]),
             approval_rx: None,
+            session: None,
         }
+    }
+
+    /// Set the session manager for logging events to a session log.
+    pub fn with_session(mut self, session: SessionManager) -> Self {
+        self.session = Some(session);
+        self
     }
 
     /// Set the shutdown signal receiver.
@@ -559,7 +569,7 @@ impl<M: Model> ReactLoop<M> {
     /// model not found, context length) are returned immediately without
     /// retry. Every retry attempt is logged as an event.
     async fn call_model(&mut self, messages: &[ModelMessage]) -> Result<ModelResponse, ModelError> {
-        let policy = &self.config.retry_policy;
+        let retry_policy = self.config.retry_policy.clone();
         let mut attempt = 0usize;
 
         loop {
@@ -570,16 +580,17 @@ impl<M: Model> ReactLoop<M> {
             {
                 Ok(response) => return Ok(response),
                 Err(error) => {
-                    let retryable = policy.classify(&error);
-                    if retryable == RetryDecision::Retry && attempt < policy.max_retries {
+                    let retryable = retry_policy.classify(&error);
+                    if retryable == RetryDecision::Retry && attempt < retry_policy.max_retries {
                         self.retries += 1;
-                        let backoff = policy.backoff_for_attempt(attempt, Some(&error));
+                        let backoff = retry_policy.backoff_for_attempt(attempt, Some(&error));
+                        let max_retries = retry_policy.max_retries;
                         self.emit_log(
                             LogLevel::Warn,
                             format!(
                                 "Provider error (attempt {}/{}), retrying in {:?}: {}",
                                 attempt + 1,
-                                policy.max_retries,
+                                max_retries,
                                 backoff,
                                 error
                             ),
@@ -675,13 +686,7 @@ impl<M: Model> ReactLoop<M> {
             }
         }
 
-        // Re-fetch the tool (the borrow was dropped above).
-        let tool = self
-            .tools
-            .get(&tool_call.name)
-            .ok_or_else(|| ReactError::Tool(format!("unknown tool: {}", tool_call.name)))?;
-
-        // Emit tool call started event
+        // Emit tool call started event (before re-fetching tool to avoid borrow conflict)
         self.emit_tool_call(ToolCall {
             id: tool_call.id.clone(),
             name: tool_call.name.clone(),
@@ -689,6 +694,12 @@ impl<M: Model> ReactLoop<M> {
             status: ToolCallStatus::Pending,
         })
         .await;
+
+        // Re-fetch the tool (the borrow was dropped above).
+        let tool = self
+            .tools
+            .get(&tool_call.name)
+            .ok_or_else(|| ReactError::Tool(format!("unknown tool: {}", tool_call.name)))?;
 
         let start = Instant::now();
 
@@ -764,27 +775,43 @@ impl<M: Model> ReactLoop<M> {
     }
 
     /// Emit a message event.
-    async fn emit_message(&self, msg: Message) {
-        let _ = self.event_tx.send(Event::Message(msg));
+    async fn emit_message(&mut self, msg: Message) {
+        let event = Event::Message(msg);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 
     /// Emit a tool call event.
-    async fn emit_tool_call(&self, call: ToolCall) {
-        let _ = self.event_tx.send(Event::ToolCall(call));
+    async fn emit_tool_call(&mut self, call: ToolCall) {
+        let event = Event::ToolCall(call);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 
     /// Emit a tool result event.
-    async fn emit_tool_result(&self, result: ToolResult) {
-        let _ = self.event_tx.send(Event::ToolResult(result));
+    async fn emit_tool_result(&mut self, result: ToolResult) {
+        let event = Event::ToolResult(result);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 
     /// Emit an approval request event.
-    async fn emit_approval_request(&self, req: ApprovalRequest) {
-        let _ = self.event_tx.send(Event::ApprovalRequest(req));
+    async fn emit_approval_request(&mut self, req: ApprovalRequest) {
+        let event = Event::ApprovalRequest(req);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 
     /// Emit a status event.
-    async fn emit_status(&self) {
+    async fn emit_status(&mut self) {
         let status = crate::events::Status {
             model: self.model.model_id().to_string(),
             tokens_in: self.conversation.estimated_tokens() as u64,
@@ -794,21 +821,29 @@ impl<M: Model> ReactLoop<M> {
             retries: self.retries,
             mode: "headless".to_string(),
         };
-        let _ = self.event_tx.send(Event::Status(status));
+        let event = Event::Status(status);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 
     /// Emit an error event to the event stream.
-    async fn emit_error(&self, code: &str, message: &str) {
-        let _ = self
-            .event_tx
-            .send(Event::error(code.to_string(), message.to_string()));
+    async fn emit_error(&mut self, code: &str, message: &str) {
+        let event = Event::error(code.to_string(), message.to_string());
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 
     /// Emit a log event.
-    async fn emit_log(&self, level: crate::events::LogLevel, message: String) {
-        let _ = self
-            .event_tx
-            .send(Event::Log(crate::events::Log { level, message }));
+    async fn emit_log(&mut self, level: crate::events::LogLevel, message: String) {
+        let event = Event::Log(crate::events::Log { level, message });
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
     }
 }
 

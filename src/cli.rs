@@ -18,6 +18,13 @@ pub struct Cli {
         help = "Project root directory (defaults to CWD)"
     )]
     pub root: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        help = "Resume a previous session by ID"
+    )]
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

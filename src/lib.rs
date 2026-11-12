@@ -9,6 +9,7 @@ pub mod context;
 pub mod events;
 pub mod harness;
 pub mod model;
+pub mod session;
 pub mod tool;
 
 pub use harness::error::HarnessError;
