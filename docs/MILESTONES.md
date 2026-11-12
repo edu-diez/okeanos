@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -260,7 +260,37 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 9 — Cost budget
+## Milestone 9 — OpenRouter / OpenAI-compatible provider
+
+**Scope:**
+- `OpenRouterModel` implementing `Model` trait with chat completion + streaming.
+- OpenAI-compatible API via reqwest + rustls (already in deps).
+- Native function calling (OpenAI tool calling format) with `supports_tool_calling = true`.
+- Streaming token deltas via SSE; emit `Token` events for TUI/headless parity.
+- Provider discovery via OpenRouter `/models` endpoint with local cache (24h TTL).
+- Model capability negotiation: auto-populate `ModelCapabilities` from discovered metadata.
+- Config-driven model selection: `model.name`, `provider.base_url`, `provider.api_key` (with `{env:VAR}`/`{file:path}` secret substitution).
+- Retry policy integration: 429/503 → exponential backoff (uses M7 retry policy).
+- Error mapping: provider errors → `ModelError` variants (AuthFailed, RateLimited, ServiceUnavailable, ContextLengthExceeded, InvalidRequest, ModelNotFound, MissingCapability).
+- Per-model pricing from OpenRouter metadata → cost estimation (feeds M10 cost budget).
+
+**Out of scope:** Non-OpenAI-compatible providers (Anthropic, etc. — feature-gated post-MVP), WebSocket transport, MCP client.
+
+**Acceptance criteria:**
+- `okeanos --headless "prompt"` runs end-to-end against OpenRouter with a real model.
+- Streaming tokens render in headless JSON events and TUI (when M12 ready).
+- Native tool calls execute via `ToolRegistry`; text-based fallback works for models without FC.
+- Provider discovery populates capabilities; explicit TOML override works for self-hosted.
+- Rate limits trigger retry with backoff; permanent errors fail fast.
+- Cost estimates match OpenRouter pricing (within estimate tolerance).
+
+**Testing requirements:** Integration tests with real OpenRouter API (feature-gated, requires API key); unit tests with mock HTTP server for error mapping, streaming parsing, tool call format. CI runs unit tests only; integration tests run manually or in separate workflow.
+
+**Definition of Done:** CI green (unit tests); integration verified manually; milestone tagged.
+
+---
+
+## Milestone 10 — Cost budget
 
 **Scope:**
 - Opt-in hard session cost cap (USD) + per-turn soft warning threshold.
@@ -282,7 +312,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 10 — Edit format
+## Milestone 11 — Edit format
 
 **Scope:**
 - Diff/patch default for frontier models; whole-file / str_replace fallback for small local models.
@@ -303,7 +333,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 11 — TUI shell
+## Milestone 12 — TUI shell
 
 **Scope:**
 - ratatui + crossterm TUI per DESIGN.md: theme tokens from `assets/themes/dark.toml`/`light.toml`, responsive layout grid (80×24 min, 120×40 comfortable).
@@ -325,7 +355,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 12 — Git snapshots + undo/redo
+## Milestone 13 — Git snapshots + undo/redo
 
 **Scope:**
 - gix-based snapshot store: snapshot before destructive actions and on loop boundaries.
@@ -345,7 +375,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 13 — Headless/RPC mode
+## Milestone 14 — Headless/RPC mode
 
 **Scope:**
 - `--headless`: no terminal; JSON event stream to stdout identical to TUI events.
@@ -366,7 +396,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 14 — Apple Silicon support
+## Milestone 15 — Apple Silicon support
 
 **Scope:**
 - Native `aarch64-apple-darwin` target build via osxcross (or macOS CI runners), producing a native Apple Silicon binary.
@@ -398,9 +428,10 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 6 | Built-in tools + interruptible execution | 2 | M4, M5 |
 | 7 | Rate limits & fallback strategies | 1 | M6 |
 | 8 | Session log & resume | 1 | M2 |
-| 9 | Cost budget | 1 | M2, M3 |
-| 10 | Edit format | 1 | M6 |
-| 11 | TUI shell | 2–3 | M2, M4, M5 |
-| 12 | Git snapshots + undo/redo | 2 | M6 |
-| 13 | Headless/RPC | 2 | M2, M8, M11 |
-| 14 | Apple Silicon support | 1–2 | M0 |
+| 9 | **OpenRouter / OpenAI-compatible provider** | 2 | M3, M4 |
+| 10 | Cost budget | 1 | M2, M3, M9 |
+| 11 | Edit format | 1 | M6, M9 |
+| 12 | TUI shell | 2–3 | M2, M4, M5, M9, M11 |
+| 13 | Git snapshots + undo/redo | 2 | M6 |
+| 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
+| 15 | Apple Silicon support | 1–2 | M0 |
