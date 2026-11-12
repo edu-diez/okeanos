@@ -5,7 +5,7 @@
 //! Features:
 //! - Configurable per-invocation timeout (`timeout_secs` argument).
 //! - Output streams incrementally (line by line) as the process produces it.
-//! - On timeout: SIGKILL, drain output, return with `timed_out: true`.
+//! - On timeout: SIGTERM → grace period → SIGKILL, drain output, return with `timed_out: true`.
 //! - On cancellation (shutdown signal): process killed via `kill_on_drop`.
 //! - Returns `exit_code`, `timed_out`, `cancelled` in the tool result.
 //! - Output is truncated to MAX_OUTPUT_BYTES with head/tail overflow indicator.
@@ -19,6 +19,8 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
+
+const GRACE_PERIOD_MS: u64 = 500; // Grace period between SIGTERM and SIGKILL
 
 /// Built-in tool for executing local commands.
 #[derive(Debug, Default)]
@@ -118,8 +120,26 @@ impl Tool for RunTool {
                 match timeout(Duration::from_secs(secs), child.wait()).await {
                     Ok(status) => status,
                     Err(_elapsed) => {
-                        // Timeout: kill the process (SIGKILL) and drain output.
-                        let _ = child.kill().await;
+                        // Timeout: implement SIGTERM → grace period → SIGKILL sequence.
+                        #[cfg(unix)]
+                        {
+                            use nix::sys::signal::{Signal, kill};
+                            use nix::unistd::Pid;
+                            if let Some(pid) = child.id() {
+                                // Get the process group ID (negative of pid since we set process_group(0))
+                                let pgid = Pid::from_raw(-(pid as i32));
+                                // Send SIGTERM to the process group
+                                let _ = kill(pgid, Signal::SIGTERM);
+                                // Wait for grace period
+                                tokio::time::sleep(Duration::from_millis(GRACE_PERIOD_MS)).await;
+                                // Force SIGKILL if still alive
+                                let _ = kill(pgid, Signal::SIGKILL);
+                            }
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = child.kill().await;
+                        }
                         let _ = child.wait().await;
                         // Abort the stream readers — the pipes are now closed.
                         stdout_handle.abort();

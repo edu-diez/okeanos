@@ -2,11 +2,13 @@ use anyhow::Context as _;
 use clap::Parser;
 use okeanos::cli::{Cli, Mode};
 use okeanos::config::Config;
-use okeanos::context::Conversation;
+use okeanos::context::{Conversation, build_system_prompt};
 use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
-use okeanos::model::{MockModel, ModelTier};
+use okeanos::model::MockModel;
 use okeanos::session::{SessionManager, replay_events};
+use okeanos::tool::ToolRegistry;
+use okeanos::tool::builtin::{DeleteTool, GrepTool, ReadTool, RunTool, WriteTool};
 use okeanos::tool::{TodoList, TodoTool};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -64,7 +66,7 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                 .load_session(resume_id)
                 .context("failed to load session for resume")?;
 
-            // Replay events to restore state
+            // Replay events to restore state (conversation + todos)
             let (messages, todos) = replay_events(&restored.1);
 
             // Print any warnings from loading
@@ -73,7 +75,6 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             }
 
             // Start a new session for continued logging (append mode not supported, create new)
-            // We'll log to a new session file but include a reference to the parent
             let new_session_id = session_manager
                 .start_session(&cwd, &project_root)
                 .context("failed to start new session for resume")?;
@@ -85,7 +86,6 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                 .start_session(&cwd, &project_root)
                 .context("failed to start session")?;
 
-            // If prompt is not provided, we'll error later
             (session_id, Vec::new(), TodoList::new(), Vec::new())
         };
 
@@ -96,10 +96,8 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         eprintln!("[WARN] {}", warning);
     }
 
-    // Get the prompt from CLI (not needed for resume if we're just continuing, but required for new sessions)
+    // Get the prompt from CLI
     let prompt = if cli.resume.is_some() {
-        // For resume, prompt is optional - we continue from where we left off
-        // But we still need something to send to the model to continue
         cli.prompt
             .clone()
             .unwrap_or_else(|| "Continue from previous session.".to_string())
@@ -113,35 +111,67 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
     // Create event channel for logging
     let (event_tx, mut event_rx) = okeanos::events::event_channel();
 
-    // Create mock model (in real implementation, this would be a real provider)
-    let model = std::sync::Arc::new(MockModel::small("mock-model"));
+    // Determine model configuration from config
+    let model_name = config
+        .model
+        .as_ref()
+        .and_then(|m| m.name.as_deref())
+        .unwrap_or("mock-model");
+
+    // Build model capabilities from config
+    let mut model_capabilities = config.to_model_capabilities(None);
+
+    // Ensure we have sensible defaults if config didn't provide them
+    if model_capabilities.max_context == 0 {
+        model_capabilities = okeanos::model::default_capabilities_for_tier(model_capabilities.tier);
+    }
+
+    // Determine model tier from capabilities
+    let model_tier = model_capabilities.tier;
+
+    // Determine context cap from config or capabilities
+    let context_cap = config
+        .context
+        .as_ref()
+        .and_then(|c| c.cap)
+        .unwrap_or(model_capabilities.max_context)
+        .max(1); // Ensure at least 1
+
+    // Create model (mock for now, real provider in M9)
+    let model = std::sync::Arc::new(MockModel::new(model_capabilities.clone(), model_name));
 
     // Program a simple response for testing
     model.push_response(okeanos::model::mock::MockModel::text_response(
         "Task complete. I've finished the requested work.",
     ));
 
-    // Build conversation with system prompt
-    let mut conversation = Conversation::from_tier(ModelTier::Small, 4096);
+    // Build conversation with system prompt and context cap
+    let system_prompt = build_system_prompt(
+        model_tier,
+        config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+    )
+    .context("failed to build system prompt")?;
+    let mut conversation =
+        Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
     // Restore conversation messages if resuming
     for msg in restored_messages {
-        // Add messages to conversation without emitting events (they're already in session log)
-        // We need to add them directly to the conversation
         match msg.role {
             okeanos::events::MessageRole::User => {
-                conversation.add_user_message(msg.content).ok();
+                if let Err(e) = conversation.add_user_message(msg.content) {
+                    eprintln!("[WARN] Failed to restore user message: {e}");
+                }
             }
             okeanos::events::MessageRole::Assistant => {
-                conversation
-                    .add_assistant_message(msg.content, msg.tool_calls)
-                    .ok();
+                if let Err(e) = conversation.add_assistant_message(msg.content, msg.tool_calls) {
+                    eprintln!("[WARN] Failed to restore assistant message: {e}");
+                }
             }
             okeanos::events::MessageRole::Tool => {
-                if let Some(tool_call_id) = msg.tool_call_id {
-                    conversation
-                        .add_tool_message(msg.content, tool_call_id)
-                        .ok();
+                if let Some(tool_call_id) = msg.tool_call_id
+                    && let Err(e) = conversation.add_tool_message(msg.content, tool_call_id)
+                {
+                    eprintln!("[WARN] Failed to restore tool message: {e}");
                 }
             }
             okeanos::events::MessageRole::System => {
@@ -150,10 +180,15 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         }
     }
 
-    // Create tool registry with todo tool (using restored todo list)
+    // Create tool registry with ALL built-in tools (using restored todo list)
     let todo_list = restored_todos;
-    let mut tools = okeanos::tool::ToolRegistry::new();
+    let mut tools = ToolRegistry::new();
     tools.register(TodoTool::new(todo_list));
+    tools.register(ReadTool::new());
+    tools.register(WriteTool::new());
+    tools.register(DeleteTool::new());
+    tools.register(RunTool::new());
+    tools.register(GrepTool::new());
 
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
@@ -163,14 +198,24 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         .unwrap_or_else(|| vec!["todo".to_string()]);
     let policy = Policy::new(allow_list);
 
-    // Channel for external approval decisions (TUI modal, RPC `approve`/`deny`).
+    // Channel for external approval decisions (TUI modal, RPC `approve`/`deny`, headless stdin).
     let (approval_tx, approval_rx) = mpsc::channel(16);
-    let _ = approval_tx; // reserved for external approval sources in later milestones
 
-    // Configure ReAct loop
+    // Spawn headless approval handler if not in TUI mode
+    let approval_handler = tokio::spawn(handle_headless_approvals(approval_tx, event_tx.clone()));
+
+    // Configure ReAct loop from config
     let react_config = ReactConfig {
-        max_iterations: 10,
-        max_elapsed_sec: 60,
+        max_iterations: config
+            .context
+            .as_ref()
+            .and_then(|c| c.max_iterations)
+            .unwrap_or(50),
+        max_elapsed_sec: config
+            .context
+            .as_ref()
+            .and_then(|c| c.max_elapsed_sec)
+            .unwrap_or(300),
         ..Default::default()
     };
 
@@ -208,6 +253,9 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                 Event::Error(err) => {
                     eprintln!("[ERROR] {}: {}", err.code, err.message);
                 }
+                Event::ApprovalRequest(req) => {
+                    eprintln!("[APPROVAL REQUIRED] tool={} args={}", req.tool, req.args);
+                }
                 _ => {}
             }
         }
@@ -216,9 +264,8 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
     // Run the loop
     let result = loop_.run(prompt).await;
 
-    // Ensure session is flushed and closed
-    // Note: The session is moved into the loop, so we can't access it here directly.
-    // The loop's drop/end will handle flushing.
+    // Shutdown approval handler
+    approval_handler.abort();
 
     // Wait for logger to finish
     let _ = logger_handle.await;
@@ -233,4 +280,32 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             Err(e.into())
         }
     }
+}
+
+/// Handle approval requests in headless mode.
+/// Reads `Approval` decisions from stdin as JSON lines.
+async fn handle_headless_approvals(
+    approval_tx: mpsc::Sender<okeanos::events::Approval>,
+    _event_tx: okeanos::events::EventSender,
+) {
+    use std::io::{BufRead, BufReader, stdin};
+    use tokio::task;
+
+    // Read stdin in a blocking task
+    task::spawn_blocking(move || {
+        let reader = BufReader::new(stdin());
+        for line in reader.lines() {
+            match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    if let Ok(approval) = serde_json::from_str::<okeanos::events::Approval>(&line) {
+                        let _ = approval_tx.blocking_send(approval);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => break, // stdin closed
+            }
+        }
+    })
+    .await
+    .ok();
 }

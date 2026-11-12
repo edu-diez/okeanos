@@ -446,46 +446,9 @@ pub fn restore_session(
 ) -> Result<RestoredSession, SessionError> {
     let (header, events, warnings) = manager.load_session(session_id)?;
 
-    let mut messages = Vec::new();
-    let todos = TodoList::new();
+    // Replay events to restore state using the proper replay function
+    let (messages, todos) = replay_events(&events);
 
-    // Replay events to rebuild state
-    for event in events {
-        match event {
-            Event::Message(msg) => {
-                messages.push(msg);
-            }
-            Event::Todo(_todo) => {
-                // Todo events are emitted when todo list changes
-                // We'll reconstruct from the event
-                // Note: Todo event is a single item, but we need the full list
-                // This is a simplification - in practice we'd track the full list
-            }
-            Event::ToolResult(result) => {
-                // Check if it's a todo tool result and reconstruct
-                if result.name == "todo"
-                    && let Ok(output) = serde_json::from_str::<serde_json::Value>(&result.output)
-                {
-                    if let Some(arr) = output.as_array() {
-                        for item_val in arr {
-                            if let Ok(_item) = serde_json::from_value::<TodoItem>(item_val.clone())
-                            {
-                                // Reconstruct todo list from items
-                                // Since TodoList is internal, we need a way to populate it
-                                // For now, we'll just note that we have todo data
-                            }
-                        }
-                    } else if let Ok(_item) = serde_json::from_value::<TodoItem>(output) {
-                        // Single item result
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // We need a better way to restore todos - the events don't capture full state
-    // For now, we'll just return what we have
     Ok(RestoredSession {
         header,
         messages,
@@ -511,21 +474,36 @@ pub fn replay_events(events: &[Event]) -> (Vec<Message>, TodoList) {
                 if result.name == "todo"
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result.output)
                 {
+                    // Check the action from the tool args to determine how to handle
+                    let action = result
+                        .args
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
                     if let Some(arr) = parsed.as_array() {
-                        for item_val in arr {
-                            if let Ok(item) = serde_json::from_value::<TodoItem>(item_val.clone()) {
-                                if item.done {
-                                    let _ = todos.complete(&item.id);
-                                } else {
-                                    todos.add(item.title);
-                                }
-                            }
-                        }
+                        // This is likely a `list` result - replace entire todo list
+                        // Clear existing and add all items from the list
+                        let items: Vec<TodoItem> = arr
+                            .iter()
+                            .filter_map(|v| serde_json::from_value::<TodoItem>(v.clone()).ok())
+                            .collect();
+                        // Rebuild todo list from scratch using the list result
+                        rebuild_todo_list(&todos, &items);
                     } else if let Ok(item) = serde_json::from_value::<TodoItem>(parsed) {
-                        if item.done {
+                        // Single item result - could be `add` or `complete`
+                        if action == "complete" || item.done {
                             let _ = todos.complete(&item.id);
+                        } else if action == "add" {
+                            // Only add if not already present (by ID)
+                            if todos.get(&item.id).is_none() {
+                                todos.add(item.title);
+                            }
                         } else {
-                            todos.add(item.title);
+                            // Default: add if not present
+                            if todos.get(&item.id).is_none() {
+                                todos.add(item.title);
+                            }
                         }
                     }
                 }
@@ -535,6 +513,38 @@ pub fn replay_events(events: &[Event]) -> (Vec<Message>, TodoList) {
     }
 
     (messages, todos)
+}
+
+/// Rebuild the entire todo list from a list of items.
+fn rebuild_todo_list(todos: &TodoList, items: &[TodoItem]) {
+    // Get current items
+    let current = todos.list();
+
+    // Complete items that are done in the new list but not in current
+    for item in items {
+        if item.done {
+            // If item exists in current but not done, complete it
+            if let Some(existing) = current.iter().find(|e| e.id == item.id) {
+                if !existing.done {
+                    let _ = todos.complete(&item.id);
+                }
+            } else {
+                // Item doesn't exist but is marked done - add then complete
+                // This shouldn't happen normally, but handle gracefully
+                let _ = todos.add(item.title.clone());
+                let _ = todos.complete(&item.id);
+            }
+        } else {
+            // Item is not done - add if not present
+            if current.iter().all(|e| e.id != item.id) {
+                todos.add(item.title.clone());
+            }
+        }
+    }
+
+    // Note: We don't remove items that are in current but not in the new list
+    // because the list result should be authoritative. In practice, the list
+    // result should contain all items.
 }
 
 /// Generate a unique session ID.
