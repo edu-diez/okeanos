@@ -560,7 +560,7 @@ fn current_timestamp() -> u64 {
 mod tests {
     use super::*;
     use crate::events::{
-        Event, Log, LogLevel, Message, MessageRole, ToolCall, ToolCallStatus, ToolResult,
+        Event, Log, LogLevel, Message, MessageRole, ToolResult,
     };
     use tempfile::tempdir;
 
