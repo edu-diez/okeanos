@@ -1,6 +1,6 @@
 use anyhow::Context as _;
 use clap::Parser;
-use okeanos::cli::{Cli, Mode};
+use okeanos::cli::{Cli, Command, ConfigAction, Mode, Shell, Verbosity};
 use okeanos::config::Config;
 use okeanos::context::{Conversation, build_system_prompt};
 use okeanos::events::Event;
@@ -15,33 +15,365 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(EnvFilter::from_default_env())
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
-
     let cli = Cli::parse();
-    let mode = cli.mode();
-    tracing::info!(mode = ?mode, "okeanos starting");
 
-    let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
-    tracing::info!("configuration loaded");
+    // Initialize tracing based on verbosity
+    init_tracing(cli.verbosity())?;
 
-    match mode {
-        Mode::Interactive => run_interactive(&cli).await,
-        Mode::Headless => run_headless(&cli, &config).await,
+    tracing::info!(mode = ?cli.mode(), "okeanos starting");
+
+    match &cli.command {
+        Some(Command::Completions { shell }) => {
+            generate_completions(*shell);
+            return Ok(());
+        }
+        Some(Command::Init { git_root, force }) => {
+            return cmd_init(*git_root, *force).await;
+        }
+        Some(Command::Config { action }) => match action {
+            ConfigAction::Validate => {
+                return cmd_config_validate(&cli).await;
+            }
+        },
+        Some(Command::Doctor) => {
+            return cmd_doctor(&cli).await;
+        }
+        Some(Command::Sessions) => {
+            return cmd_sessions(&cli).await;
+        }
+        Some(Command::Run { prompt }) => run_with_prompt(&cli, prompt.clone()).await,
+        None => {
+            // No subcommand provided, treat first positional as prompt
+            let prompt = std::env::args().nth(1);
+            run_with_prompt(&cli, prompt).await
+        }
     }
 }
 
-async fn run_interactive(_cli: &Cli) -> anyhow::Result<()> {
+// Helper to run with a prompt (for Run subcommand or implicit run)
+async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
+    let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
+    tracing::info!("configuration loaded");
+
+    match cli.mode() {
+        Mode::Interactive => run_interactive(cli, &config, prompt).await,
+        Mode::Headless => run_headless(cli, &config, prompt).await,
+    }
+}
+
+/// Initialize tracing subscriber based on verbosity level.
+fn init_tracing(verbosity: Verbosity) -> anyhow::Result<()> {
+    let filter = match verbosity {
+        Verbosity::Quiet => EnvFilter::new("warn"),
+        Verbosity::Info => EnvFilter::new("info"),
+        Verbosity::Debug => EnvFilter::new("debug"),
+    };
+
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
+
+    Ok(())
+}
+
+/// Generate shell completions for the given shell.
+fn generate_completions(shell: Shell) {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    let shell = match shell {
+        Shell::Bash => clap_complete::Shell::Bash,
+        Shell::Zsh => clap_complete::Shell::Zsh,
+        Shell::Fish => clap_complete::Shell::Fish,
+        Shell::PowerShell => clap_complete::Shell::PowerShell,
+        Shell::Elvish => clap_complete::Shell::Elvish,
+    };
+    clap_complete::generate(shell, &mut cmd, "okeanos", &mut std::io::stdout());
+}
+
+/// Initialize a new okeanos project with a default config file.
+async fn cmd_init(git_root: bool, force: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().context("failed to get CWD")?;
+
+    let target_dir = if git_root {
+        find_git_root(&cwd).unwrap_or(cwd)
+    } else {
+        cwd
+    };
+
+    let config_path = target_dir.join("okeanos.toml");
+
+    if config_path.exists() && !force {
+        anyhow::bail!(
+            "Config file already exists at {}. Use --force to overwrite.",
+            config_path.display()
+        );
+    }
+
+    let config_content = default_config_content();
+    std::fs::write(&config_path, config_content).context("failed to write config file")?;
+
+    println!("Created config at {}", config_path.display());
+    Ok(())
+}
+
+/// Find the git root directory by walking up from the given path.
+fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Default configuration content for `okeanos init`.
+fn default_config_content() -> String {
+    r#"# okeanos configuration
+# See https://github.com/okeanos/okeanos for documentation
+
+# Model configuration
+[model]
+# Model name (e.g., "gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet")
+# For local/self-hosted models, you must also provide [model.capabilities]
+name = "gpt-4o-mini"
+# Tier: "small" or "frontier" (affects prompt size, tool selection, generation params)
+tier = "frontier"
+# Optional: max context window (tokens)
+# max_context = 128000
+# Optional: max output tokens
+# max_output = 8192
+# Optional: temperature (0.0-2.0)
+# temperature = 0.7
+# Optional: edit format for this model: "diff", "whole_file", or "str_replace"
+# edit_format = "diff"
+# Optional: directory containing skill files to include in system prompt
+# skills_dir = ".okeanos/skills"
+
+# Optional: explicit capabilities for local/self-hosted models (required if name is not a known model)
+# [model.capabilities]
+# tool_calling = true
+# structured_output = true
+# thinking = true
+# max_context = 128000
+# max_output = 8192
+# temperature_supported = true
+# tier = "frontier"
+
+# Provider configuration
+[provider]
+# Provider kind (currently only "openai-compatible")
+kind = "openai-compatible"
+# Base URL for the API (e.g., "https://openrouter.ai/api/v1")
+base_url = "https://openrouter.ai/api/v1"
+# API key: use {env:VAR} or {file:path} for secret substitution
+# api_key = "{env:OPENROUTER_API_KEY}"
+
+# Context configuration
+[context]
+# Hard context cap (tokens) - 0 means no cap (uses model max)
+# cap = 0
+# Maximum iterations per session
+max_iterations = 50
+# Maximum wall-clock time (seconds)
+max_elapsed_sec = 300
+
+# Permissions configuration
+[permissions]
+# Allow-list of tools that can run without approval
+# Tools not on this list require interactive approval
+allow_list = ["todo", "read", "grep"]
+
+# Cost budget configuration (opt-in)
+# [cost]
+# Hard session cost cap (USD) - 0 means disabled
+# session_cap_usd = 0.0
+# Per-turn soft warning threshold (USD)
+# per_turn_warning_usd = 0.10
+"#
+    .to_string()
+}
+
+/// Validate the configuration file.
+async fn cmd_config_validate(cli: &Cli) -> anyhow::Result<()> {
+    let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
+    println!("Configuration is valid!");
+    println!("{config:#?}");
+    Ok(())
+}
+
+/// Health check: verify API keys, config, and dependencies.
+async fn cmd_doctor(cli: &Cli) -> anyhow::Result<()> {
+    println!("okeanos doctor");
+    println!("==============");
+    println!();
+
+    // Check config
+    let config_result = Config::load(cli.root.as_deref());
+    match &config_result {
+        Ok(config) => {
+            println!("✓ Config: OK (loaded from global + project layers)");
+            if let Some(model) = &config.model {
+                println!("  └─ Model: {}", model.name.as_deref().unwrap_or("<unset>"));
+            }
+            if let Some(provider) = &config.provider {
+                println!(
+                    "  └─ Provider: {} ({})",
+                    provider.kind.as_deref().unwrap_or("<unset>"),
+                    provider.base_url.as_deref().unwrap_or("<unset>")
+                );
+                if provider.api_key.is_some() {
+                    println!("  └─ API Key: ***SET***");
+                } else {
+                    println!("  └─ API Key: NOT SET (will fail for real providers)");
+                }
+            }
+        }
+        Err(e) => {
+            println!("✗ Config: FAILED - {e}");
+        }
+    }
+    println!();
+
+    // Check dependencies / versions
+    println!("✓ Dependencies:");
+    println!("  └─ Rust: {}", rustc_version());
+    println!("  └─ okeanos: {}", env!("CARGO_PKG_VERSION"));
+    println!("  └─ tokio: {}", tokio_version());
+    println!("  └─ reqwest: {}", reqwest_version());
+    println!("  └─ clap: {}", clap_version());
+    println!();
+
+    // Check API key validity (if configured)
+    if let Ok(config) = &config_result
+        && let Some(provider) = &config.provider
+        && let Some(api_key) = &provider.api_key
+        && !api_key.is_empty()
+    {
+        println!("✓ API Key: Present (validity check requires network)");
+    } else {
+        println!("⚠ API Key: Not configured (mock provider will be used)");
+    }
+    println!();
+
+    // Check session directory
+    if let Ok(cwd) = std::env::current_dir() {
+        let session_dir = cwd.join(".okeanos").join("sessions");
+        if session_dir.exists() {
+            let count = std::fs::read_dir(&session_dir)?
+                .filter(|e| e.is_ok())
+                .count();
+            println!(
+                "✓ Session storage: {} ({} sessions)",
+                session_dir.display(),
+                count
+            );
+        } else {
+            println!(
+                "✓ Session storage: {} (will be created on first run)",
+                session_dir.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// List resumable sessions.
+async fn cmd_sessions(cli: &Cli) -> anyhow::Result<()> {
+    let project_root = cli
+        .root
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let project_root =
+        std::fs::canonicalize(project_root).context("failed to resolve project root")?;
+
+    let session_manager =
+        SessionManager::new(&project_root).context("failed to create session manager")?;
+    let sessions = session_manager
+        .list_sessions()
+        .context("failed to list sessions")?;
+
+    if sessions.is_empty() {
+        println!(
+            "No sessions found in {}",
+            project_root.join(".okeanos/sessions").display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<40} {:<20} {:<40} {:>8}",
+        "SESSION ID", "STARTED", "PROJECT", "EVENTS"
+    );
+    println!("{}", "-".repeat(110));
+
+    for session in sessions {
+        let started = chrono::DateTime::from_timestamp_millis(session.started_at as i64)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let project = session
+            .project_root
+            .split('/')
+            .next_back()
+            .unwrap_or(&session.project_root);
+
+        println!(
+            "{:<40} {:<20} {:<40} {:>8}",
+            session.id, started, project, session.event_count
+        );
+    }
+
+    Ok(())
+}
+
+fn rustc_version() -> String {
+    // This is a compile-time value
+    option_env!("RUSTC_VERSION")
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn tokio_version() -> String {
+    option_env!("CARGO_PKG_VERSION_TOKIO")
+        .unwrap_or("1.43")
+        .to_string()
+}
+
+fn reqwest_version() -> String {
+    option_env!("CARGO_PKG_VERSION_REQWEST")
+        .unwrap_or("0.12")
+        .to_string()
+}
+
+fn clap_version() -> String {
+    option_env!("CARGO_PKG_VERSION_CLAP")
+        .unwrap_or("4.5")
+        .to_string()
+}
+
+async fn run_interactive(
+    cli: &Cli,
+    config: &Config,
+    _prompt: Option<String>,
+) -> anyhow::Result<()> {
+    // For now, interactive mode is not implemented (M12)
+    // But we still need to handle the CLI overrides for consistency
+    let _ = apply_cli_overrides(cli, config);
     Err::<(), anyhow::Error>(
         okeanos::HarnessError::UnsupportedMode("interactive TUI".into()).into(),
     )
-    .context("interactive mode is not yet implemented (Milestone 11)")
+    .context("interactive mode is not yet implemented (Milestone 12)")
 }
 
-async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
+async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {
+    // Apply CLI overrides to config
+    let (model_name, model_capabilities, generation_params) = apply_cli_overrides(cli, config);
+
     // Determine project root (CWD or --root)
     let project_root = cli
         .root
@@ -98,33 +430,26 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
 
     // Get the prompt from CLI
     let prompt = if cli.resume.is_some() {
-        cli.prompt
-            .clone()
-            .unwrap_or_else(|| "Continue from previous session.".to_string())
+        prompt.unwrap_or_else(|| "Continue from previous session.".to_string())
     } else {
-        cli.prompt.clone().unwrap_or_else(|| {
+        prompt.unwrap_or_else(|| {
             eprintln!("Error: prompt is required in headless mode");
             std::process::exit(1);
         })
     };
 
+    // Dry-run mode: show execution plan and exit
+    if cli.dry_run {
+        return run_dry_run(
+            &prompt,
+            &model_capabilities,
+            &generation_params,
+            &tools_list(),
+        );
+    }
+
     // Create event channel for logging
     let (event_tx, mut event_rx) = okeanos::events::event_channel();
-
-    // Determine model configuration from config
-    let model_name = config
-        .model
-        .as_ref()
-        .and_then(|m| m.name.as_deref())
-        .unwrap_or("mock-model");
-
-    // Build model capabilities from config
-    let mut model_capabilities = config.to_model_capabilities(None);
-
-    // Ensure we have sensible defaults if config didn't provide them
-    if model_capabilities.max_context == 0 {
-        model_capabilities = okeanos::model::default_capabilities_for_tier(model_capabilities.tier);
-    }
 
     // Determine model tier from capabilities
     let model_tier = model_capabilities.tier;
@@ -138,7 +463,10 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
         .max(1); // Ensure at least 1
 
     // Create model (mock for now, real provider in M9)
-    let model = std::sync::Arc::new(MockModel::new(model_capabilities.clone(), model_name));
+    let model = std::sync::Arc::new(MockModel::new(
+        model_capabilities.clone(),
+        model_name.clone(),
+    ));
 
     // Program a simple response for testing
     model.push_response(okeanos::model::mock::MockModel::text_response(
@@ -204,7 +532,7 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
     // Spawn headless approval handler if not in TUI mode
     let approval_handler = tokio::spawn(handle_headless_approvals(approval_tx, event_tx.clone()));
 
-    // Configure ReAct loop from config
+    // Configure ReAct loop from config + CLI overrides
     let react_config = ReactConfig {
         max_iterations: config
             .context
@@ -216,6 +544,7 @@ async fn run_headless(cli: &Cli, config: &Config) -> anyhow::Result<()> {
             .as_ref()
             .and_then(|c| c.max_elapsed_sec)
             .unwrap_or(300),
+        generation_params,
         ..Default::default()
     };
 
@@ -308,4 +637,124 @@ async fn handle_headless_approvals(
     })
     .await
     .ok();
+}
+
+/// Apply CLI overrides to configuration, returning the effective model name,
+/// capabilities, and generation parameters.
+fn apply_cli_overrides(
+    cli: &Cli,
+    config: &Config,
+) -> (
+    String,
+    okeanos::model::ModelCapabilities,
+    okeanos::model::GenerationParams,
+) {
+    use okeanos::model::{default_capabilities_for_tier, default_generation_params};
+
+    // Start with config values
+    let mut model_name = config
+        .model
+        .as_ref()
+        .and_then(|m| m.name.as_deref())
+        .unwrap_or("mock-model")
+        .to_string();
+
+    let mut model_capabilities = config.to_model_capabilities(None);
+    let mut generation_params = default_generation_params(model_capabilities.tier);
+
+    // Apply CLI overrides
+    if let Some(ref m) = cli.model {
+        model_name = m.clone();
+        // Re-classify capabilities for the new model name
+        if config
+            .model
+            .as_ref()
+            .is_none_or(|m| m.capabilities.is_none())
+        {
+            // Only auto-classify if no explicit capabilities were provided
+            let classification = okeanos::model::classify_model(m);
+            model_capabilities = default_capabilities_for_tier(classification.tier);
+        }
+    }
+
+    if cli.provider.is_some() {
+        // Provider base URL override is handled at the provider level (M9)
+        // For now, we just note it would be used
+    }
+
+    if let Some(temp) = cli.temperature {
+        if model_capabilities.temperature_supported {
+            generation_params.temperature = Some(temp as f64);
+        } else {
+            eprintln!("[WARN] Temperature override ignored: model does not support temperature");
+        }
+    }
+
+    if let Some(max_tokens) = cli.max_tokens {
+        if max_tokens > 0 && max_tokens <= model_capabilities.max_output {
+            generation_params.max_tokens = Some(max_tokens);
+        } else {
+            eprintln!(
+                "[WARN] Max-tokens override ignored: value {} exceeds model max_output ({}) or is invalid",
+                max_tokens, model_capabilities.max_output
+            );
+        }
+    }
+
+    (model_name, model_capabilities, generation_params)
+}
+
+/// List of available tools for dry-run display.
+fn tools_list() -> Vec<&'static str> {
+    vec!["todo", "read", "write", "delete", "run", "grep"]
+}
+
+/// Dry-run mode: show execution plan without executing.
+fn run_dry_run(
+    prompt: &str,
+    capabilities: &okeanos::model::ModelCapabilities,
+    generation_params: &okeanos::model::GenerationParams,
+    tools: &[&'static str],
+) -> anyhow::Result<()> {
+    println!("=== DRY RUN ===");
+    println!();
+    println!("Prompt: {}", prompt);
+    println!();
+    println!("Model: {} (tier: {})", capabilities.tier, capabilities.tier);
+    println!("Capabilities:");
+    println!("  tool_calling: {}", capabilities.tool_calling);
+    println!("  structured_output: {}", capabilities.structured_output);
+    println!("  thinking: {}", capabilities.thinking);
+    println!("  max_context: {}", capabilities.max_context);
+    println!("  max_output: {}", capabilities.max_output);
+    println!(
+        "  temperature_supported: {}",
+        capabilities.temperature_supported
+    );
+    println!();
+    println!("Generation Parameters:");
+    println!("  temperature: {:?}", generation_params.temperature);
+    println!("  max_tokens: {:?}", generation_params.max_tokens);
+    println!("  top_p: {:?}", generation_params.top_p);
+    println!("  stop_sequences: {:?}", generation_params.stop_sequences);
+    println!();
+    println!("Available Tools:");
+    for tool in tools {
+        println!("  - {}", tool);
+    }
+    println!();
+    println!("Execution Plan:");
+    println!(
+        "  1. Build conversation with system prompt ({} tier)",
+        capabilities.tier
+    );
+    println!("  2. Send prompt to model");
+    println!("  3. Parse model response for tool calls");
+    println!("  4. Validate tool calls against schemas");
+    println!("  5. Execute approved tools");
+    println!("  6. Add results to conversation");
+    println!("  7. Repeat until completion or max iterations");
+    println!();
+    println!("Dry-run complete. No actions were executed.");
+    Ok(())
 }
