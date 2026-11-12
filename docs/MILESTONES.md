@@ -31,6 +31,37 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
+## Milestone 0.5 — CLI UX Essentials
+
+**Scope:**
+- Shell completions: `--generate-completions bash|zsh|fish`.
+- Verbose/quiet flags: `-v` (info), `-vv` (debug), `-q` (warn only) controlling `tracing` filter.
+- Dry-run mode: `--dry-run` shows execution plan (tools that would run, files that would change) without executing.
+- Model override: `--model <name>` and `--provider <base_url>` flags overriding config.
+- Generation parameter overrides: `--temperature <f32>`, `--max-tokens <usize>` CLI flags.
+- Project initialization: `okeanos init` creates `okeanos.toml` with sensible defaults (model, tier, permissions) at git root or CWD.
+- Config validation: `okeanos config validate` checks TOML syntax, secret references, required fields.
+- Health check: `okeanos doctor` verifies API key validity (if configured), config load, dependency versions.
+- Session listing: `okeanos sessions` lists resumable sessions with ID, date, project, event count.
+
+**Out of scope:** TUI, ReAct loop, tools, git snapshots, RPC.
+
+**Acceptance criteria:**
+- `okeanos --generate-completions bash` outputs valid completion script.
+- `-v`/`-vv`/`-q` adjust log output visibly.
+- `--dry-run` prints planned tool calls and exits 0.
+- `--model`/`--temperature` override config values in headless run.
+- `okeanos init` creates valid `okeanos.toml` that loads without error.
+- `okeanos config validate` catches invalid TOML and missing secrets.
+- `okeanos doctor` reports ✓/✗ for API key, config, deps.
+- `okeanos sessions` shows table with ID, started-at, project, events.
+
+**Testing requirements:** Unit tests for CLI arg parsing, dry-run plan generation, config validation logic. Integration test for `init` + `config validate` round-trip.
+
+**Definition of Done:** CI green; all new CLI flags functional; milestone tagged.
+
+---
+
 ## Milestone 1 — Config & secrets
 
 **Status:** complete — tagged v0.1.0-milestone-1
@@ -388,6 +419,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - ReAct loop driven identically in all three modes; mode is a renderer/transport choice only.
 - RPC accepts `approve`/`deny` commands resolving pending approvals.
 - Slash command support via JSON events: `/help`, `/todos`, `/logs`, `/undo`, `/redo` emitted as structured events for script consumption.
+- **Headless approval handling:** `--approval-policy auto|deny|prompt` flag: `auto` = allow-all, `deny` = block all privileged ops, `prompt` = emit `ApprovalRequest` event and wait for JSON `Approval` on stdin (for scripted approval). Timeout configurable via `--approval-timeout-sec`.
 
 **Out of scope:** WebSocket transport (deferred), MCP client (deferred, `mcp` feature).
 
@@ -396,6 +428,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - RPC accepts `approve`/`deny` commands resolving pending approvals.
 - Headless mode works piped/non-TTY.
 - Slash commands emit corresponding JSON events (not interactive).
+- `--approval-policy auto` allows writes without pausing; `deny` blocks them with clear error; `prompt` waits for stdin JSON.
 
 **Testing requirements:** Event-parity test across modes; RPC request/response round-trip tests.
 
@@ -427,6 +460,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | Milestone | Deliverable | Sessions (est.) | Builds on |
 |-----------|-------------|-----------------|-----------|
 | 0 | Scaffolding + CLI | 1 | — |
+| 0.5 | CLI UX Essentials | 1 | M0 |
 | 1 | Config & secrets | 1 | M0 |
 | 2 | Core harness loop | 2 | M1 |
 | 3 | Model capabilities & tiering | 2 | M2 |
