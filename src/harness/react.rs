@@ -2,11 +2,14 @@
 
 use crate::context::{Conversation, ConversationError};
 use crate::events::{
-    Approval, ApprovalDecision, ApprovalRequest, Event, EventSender, Message, MessageRole,
-    ToolCall, ToolCallStatus, ToolResult,
+    Approval, ApprovalDecision, ApprovalRequest, Event, EventSender, LogLevel, Message,
+    MessageRole, ToolCall, ToolCallStatus, ToolResult,
 };
+use crate::harness::retry::{RetryDecision, RetryPolicy};
 use crate::model::text_tool::{TextToolError, TextToolParser};
-use crate::model::{GenerationParams, Model, ModelError, ModelMessage, ModelResponse};
+use crate::model::{
+    GenerationParams, Model, ModelError, ModelMessage, ModelResponse, ModelRole, ModelTier,
+};
 use crate::tool::ToolRegistry;
 use anyhow::Context as _;
 use std::sync::Arc;
@@ -52,6 +55,28 @@ pub enum LoopDecision {
     Stop(String),
 }
 
+/// Configuration for fallback strategies on malformed/failed tool calls.
+#[derive(Debug, Clone)]
+pub struct FallbackConfig {
+    /// Whether fallback strategies are enabled.
+    pub enabled: bool,
+    /// Maximum number of fallback retry attempts per turn (hard retry cap).
+    /// Default 1 = retry once with simpler prompt + reduced tool set.
+    pub max_retries_per_turn: usize,
+    /// Reduced tool set used during fallback attempts.
+    pub reduced_tool_set: Vec<String>,
+}
+
+impl Default for FallbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_retries_per_turn: 1,
+            reduced_tool_set: vec!["todo".to_string(), "read".to_string()],
+        }
+    }
+}
+
 /// Configuration for the ReAct loop.
 #[derive(Debug, Clone)]
 pub struct ReactConfig {
@@ -61,6 +86,10 @@ pub struct ReactConfig {
     pub max_elapsed_sec: u64,
     /// Generation parameters for the model.
     pub generation_params: GenerationParams,
+    /// Retry policy for provider errors (429/503 with exponential backoff).
+    pub retry_policy: RetryPolicy,
+    /// Fallback strategy configuration for malformed/failed tool calls.
+    pub fallback: FallbackConfig,
 }
 
 impl Default for ReactConfig {
@@ -69,6 +98,8 @@ impl Default for ReactConfig {
             max_iterations: 50,
             max_elapsed_sec: 300, // 5 minutes
             generation_params: GenerationParams::default(),
+            retry_policy: RetryPolicy::default(),
+            fallback: FallbackConfig::default(),
         }
     }
 }
@@ -81,6 +112,7 @@ pub struct ReactLoop<M: Model> {
     config: ReactConfig,
     event_tx: EventSender,
     iteration: usize,
+    retries: u32,
     start_time: Instant,
     shutdown_rx: Option<mpsc::Receiver<()>>,
     policy: Policy,
@@ -103,6 +135,7 @@ impl<M: Model> ReactLoop<M> {
             config,
             event_tx,
             iteration: 0,
+            retries: 0,
             start_time: Instant::now(),
             shutdown_rx: None,
             policy: Policy::new(vec![]),
@@ -129,6 +162,18 @@ impl<M: Model> ReactLoop<M> {
     /// before resuming.
     pub fn with_approval_receiver(mut self, rx: mpsc::Receiver<Approval>) -> Self {
         self.approval_rx = Some(rx);
+        self
+    }
+
+    /// Set the retry policy for provider errors.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.config.retry_policy = policy;
+        self
+    }
+
+    /// Set the fallback strategy configuration.
+    pub fn with_fallback(mut self, config: FallbackConfig) -> Self {
+        self.config.fallback = config;
         self
     }
 
@@ -281,35 +326,13 @@ impl<M: Model> ReactLoop<M> {
         // No native tool calls. For models without native function calling,
         // try text-based tool calling: parse raw model output into tool
         // invocations, validate against schema, then execute.
+        // On malformed/failed tool calls, retry with a simpler prompt and
+        // reduced tool set (fallback strategy); if still failing after the
+        // hard retry cap, emit an error and skip the turn.
         if !self.model.capabilities().tool_calling {
-            match TextToolParser::parse(&response.content) {
-                Ok(calls) => {
-                    if !calls.is_empty() {
-                        let validated = TextToolParser::validate(&calls, &self.tools)
-                            .map_err(|e| ReactError::Tool(format!("text tool call failed: {e}")))?;
-                        for (i, call) in validated.into_iter().enumerate() {
-                            let tool_call = ToolCall {
-                                id: format!("text-call-{}-{}", self.iteration, i),
-                                name: call.name,
-                                args: call.args,
-                                status: ToolCallStatus::Pending,
-                            };
-                            let result = self.execute_tool(tool_call, shutdown_rx).await?;
-
-                            self.conversation
-                                .add_tool_message(result.output.clone(), result.id.clone())
-                                .context("failed to add tool result")?;
-
-                            self.emit_tool_result(result).await;
-                        }
-                        return Ok(LoopDecision::Continue);
-                    }
-                }
-                Err(TextToolError::NoToolCalls) => {}
-                Err(e) => {
-                    return Err(ReactError::Tool(format!("text tool call failed: {e}")));
-                }
-            }
+            return self
+                .execute_text_tool_calls(&response.content, shutdown_rx)
+                .await;
         }
 
         // No tool calls - check for completion
@@ -320,12 +343,256 @@ impl<M: Model> ReactLoop<M> {
         }
     }
 
-    /// Call the model with the current conversation.
-    async fn call_model(&self, messages: &[ModelMessage]) -> Result<ModelResponse, ModelError> {
-        // Use non-streaming completion for simplicity
-        self.model
-            .complete(messages, &self.config.generation_params)
-            .await
+    /// Execute text-based tool calls with fallback support.
+    ///
+    /// On malformed/failed tool calls, retries with a simpler prompt and
+    /// reduced tool set up to `fallback.max_retries_per_turn` times
+    /// (hard retry cap per turn). If still failing, emits an error event and
+    /// skips the turn (returns `Continue`) rather than aborting the loop.
+    async fn execute_text_tool_calls(
+        &mut self,
+        content: &str,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<LoopDecision, ReactError> {
+        // When fallback is disabled, a single attempt is made and errors
+        // propagate immediately (preserving the validate-before-execute
+        // security property without retry).
+        if !self.config.fallback.enabled {
+            return self
+                .execute_text_tool_calls_once(content, shutdown_rx, None)
+                .await;
+        }
+
+        let max_fallback = self.config.fallback.max_retries_per_turn;
+
+        for attempt in 0..=max_fallback {
+            let is_fallback = attempt > 0;
+
+            // On fallback attempts, re-call the model with a simpler prompt
+            // to get a fresh response that is more likely to be valid.
+            let current_content = if is_fallback {
+                self.emit_log(
+                    LogLevel::Warn,
+                    format!(
+                        "Fallback attempt {}/{}: retrying with simpler prompt and reduced tool set",
+                        attempt, max_fallback
+                    ),
+                )
+                .await;
+
+                let simpler_messages = self.build_simpler_model_messages();
+                let simpler_response = self.call_model(&simpler_messages).await?;
+
+                // Add assistant message from fallback attempt.
+                self.conversation
+                    .add_assistant_message(
+                        simpler_response.content.clone(),
+                        simpler_response.tool_calls.clone(),
+                    )
+                    .context("failed to add fallback assistant message")?;
+                self.emit_message(Message {
+                    role: MessageRole::Assistant,
+                    content: simpler_response.content.clone(),
+                    tool_calls: simpler_response.tool_calls.clone(),
+                    tool_call_id: None,
+                    ts: current_timestamp(),
+                })
+                .await;
+
+                // Handle native tool calls from fallback response (defensive;
+                // non-tool-calling models should not produce these).
+                if let Some(tool_calls) = simpler_response.tool_calls
+                    && !tool_calls.is_empty()
+                {
+                    for tool_call in tool_calls {
+                        let result = self.execute_tool(tool_call, shutdown_rx).await?;
+                        self.conversation
+                            .add_tool_message(result.output.clone(), result.id.clone())
+                            .context("failed to add tool result")?;
+                        self.emit_tool_result(result).await;
+                    }
+                    return Ok(LoopDecision::Continue);
+                }
+
+                simpler_response.content
+            } else {
+                content.to_string()
+            };
+
+            let tool_filter = if is_fallback {
+                Some(self.config.fallback.reduced_tool_set.clone())
+            } else {
+                None
+            };
+
+            let result = self
+                .execute_text_tool_calls_once(&current_content, shutdown_rx, tool_filter.as_deref())
+                .await;
+
+            match result {
+                Ok(decision) => return Ok(decision),
+                Err(ReactError::Tool(_)) if is_fallback && attempt == max_fallback => {
+                    // Hard retry cap reached: emit error and skip turn.
+                    self.emit_log(
+                        LogLevel::Error,
+                        format!(
+                            "Fallback exhausted after {} attempts; skipping turn.",
+                            max_fallback
+                        ),
+                    )
+                    .await;
+                    self.emit_error(
+                        "tool_fallback_exhausted",
+                        "Tool call failed after fallback; turn skipped.",
+                    )
+                    .await;
+                    return Ok(LoopDecision::Continue);
+                }
+                Err(ReactError::Tool(_)) => {
+                    // Try next fallback attempt.
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(LoopDecision::Continue)
+    }
+
+    /// Single attempt at text-based tool calling.
+    ///
+    /// When `tool_filter` is `Some`, only the named tools are advertised to
+    /// the model and validated against (reduced tool set for fallback).
+    async fn execute_text_tool_calls_once(
+        &mut self,
+        content: &str,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+        tool_filter: Option<&[String]>,
+    ) -> Result<LoopDecision, ReactError> {
+        match TextToolParser::parse(content) {
+            Ok(calls) => {
+                if calls.is_empty() {
+                    return self.check_completion(content);
+                }
+
+                let validated = match tool_filter {
+                    Some(names) => {
+                        let specs = self.tools.filtered_specs(names);
+                        TextToolParser::validate_against_specs(&calls, &specs)
+                            .map_err(|e| ReactError::Tool(format!("text tool call failed: {e}")))?
+                    }
+                    None => TextToolParser::validate(&calls, &self.tools)
+                        .map_err(|e| ReactError::Tool(format!("text tool call failed: {e}")))?,
+                };
+
+                for (i, call) in validated.into_iter().enumerate() {
+                    let tool_call = ToolCall {
+                        id: format!("text-call-{}-{}", self.iteration, i),
+                        name: call.name,
+                        args: call.args,
+                        status: ToolCallStatus::Pending,
+                    };
+                    let result = self.execute_tool(tool_call, shutdown_rx).await?;
+
+                    self.conversation
+                        .add_tool_message(result.output.clone(), result.id.clone())
+                        .context("failed to add tool result")?;
+
+                    self.emit_tool_result(result).await;
+                }
+                Ok(LoopDecision::Continue)
+            }
+            Err(TextToolError::NoToolCalls) => self.check_completion(content),
+            Err(e) => Err(ReactError::Tool(format!("text tool call failed: {e}"))),
+        }
+    }
+
+    /// Check whether the model's response indicates task completion.
+    fn check_completion(&self, content: &str) -> Result<LoopDecision, ReactError> {
+        if self.is_completion_response(content) {
+            Ok(LoopDecision::Complete(content.to_string()))
+        } else {
+            Ok(LoopDecision::Continue)
+        }
+    }
+
+    /// Build model messages using a shorter system prompt (Small tier
+    /// template) and recent history, for use in fallback attempts.
+    fn build_simpler_model_messages(&self) -> Vec<ModelMessage> {
+        use crate::model::model_trait::system_prompt_template;
+
+        let simpler_prompt = system_prompt_template(ModelTier::Small);
+        let mut messages = Vec::with_capacity(self.conversation.message_count() + 1);
+
+        messages.push(ModelMessage {
+            role: ModelRole::System,
+            content: simpler_prompt.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        // Include recent history only (fewer turns for simpler prompt).
+        let max_turns = 3;
+        let history = self.conversation.messages();
+        let start = history.len().saturating_sub(max_turns * 2);
+        for msg in &history[start..] {
+            messages.push(ModelMessage {
+                role: match msg.role {
+                    crate::events::MessageRole::User => ModelRole::User,
+                    crate::events::MessageRole::Assistant => ModelRole::Assistant,
+                    crate::events::MessageRole::Tool => ModelRole::Tool,
+                    crate::events::MessageRole::System => ModelRole::System,
+                },
+                content: msg.content.clone(),
+                tool_calls: msg.tool_calls.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+            });
+        }
+
+        messages
+    }
+
+    /// Call the model with the current conversation, with bounded retries and
+    /// exponential backoff on retryable provider errors (429/503).
+    ///
+    /// Permanent errors (auth failure, invalid request, missing capability,
+    /// model not found, context length) are returned immediately without
+    /// retry. Every retry attempt is logged as an event.
+    async fn call_model(&mut self, messages: &[ModelMessage]) -> Result<ModelResponse, ModelError> {
+        let policy = &self.config.retry_policy;
+        let mut attempt = 0usize;
+
+        loop {
+            match self
+                .model
+                .complete(messages, &self.config.generation_params)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let retryable = policy.classify(&error);
+                    if retryable == RetryDecision::Retry && attempt < policy.max_retries {
+                        self.retries += 1;
+                        let backoff = policy.backoff_for_attempt(attempt, Some(&error));
+                        self.emit_log(
+                            LogLevel::Warn,
+                            format!(
+                                "Provider error (attempt {}/{}), retrying in {:?}: {}",
+                                attempt + 1,
+                                policy.max_retries,
+                                backoff,
+                                error
+                            ),
+                        )
+                        .await;
+                        tokio::time::sleep(backoff).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
 
     /// Build the model messages, injecting a text-based tool schema into the
@@ -524,10 +791,17 @@ impl<M: Model> ReactLoop<M> {
             tokens_out: 0,
             cost_usd: self.conversation.cost_estimate().total_cost_usd(),
             elapsed_ms: self.start_time.elapsed().as_millis() as u64,
-            retries: 0,
+            retries: self.retries,
             mode: "headless".to_string(),
         };
         let _ = self.event_tx.send(Event::Status(status));
+    }
+
+    /// Emit an error event to the event stream.
+    async fn emit_error(&self, code: &str, message: &str) {
+        let _ = self
+            .event_tx
+            .send(Event::error(code.to_string(), message.to_string()));
     }
 
     /// Emit a log event.
@@ -549,7 +823,7 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MockModel, ModelTier};
+    use crate::model::{MockModel, ModelError, ModelTier};
     use crate::tool::ToolRegistry;
     use crate::tool::todo::TodoTool;
     use crate::tool::tool_trait::{Tool, ToolCategory, ToolError, ToolExecutionResult, ToolSpec};
@@ -670,9 +944,51 @@ mod tests {
     #[tokio::test]
     async fn test_react_loop_text_based_tool_call_invalid() {
         // Invalid text tool call: missing required "action" field.
+        // Fallback is disabled so the validation error surfaces immediately.
         let model = Arc::new(MockModel::small("test-model"));
         model.push_response(crate::model::mock::MockModel::text_response(
             "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            fallback: FallbackConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Create a todo".into()).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::Tool(msg) => assert!(msg.contains("text tool call failed")),
+            _ => panic!("expected text tool call error"),
+        }
+    }
+
+    /// Malformed tool call triggers fallback retry with simpler prompt;
+    /// if fallback also fails, the turn is skipped (not aborted).
+    #[tokio::test]
+    async fn test_react_loop_fallback_retries_with_simpler_prompt() {
+        // First response: malformed tool call (missing required "action").
+        // Second response (fallback): valid tool call.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "<tool_call name=\"todo\">\n{\"action\": \"add\", \"title\": \"Fallback task\"}\n</tool_call>",
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
         ));
 
         let conversation = Conversation::from_tier(ModelTier::Small, 4096);
@@ -688,11 +1004,152 @@ mod tests {
         let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
         let result = loop_.run("Create a todo".into()).await;
 
+        assert!(
+            result.is_ok(),
+            "loop should complete after fallback: {result:?}"
+        );
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    /// When fallback is exhausted, the turn is skipped rather than aborting
+    /// the loop (provided the model eventually produces a completion).
+    #[tokio::test]
+    async fn test_react_loop_fallback_exhausted_skips_turn() {
+        // Both responses are malformed; fallback is exhausted, turn skipped,
+        // then the model completes on the next iteration.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "<tool_call name=\"todo\">\n{\"title\": \"Still no action\"}\n</tool_call>",
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            fallback: FallbackConfig {
+                max_retries_per_turn: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Create a todo".into()).await;
+
+        assert!(
+            result.is_ok(),
+            "loop should complete after skip: {result:?}"
+        );
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    /// Provider 429 rate limit triggers retry with exponential backoff.
+    #[tokio::test]
+    async fn test_react_loop_provider_rate_limited_retries() {
+        // First two calls return 429, third succeeds.
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::rate_limit_error(1));
+        model.push_response(crate::model::mock::MockModel::rate_limit_error(1));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            retry_policy: RetryPolicy {
+                max_retries: 3,
+                base_backoff_ms: 10, // short for test
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Test prompt".into()).await;
+
+        assert!(
+            result.is_ok(),
+            "loop should complete after retries: {result:?}"
+        );
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    /// Permanent provider errors (auth failure) are not retried.
+    #[tokio::test]
+    async fn test_react_loop_permanent_error_not_retried() {
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::error_response(
+            ModelError::AuthFailed,
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            retry_policy: RetryPolicy {
+                max_retries: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Test prompt".into()).await;
+
         assert!(result.is_err());
         match result.unwrap_err() {
-            ReactError::Tool(msg) => assert!(msg.contains("text tool call failed")),
-            _ => panic!("expected text tool call error"),
+            ReactError::Model(ModelError::AuthFailed) => {}
+            _ => panic!("expected AuthFailed error, not retry"),
         }
+    }
+
+    /// ServiceUnavailable (503) is retried with backoff.
+    #[tokio::test]
+    async fn test_react_loop_service_unavailable_retries() {
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::error_response(
+            ModelError::ServiceUnavailable { retry_after_sec: 0 },
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            retry_policy: RetryPolicy {
+                max_retries: 3,
+                base_backoff_ms: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Test prompt".into()).await;
+
+        assert!(
+            result.is_ok(),
+            "loop should complete after retry: {result:?}"
+        );
     }
 
     // ---- WriteTool stub for approval tests ----

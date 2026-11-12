@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -208,6 +208,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 7 — Rate limits & fallback strategies
 
+**Status:** complete — tagged v0.1.0-milestone-7  
+
 **Scope:**
 - Error-in-context with bounded retries (2–3) + exponential backoff on provider 429/503.
 - Provider errors distinguished from permanent tool errors; retry events logged.
@@ -222,7 +224,17 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for retry bounds, backoff timing, provider-vs-tool error distinction, fallback strategies. No network (mock provider returns 429/error responses).
 
-**Definition of Done:** CI green; retry and fallback verified; milestone tagged.
+**Definition of Done:** CI green; retry and fallback verified; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (176 unit tests)
+- `cargo build --release` produces a single binary
+- Provider 429/503 triggers retry with exponential backoff (2–3 attempts)
+- Permanent errors (AuthFailed, ModelNotFound, InvalidRequest, ContextLengthExceeded, MissingCapability) are not retried
+- Malformed tool call triggers fallback retry with simpler prompt + reduced tool set
+- Fallback exhaustion emits error event and skips turn (no loop abort)
+- Retry events logged via `Event::Log`
+- Tagged v0.1.0-milestone-7
 
 ---
 

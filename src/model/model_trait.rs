@@ -130,8 +130,24 @@ pub enum ModelError {
     InvalidRequest(String),
     #[error("streaming error: {0}")]
     Streaming(String),
+    #[error("service unavailable: retry after {retry_after_sec}s")]
+    ServiceUnavailable { retry_after_sec: u64 },
     #[error("capability missing: {0}")]
     MissingCapability(String),
+}
+
+impl ModelError {
+    /// Returns `true` if this error is transient and the call should be
+    /// retried with backoff (e.g. rate limiting, temporary service issues).
+    ///
+    /// Permanent errors (auth failures, invalid requests, missing
+    /// capabilities, model not found, context length) must not be retried.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            ModelError::RateLimited { .. } | ModelError::ServiceUnavailable { .. }
+        )
+    }
 }
 
 /// The Model trait - text-in/text-out as the primitive.

@@ -168,6 +168,15 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Get specs for only the named tools, in the order given.
+    /// Tools not found in the registry are skipped.
+    pub fn filtered_specs(&self, names: &[String]) -> Vec<ToolSpec> {
+        names
+            .iter()
+            .filter_map(|name| self.get(name).map(|tool| tool.spec()))
+            .collect()
+    }
+
     /// Check if a tool exists.
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)

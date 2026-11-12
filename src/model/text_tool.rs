@@ -168,6 +168,30 @@ impl TextToolParser {
         Self::validate(&calls, registry)
     }
 
+    /// Validate parsed tool calls against a list of tool specs (instead of a
+    /// full `ToolRegistry`). Used for fallback strategies with a reduced tool
+    /// set where the full registry is not available or desirable.
+    ///
+    /// Returns structured errors for unknown tools or schema violations.
+    pub fn validate_against_specs(
+        calls: &[ParsedToolCall],
+        specs: &[ToolSpec],
+    ) -> Result<Vec<ValidatedToolCall>, TextToolError> {
+        let mut validated = Vec::new();
+        for call in calls {
+            let spec = specs
+                .iter()
+                .find(|s| s.name == call.name)
+                .ok_or_else(|| TextToolError::ToolNotFound(call.name.clone()))?;
+            Self::validate_args(&call.args, &spec.input_schema, &call.name)?;
+            validated.push(ValidatedToolCall {
+                name: call.name.clone(),
+                args: call.args.clone(),
+            });
+        }
+        Ok(validated)
+    }
+
     // --- Internal helpers ---
 
     /// Find all `<tool_call ...> ... </tool_call>` blocks in the output.
