@@ -559,9 +559,7 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{
-        Event, Log, LogLevel, Message, MessageRole, ToolResult,
-    };
+    use crate::events::{Event, Log, LogLevel, Message, MessageRole, ToolResult};
     use tempfile::tempdir;
 
     #[test]
