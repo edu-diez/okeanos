@@ -94,9 +94,9 @@ jobs:
           fi
           ARTIFACT_DIR="target/${{ matrix.target }}/release"
           mkdir -p artifacts
-          cp "${ARTIFACT_DIR}/${BINARY}" "artifacts/${BINARY}"
-          # Add shell completion and man page if they exist later
-          # For now just the binary
+          # Include the target triple so each binary gets a unique
+          # release asset name (otherwise all 'okeanos' binaries collide).
+          cp "${ARTIFACT_DIR}/${BINARY}" "artifacts/${BINARY}-${{ matrix.target }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
