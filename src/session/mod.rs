@@ -700,6 +700,9 @@ mod tests {
             .unwrap();
         manager.end_session().unwrap();
 
+        // Ensure different timestamps for stable ordering
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         let id2 = manager.start_session(dir.path(), dir.path()).unwrap();
         manager
             .log_event(Event::Log(Log {
