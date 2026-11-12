@@ -246,6 +246,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - `--resume <session-id>`: restores conversation + todos + plan state.
 - Project-scoped session storage under okeanos home dir.
 - Corrupted trailing line tolerance (skip/report, don't crash).
+- **Graceful shutdown:** SIGINT/SIGTERM flushes the JSONL session log, tears down TUI alternate screen (when M12 ready), drains in-flight tool execution, escalates SIGTERM→SIGKILL after timeout.
 
 **Out of scope:** Git snapshots, undo/redo, TUI, RPC.
 
@@ -253,10 +254,12 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - Session log is append-only; every ReAct event is appended.
 - `--resume <id>` restores conversation, todos, plan state.
 - Corrupted last line does not crash the loader; earlier lines are readable.
+- SIGINT flushes session log to disk before exit.
+- SIGTERM escalation works: grace period then SIGKILL on hung work.
 
-**Testing requirements:** Integration tests for session log append, resume round-trip, corrupted-line tolerance, project-scoped storage. Headless mode only (no TUI).
+**Testing requirements:** Integration tests for session log append, resume round-trip, corrupted-line tolerance, project-scoped storage, graceful shutdown flush. Headless mode only (no TUI).
 
-**Definition of Done:** CI green; resume verified end-to-end in headless mode; milestone tagged.
+**Definition of Done:** CI green; resume verified end-to-end in headless mode; graceful shutdown verified; milestone tagged.
 
 ---
 
@@ -338,15 +341,17 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 **Scope:**
 - ratatui + crossterm TUI per DESIGN.md: theme tokens from `assets/themes/dark.toml`/`light.toml`, responsive layout grid (80×24 min, 120×40 comfortable).
 - Components: conversation pane, streaming token render, tool-call panel, approval modal, todo panel, status bar, command palette, log tail.
+- Command palette with slash commands: `/help`, `/todos`, `/logs`, `/undo`, `/redo`.
 - Headless/RPC event parity: same event structs feed TUI renderer and JSON emitter (DESIGN.md §7).
 - Resize handling, scroll preservation, reduced-motion toggle.
 
-**Out of scope:** Git snapshots, `/undo`/`/redo`, RPC transport, session resume, compressed logs.
+**Out of scope:** Git snapshots, RPC transport, session resume, compressed logs.
 
 **Acceptance criteria:**
 - TUI renders all regions at 80×24 and 120×40; regions reflow on resize.
 - Approval modal is keyboard-first (Enter allow / Esc deny) with high-contrast focus ring.
 - Streaming tokens render with typewriter cursor; typing indicator present.
+- Command palette opens with `:`; `/help`, `/todos`, `/logs`, `/undo`, `/redo` work.
 - Snapshot tests pass for golden frames; contrast audit passes (WCAG AA/AAA); reduced-motion disables all animations.
 
 **Testing requirements:** TUI snapshot tests, resize tests, contrast audit, reduced-motion test, event-parity test (TUI state → JSON event).
@@ -382,6 +387,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - `--rpc`: JSON-RPC over stdio (feature-gated `jsonrpsee` server); optional HTTP transport behind `rpc` feature.
 - ReAct loop driven identically in all three modes; mode is a renderer/transport choice only.
 - RPC accepts `approve`/`deny` commands resolving pending approvals.
+- Slash command support via JSON events: `/help`, `/todos`, `/logs`, `/undo`, `/redo` emitted as structured events for script consumption.
 
 **Out of scope:** WebSocket transport (deferred), MCP client (deferred, `mcp` feature).
 
@@ -389,6 +395,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - Same prompt produces identical event sequences in TUI, headless, and RPC modes.
 - RPC accepts `approve`/`deny` commands resolving pending approvals.
 - Headless mode works piped/non-TTY.
+- Slash commands emit corresponding JSON events (not interactive).
 
 **Testing requirements:** Event-parity test across modes; RPC request/response round-trip tests.
 
