@@ -1,15 +1,21 @@
 use anyhow::Context as _;
 use clap::Parser;
+use futures::Stream;
 use okeanos::cli::{Cli, Command, ConfigAction, Mode, Shell, Verbosity};
 use okeanos::config::Config;
 use okeanos::context::{Conversation, build_system_prompt};
 use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
-use okeanos::model::MockModel;
+use okeanos::model::{
+    GenerationParams, MockModel, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse,
+    ModelStreamChunk, OpenRouterModel,
+};
 use okeanos::session::{SessionManager, replay_events};
-use okeanos::tool::ToolRegistry;
 use okeanos::tool::builtin::{DeleteTool, GrepTool, ReadTool, RunTool, WriteTool};
 use okeanos::tool::{TodoList, TodoTool};
+use okeanos::tool::{ToolRegistry, ToolSpec};
+use std::pin::Pin;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -51,6 +57,67 @@ async fn main() -> anyhow::Result<()> {
 }
 
 // Helper to run with a prompt (for Run subcommand or implicit run)
+
+// ActiveModel wraps either a MockModel (testing/dev) or an OpenRouterModel
+// (real provider) behind a single concrete type that implements `Model`.
+// This is needed because `ReactLoop` is generic over `M: Model` and requires
+// `M: Sized`, so we cannot use `dyn Model` directly.
+enum ActiveModel {
+    Mock(MockModel),
+    OpenRouter(OpenRouterModel),
+}
+
+#[async_trait::async_trait]
+impl Model for ActiveModel {
+    fn capabilities(&self) -> &ModelCapabilities {
+        match self {
+            ActiveModel::Mock(m) => m.capabilities(),
+            ActiveModel::OpenRouter(m) => m.capabilities(),
+        }
+    }
+
+    fn model_id(&self) -> &str {
+        match self {
+            ActiveModel::Mock(m) => m.model_id(),
+            ActiveModel::OpenRouter(m) => m.model_id(),
+        }
+    }
+
+    async fn complete(
+        &self,
+        messages: &[ModelMessage],
+        params: &GenerationParams,
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<ModelResponse, ModelError> {
+        match self {
+            ActiveModel::Mock(m) => m.complete(messages, params, tools).await,
+            ActiveModel::OpenRouter(m) => m.complete(messages, params, tools).await,
+        }
+    }
+
+    async fn stream(
+        &self,
+        messages: &[ModelMessage],
+        params: &GenerationParams,
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ModelStreamChunk, ModelError>> + Send + 'static>>,
+        ModelError,
+    > {
+        match self {
+            ActiveModel::Mock(m) => m.stream(messages, params, tools).await,
+            ActiveModel::OpenRouter(m) => m.stream(messages, params, tools).await,
+        }
+    }
+
+    fn require_capability(&self, capability: &str) -> Result<(), ModelError> {
+        match self {
+            ActiveModel::Mock(m) => m.require_capability(capability),
+            ActiveModel::OpenRouter(m) => m.require_capability(capability),
+        }
+    }
+}
+
 async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
     let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
     tracing::info!("configuration loaded");
@@ -462,16 +529,33 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         .unwrap_or(model_capabilities.max_context)
         .max(1); // Ensure at least 1
 
-    // Create model (mock for now, real provider in M9)
-    let model = std::sync::Arc::new(MockModel::new(
-        model_capabilities.clone(),
-        model_name.clone(),
-    ));
-
-    // Program a simple response for testing
-    model.push_response(okeanos::model::mock::MockModel::text_response(
-        "Task complete. I've finished the requested work.",
-    ));
+    // Create model: real OpenRouter/OpenAI-compatible provider when an API key
+    // is configured, otherwise fall back to the mock model for testing.
+    let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
+        && let Some(api_key) = &provider.api_key
+        && !api_key.is_empty()
+    {
+        let base_url = provider
+            .base_url
+            .as_deref()
+            .unwrap_or(okeanos::model::DEFAULT_BASE_URL);
+        let client = reqwest::Client::new();
+        let pricing = None; // Pricing would come from discovery (M9)
+        Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
+            client,
+            base_url,
+            api_key,
+            &model_name,
+            model_capabilities.clone(),
+            pricing,
+        )))
+    } else {
+        let m = MockModel::new(model_capabilities.clone(), model_name.clone());
+        m.push_response(okeanos::model::mock::MockModel::text_response(
+            "Task complete. I've finished the requested work.",
+        ));
+        Arc::new(ActiveModel::Mock(m))
+    };
 
     // Build conversation with system prompt and context cap
     let system_prompt = build_system_prompt(

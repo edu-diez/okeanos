@@ -572,10 +572,22 @@ impl<M: Model> ReactLoop<M> {
         let retry_policy = self.config.retry_policy.clone();
         let mut attempt = 0usize;
 
+        // Pass native tool specs only when the model supports native function calling.
+        // Models without native FC use text-based parsing via the system prompt snippet.
+        let native_tools = if self.model.capabilities().tool_calling {
+            Some(self.tools.specs())
+        } else {
+            None
+        };
+
         loop {
             match self
                 .model
-                .complete(messages, &self.config.generation_params)
+                .complete(
+                    messages,
+                    &self.config.generation_params,
+                    native_tools.as_deref(),
+                )
                 .await
             {
                 Ok(response) => return Ok(response),

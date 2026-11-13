@@ -3,6 +3,7 @@ use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse,
     ModelStreamChunk, ModelTier, Usage,
 };
+use crate::tool::tool_trait::ToolSpec;
 use async_trait::async_trait;
 use futures::Stream;
 use futures::stream::{self};
@@ -165,6 +166,7 @@ impl Model for MockModel {
         &self,
         _messages: &[ModelMessage],
         _params: &GenerationParams,
+        _tools: Option<&[ToolSpec]>,
     ) -> Result<ModelResponse, ModelError> {
         let mut queue = self.responses.lock().unwrap();
         let response = queue.pop_front().unwrap_or(MockResponse {
@@ -195,12 +197,13 @@ impl Model for MockModel {
         &self,
         messages: &[ModelMessage],
         params: &GenerationParams,
+        _tools: Option<&[ToolSpec]>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<ModelStreamChunk, ModelError>> + Send + 'static>>,
         ModelError,
     > {
         // For streaming, we get the complete response and chunk it
-        let response = self.complete(messages, params).await?;
+        let response = self.complete(messages, params, None).await?;
 
         let content = response.content;
         let chunk_size = if self.streaming {

@@ -1,4 +1,5 @@
 use crate::events::ToolCall;
+use crate::tool::tool_trait::ToolSpec;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -165,6 +166,7 @@ pub trait Model: Send + Sync {
         &self,
         messages: &[ModelMessage],
         params: &GenerationParams,
+        tools: Option<&[ToolSpec]>,
     ) -> Result<ModelResponse, ModelError>;
 
     /// Streaming completion.
@@ -172,12 +174,11 @@ pub trait Model: Send + Sync {
         &self,
         messages: &[ModelMessage],
         params: &GenerationParams,
+        tools: Option<&[ToolSpec]>,
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<ModelStreamChunk, ModelError>> + Send + 'static>>,
         ModelError,
-    >
-    where
-        Self: Sized;
+    >;
 
     /// Validate that the model has the required capabilities.
     fn require_capability(&self, capability: &str) -> Result<(), ModelError> {

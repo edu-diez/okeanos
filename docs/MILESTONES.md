@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -335,7 +335,23 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Integration tests with real OpenRouter API (feature-gated, requires API key); unit tests with mock HTTP server for error mapping, streaming parsing, tool call format. CI runs unit tests only; integration tests run manually or in separate workflow.
 
-**Definition of Done:** CI green (unit tests); integration verified manually; milestone tagged.
+**Definition of Done:** CI green (unit tests); integration verified manually; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (all unit tests)
+- `cargo build --release` produces a single binary
+- `cargo build --release --target x86_64-unknown-linux-musl` produces a static binary
+- `OpenRouterModel` implements `Model` trait with chat completion + streaming
+- Native function calling via OpenAI tool calling format works for models with `supports_tool_calling = true`
+- Streaming token deltas via SSE; `Token` events emitted for TUI/headless parity
+- Provider discovery via OpenRouter `/models` endpoint with local cache (24h TTL)
+- Model capability negotiation auto-populates `ModelCapabilities` from discovered metadata
+- Config-driven model selection: `model.name`, `provider.base_url`, `provider.api_key` with `{env:VAR}`/`{file:path}` secret substitution
+- Retry policy integration: 429/503 → exponential backoff (uses M7 retry policy)
+- Error mapping: provider errors → `ModelError` variants (AuthFailed, RateLimited, ServiceUnavailable, ContextLengthExceeded, InvalidRequest, ModelNotFound, MissingCapability)
+- Per-model pricing from OpenRouter metadata → cost estimation
+- Unit tests with mock HTTP server for error mapping, streaming parsing, tool call format
+- Tagged v0.1.0-milestone-9
 
 ---
 
