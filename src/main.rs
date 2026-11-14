@@ -3,7 +3,8 @@ use clap::Parser;
 use futures::Stream;
 use okeanos::cli::{Cli, Command, ConfigAction, Mode, Shell, Verbosity};
 use okeanos::config::Config;
-use okeanos::context::{Conversation, build_system_prompt};
+use okeanos::context::{Conversation, build_system_prompt, tokens::default_pricing_table};
+use okeanos::cost::{CostBudgetConfig, CostTracker};
 use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::model::{
@@ -563,6 +564,27 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
     )
     .context("failed to build system prompt")?;
+
+    // Create cost tracker from config (opt-in, disabled by default) - must be before
+    // moving model_capabilities into Conversation
+    let cost_tracker = if let Some(cost_section) = &config.cost {
+        let cost_config = CostBudgetConfig::from_config_section(cost_section);
+        if cost_config.is_enabled() {
+            // Use default pricing table for known models
+            let pricing = Arc::new(default_pricing_table());
+            Some(CostTracker::new(
+                cost_config,
+                model_name.clone(),
+                pricing,
+                model_capabilities.clone(),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let mut conversation =
         Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
@@ -633,10 +655,14 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     };
 
     // Create and run the ReAct loop with policy + approval wiring + session logging.
-    let loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
+    let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
         .with_session(session_manager);
+
+    if let Some(tracker) = cost_tracker {
+        loop_ = loop_.with_cost_tracker(tracker);
+    }
 
     // Spawn event logger
     let logger_handle = tokio::spawn(async move {

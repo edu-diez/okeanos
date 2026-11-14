@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod config;
 pub mod context;
+pub mod cost;
 pub mod events;
 pub mod harness;
 pub mod model;

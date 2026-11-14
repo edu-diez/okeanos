@@ -1,6 +1,7 @@
 //! ReAct loop — core control flow: think → tool → observe → repeat.
 
 use crate::context::{Conversation, ConversationError};
+use crate::cost::{CostBudgetError, CostTracker};
 use crate::events::{
     Approval, ApprovalDecision, ApprovalRequest, Event, EventSender, LogLevel, Message,
     MessageRole, ToolCall, ToolCallStatus, ToolResult,
@@ -31,6 +32,8 @@ pub enum ReactError {
     Tool(String),
     #[error("context cap exceeded: {0}")]
     ContextCap(#[from] crate::context::cap::ContextCapError),
+    #[error("cost budget: {0}")]
+    CostBudget(#[from] CostBudgetError),
     #[error("max iterations ({max_iter}) reached")]
     MaxIterations { max_iter: usize },
     #[error("max elapsed time ({max_elapsed_sec}s) reached")]
@@ -120,6 +123,8 @@ pub struct ReactLoop<M: Model> {
     approval_rx: Option<mpsc::Receiver<Approval>>,
     /// Optional session manager for logging events to session log.
     session: Option<SessionManager>,
+    /// Optional cost tracker for budget enforcement.
+    cost_tracker: Option<CostTracker>,
 }
 
 impl<M: Model> ReactLoop<M> {
@@ -144,6 +149,7 @@ impl<M: Model> ReactLoop<M> {
             policy: Policy::new(vec![]),
             approval_rx: None,
             session: None,
+            cost_tracker: None,
         }
     }
 
@@ -184,6 +190,12 @@ impl<M: Model> ReactLoop<M> {
     /// Set the fallback strategy configuration.
     pub fn with_fallback(mut self, config: FallbackConfig) -> Self {
         self.config.fallback = config;
+        self
+    }
+
+    /// Set the cost tracker for budget enforcement.
+    pub fn with_cost_tracker(mut self, tracker: CostTracker) -> Self {
+        self.cost_tracker = Some(tracker);
         self
     }
 
@@ -288,6 +300,11 @@ impl<M: Model> ReactLoop<M> {
         // THINK: Get model completion
         let model_messages = self.build_model_messages();
         let response = self.call_model(&model_messages).await?;
+
+        // Record model usage cost
+        if let Some(usage) = &response.usage {
+            self.record_model_usage(usage).await;
+        }
 
         // Add assistant message to conversation
         self.conversation
@@ -698,6 +715,9 @@ impl<M: Model> ReactLoop<M> {
             }
         }
 
+        // Check cost budget before executing the tool.
+        self.check_cost_budget(&tool_call).await?;
+
         // Emit tool call started event (before re-fetching tool to avoid borrow conflict)
         self.emit_tool_call(ToolCall {
             id: tool_call.id.clone(),
@@ -740,6 +760,9 @@ impl<M: Model> ReactLoop<M> {
             cancelled: exec_result.cancelled,
         };
 
+        // Record actual cost after tool execution.
+        self.record_tool_cost(&result).await;
+
         // Emit tool call completed event
         self.emit_tool_call(ToolCall {
             id: result.id.clone(),
@@ -750,6 +773,58 @@ impl<M: Model> ReactLoop<M> {
         .await;
 
         Ok(result)
+    }
+
+    /// Check cost budget before executing a tool.
+    async fn check_cost_budget(&mut self, tool_call: &ToolCall) -> Result<(), ReactError> {
+        let Some(tracker) = &mut self.cost_tracker else {
+            return Ok(()); // Cost tracking not enabled
+        };
+
+        // Estimate input tokens from tool call args
+        let input_tokens = crate::context::tokens::TokenCounter.count(&tool_call.args.to_string());
+        // Estimate output tokens (rough heuristic: 1000 tokens for tool result)
+        let estimated_output_tokens = 1000;
+
+        // Check session cap
+        let estimated_cost = tracker
+            .estimate_tool_call_cost(input_tokens, estimated_output_tokens)
+            .map_err(ReactError::CostBudget)?;
+
+        tracker
+            .check_session_cap(estimated_cost.total_cost_usd())
+            .map_err(ReactError::CostBudget)?;
+
+        // Check per-turn warning (soft warning, doesn't block)
+        tracker
+            .check_per_turn_warning(estimated_cost.total_cost_usd(), &self.event_tx)
+            .await;
+
+        Ok(())
+    }
+
+    /// Record actual cost after tool execution.
+    async fn record_tool_cost(&mut self, result: &ToolResult) {
+        let Some(tracker) = &mut self.cost_tracker else {
+            return; // Cost tracking not enabled
+        };
+
+        // Estimate tokens from tool result output
+        let output_tokens = crate::context::tokens::TokenCounter.count(&result.output);
+        // Input tokens were the tool call args
+        let input_tokens = crate::context::tokens::TokenCounter.count(&result.args.to_string());
+
+        if let Ok(cost) = tracker.estimate_tool_call_cost(input_tokens, output_tokens) {
+            tracker.record_cost(&cost);
+        }
+    }
+
+    /// Record model usage cost from a completion response.
+    async fn record_model_usage(&mut self, usage: &crate::model::Usage) {
+        let Some(tracker) = &mut self.cost_tracker else {
+            return; // Cost tracking not enabled
+        };
+        tracker.record_usage(usage);
     }
 
     /// Wait for an `Approval` decision matching `approval_id` on the approval
@@ -824,11 +899,17 @@ impl<M: Model> ReactLoop<M> {
 
     /// Emit a status event.
     async fn emit_status(&mut self) {
+        let cost_usd = if let Some(tracker) = &self.cost_tracker {
+            tracker.spent_usd()
+        } else {
+            self.conversation.cost_estimate().total_cost_usd()
+        };
+
         let status = crate::events::Status {
             model: self.model.model_id().to_string(),
             tokens_in: self.conversation.estimated_tokens() as u64,
             tokens_out: 0,
-            cost_usd: self.conversation.cost_estimate().total_cost_usd(),
+            cost_usd,
             elapsed_ms: self.start_time.elapsed().as_millis() as u64,
             retries: self.retries,
             mode: "headless".to_string(),
@@ -870,7 +951,7 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MockModel, ModelError, ModelTier};
+    use crate::model::{MockModel, ModelCapabilities, ModelError, ModelTier};
     use crate::tool::ToolRegistry;
     use crate::tool::todo::TodoTool;
     use crate::tool::tool_trait::{Tool, ToolCategory, ToolError, ToolExecutionResult, ToolSpec};
@@ -1522,5 +1603,244 @@ mod tests {
                 || err.to_string().contains("permission denied"),
             "expected approval error, got: {err}"
         );
+    }
+
+    // ===== Cost Budget Tests =====
+
+    #[tokio::test]
+    async fn test_react_loop_cost_budget_disabled_by_default() {
+        // Cost budget disabled by default - loop should run normally
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
+        let result = loop_.run("Test prompt".into()).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_cost_budget_enforces_session_cap() {
+        // Session cap is exceeded - tool calls should be refused
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use a tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Test task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        // Create cost tracker with $0.01 session cap
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(0.01),
+                per_turn_warning_usd: None,
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+        let result = loop_.run("Test prompt".into()).await;
+
+        // Should fail with cost budget error
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::CostBudget(crate::cost::CostBudgetError::CapExceeded { .. }) => {}
+            e => panic!("expected CapExceeded error, got: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_cost_budget_allows_under_cap() {
+        // Session cap not exceeded - tool calls should work
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use a tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Test task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        // Create cost tracker with high session cap ($10)
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: None,
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+        let result = loop_.run("Test prompt".into()).await;
+
+        // Should succeed
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("Task complete"));
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_cost_budget_unknown_pricing_fails_closed() {
+        // Unknown model pricing should fail closed
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use a tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Test task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        // Create cost tracker with unknown model
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: None,
+            },
+            "unknown-model-xyz".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+        let result = loop_.run("Test prompt".into()).await;
+
+        // Should fail with unknown pricing error
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::CostBudget(crate::cost::CostBudgetError::UnknownPricing { model_id }) => {
+                assert_eq!(model_id, "unknown-model-xyz");
+            }
+            e => panic!("expected UnknownPricing error, got: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_react_loop_cost_budget_per_turn_warning() {
+        // Per-turn warning should emit warning event but not block
+        let model = Arc::new(MockModel::small("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use a tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Test task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        // Create cost tracker with very low per-turn warning ($0.000001)
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: Some(0.000001),
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+        let result = loop_.run("Test prompt".into()).await;
+
+        // Should succeed but emit warning
+        assert!(result.is_ok());
+
+        // Check for warning event
+        let mut found_warning = false;
+        for _ in 0..50 {
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::Log(log) = event
+                && log.message.contains("per-turn cost warning")
+            {
+                found_warning = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(found_warning, "expected per-turn warning event");
     }
 }

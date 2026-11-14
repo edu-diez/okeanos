@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -357,6 +357,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 10 — Cost budget
 
+**Status:** complete — tagged v0.1.0-milestone-10
+
 **Scope:**
 - Opt-in hard session cost cap (USD) + per-turn soft warning threshold.
 - When cap reached, refuse new tool calls that would exceed it; let in-flight work finish.
@@ -373,7 +375,15 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for cost cap enforcement, fail-closed on unknown pricing, per-turn warnings. No network.
 
-**Definition of Done:** CI green; milestone tagged.
+**Definition of Done:** CI green; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (214 unit tests)
+- `cargo build --release` produces a single binary
+- Cost cap enforcement: calls over the cap are refused; in-flight work finishes
+- Unknown pricing fails closed with clear warning
+- Per-turn soft warning fires before hard cap (emits warning event, does not block)
+- Tagged v0.1.0-milestone-10
 
 ---
 
@@ -501,7 +511,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 7 | Rate limits & fallback strategies | 1 | M6 |
 | 8 | Session log & resume | 1 | M2 |
 | 9 | **OpenRouter / OpenAI-compatible provider** | 2 | M3, M4 |
-| 10 | Cost budget | 1 | M2, M3, M9 |
+| 10 | ✅ Cost budget | 1 | M2, M3, M9 |
 | 11 | Edit format | 1 | M6, M9 |
 | 12 | TUI shell | 2–3 | M2, M4, M5, M9, M11 |
 | 13 | Git snapshots + undo/redo | 2 | M6 |
