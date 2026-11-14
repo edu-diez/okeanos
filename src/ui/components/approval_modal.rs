@@ -254,9 +254,10 @@ impl ApprovalModal {
 
         // Remove trailing spaces
         if let Some(last) = spans.last_mut()
-            && last.content.as_ref().trim().is_empty() {
-                spans.pop();
-            }
+            && last.content.as_ref().trim().is_empty()
+        {
+            spans.pop();
+        }
 
         Line::from(spans)
     }

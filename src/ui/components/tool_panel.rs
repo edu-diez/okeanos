@@ -10,9 +10,7 @@ use ratatui::{
     layout::Rect as RRect,
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, List, ListItem, ListState,
-    },
+    widgets::{Block, Borders, List, ListItem, ListState},
 };
 use std::collections::HashMap;
 use std::sync::Arc;

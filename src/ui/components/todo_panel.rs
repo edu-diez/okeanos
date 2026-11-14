@@ -50,7 +50,9 @@ impl TodoPanel {
 
     /// Handle an event from the event stream.
     pub fn handle_event(&mut self, event: &Event) {
-        if let Event::Todo(todo) = event { self.update_todo(todo.clone()) }
+        if let Event::Todo(todo) = event {
+            self.update_todo(todo.clone())
+        }
     }
 
     /// Update or add a todo.

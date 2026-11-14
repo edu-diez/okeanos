@@ -9,9 +9,7 @@ use ratatui::{
     layout::Rect as RRect,
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation,
-    },
+    widgets::{Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation},
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -36,8 +34,7 @@ struct LogEntry {
     timestamp: std::time::Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFilter {
     #[default]
     All,
@@ -45,7 +42,6 @@ pub enum LogFilter {
     WarningsAndErrors,
     SystemOnly,
 }
-
 
 impl LogTailPanel {
     pub fn new(theme: Arc<Theme>) -> Self {

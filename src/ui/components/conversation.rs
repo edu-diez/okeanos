@@ -14,9 +14,7 @@ use ratatui::{
     layout::Rect as RRect,
     style::{Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation,
-    },
+    widgets::{Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation},
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -146,44 +144,46 @@ impl ConversationPane {
     /// Append a streaming token delta to the last assistant message.
     fn append_token(&mut self, delta: &str) {
         if let Some(last) = self.messages.back_mut()
-            && last.message.role == MessageRole::Assistant {
-                last.message.content.push_str(delta);
-                last.is_streaming = true;
-                last.last_update = Instant::now();
-                last.stream_cursor_pos = last.message.content.len();
-            }
+            && last.message.role == MessageRole::Assistant
+        {
+            last.message.content.push_str(delta);
+            last.is_streaming = true;
+            last.last_update = Instant::now();
+            last.stream_cursor_pos = last.message.content.len();
+        }
     }
 
     /// Add or update a tool call.
     fn add_or_update_tool_call(&mut self, call: ToolCall) {
         if let Some(last) = self.messages.back_mut()
-            && last.message.role == MessageRole::Assistant {
-                // Find existing tool call or add new
-                if let Some(existing) = last.tool_calls.iter_mut().find(|tc| tc.call.id == call.id)
-                {
-                    existing.call = call.clone();
-                    existing.status = call.status;
-                } else {
-                    last.tool_calls.push(RenderedToolCall {
-                        call,
-                        status: ToolCallStatus::Pending,
-                        expanded: false,
-                    });
-                }
-                last.last_update = Instant::now();
+            && last.message.role == MessageRole::Assistant
+        {
+            // Find existing tool call or add new
+            if let Some(existing) = last.tool_calls.iter_mut().find(|tc| tc.call.id == call.id) {
+                existing.call = call.clone();
+                existing.status = call.status;
+            } else {
+                last.tool_calls.push(RenderedToolCall {
+                    call,
+                    status: ToolCallStatus::Pending,
+                    expanded: false,
+                });
             }
+            last.last_update = Instant::now();
+        }
     }
 
     /// Add a tool result.
     fn add_tool_result(&mut self, result: ToolResult) {
         if let Some(last) = self.messages.back_mut()
-            && last.message.role == MessageRole::Assistant {
-                last.tool_results.push(RenderedToolResult {
-                    result,
-                    expanded: false,
-                });
-                last.last_update = Instant::now();
-            }
+            && last.message.role == MessageRole::Assistant
+        {
+            last.tool_results.push(RenderedToolResult {
+                result,
+                expanded: false,
+            });
+            last.last_update = Instant::now();
+        }
     }
 
     /// Set typing indicator (model is thinking between tokens).
@@ -199,11 +199,13 @@ impl ConversationPane {
         let now = Instant::now();
 
         // Typing indicator animation
-        if self.typing_indicator && !self.reduced_motion
-            && now.duration_since(self.last_typing_tick) >= Duration::from_millis(60) {
-                self.typing_frame = (self.typing_frame + 1) % TYPING_FRAMES.len();
-                self.last_typing_tick = now;
-            }
+        if self.typing_indicator
+            && !self.reduced_motion
+            && now.duration_since(self.last_typing_tick) >= Duration::from_millis(60)
+        {
+            self.typing_frame = (self.typing_frame + 1) % TYPING_FRAMES.len();
+            self.last_typing_tick = now;
+        }
 
         // Spinner animation for streaming
         if !self.reduced_motion {
@@ -373,7 +375,8 @@ impl ConversationPane {
                     ));
 
                     // Blinking cursor
-                    if !self.reduced_motion && (Instant::now().elapsed().as_millis() / 500).is_multiple_of(2)
+                    if !self.reduced_motion
+                        && (Instant::now().elapsed().as_millis() / 500).is_multiple_of(2)
                     {
                         spans.push(Span::styled(
                             "█",
