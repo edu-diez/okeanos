@@ -20,6 +20,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "tui")]
+use okeanos::ui::TerminalApp;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -262,6 +265,11 @@ allow_list = ["todo", "read", "grep"]
 # session_cap_usd = 0.0
 # Per-turn soft warning threshold (USD)
 # per_turn_warning_usd = 0.10
+
+# UI configuration
+[ui]
+# Theme: "dark" or "light"
+# theme = "dark"
 "#
     .to_string()
 }
@@ -424,18 +432,303 @@ fn clap_version() -> String {
         .to_string()
 }
 
-async fn run_interactive(
+async fn run_interactive(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {
+    #[cfg(feature = "tui")]
+    {
+        run_interactive_tui(cli, config, prompt).await
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        let _ = apply_cli_overrides(cli, config);
+        Err::<(), anyhow::Error>(
+            okeanos::HarnessError::UnsupportedMode(
+                "interactive TUI (compile with --features tui)".into(),
+            )
+            .into(),
+        )
+        .context("interactive mode requires the 'tui' feature")
+    }
+}
+
+#[cfg(feature = "tui")]
+async fn run_interactive_tui(
     cli: &Cli,
     config: &Config,
-    _prompt: Option<String>,
+    prompt: Option<String>,
 ) -> anyhow::Result<()> {
-    // For now, interactive mode is not implemented (M12)
-    // But we still need to handle the CLI overrides for consistency
-    let _ = apply_cli_overrides(cli, config);
-    Err::<(), anyhow::Error>(
-        okeanos::HarnessError::UnsupportedMode("interactive TUI".into()).into(),
+    use okeanos::ui::ThemeVariant;
+
+    // Apply CLI overrides to config
+    let (model_name, model_capabilities, generation_params) = apply_cli_overrides(cli, config);
+
+    // Determine project root (CWD or --root)
+    let project_root = cli
+        .root
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let project_root =
+        std::fs::canonicalize(project_root).context("failed to resolve project root")?;
+
+    // Determine CWD
+    let cwd = std::env::current_dir().context("failed to get CWD")?;
+
+    // Create session manager
+    let mut session_manager =
+        SessionManager::new(&project_root).context("failed to create session manager")?;
+
+    // Handle resume or start new session
+    let (session_id, restored_messages, restored_todos, resume_warnings) =
+        if let Some(resume_id) = &cli.resume {
+            // Resume existing session
+            eprintln!("Resuming session: {}", resume_id);
+            let restored = session_manager
+                .load_session(resume_id)
+                .context("failed to load session for resume")?;
+
+            // Replay events to restore state (conversation + todos)
+            let (messages, todos) = replay_events(&restored.1);
+
+            // Print any warnings from loading
+            for warning in &restored.2 {
+                eprintln!("[WARN] Session load: {}", warning);
+            }
+
+            // Start a new session for continued logging
+            let new_session_id = session_manager
+                .start_session(&cwd, &project_root)
+                .context("failed to start new session for resume")?;
+
+            (new_session_id, messages, todos, restored.2)
+        } else {
+            // Start new session
+            let session_id = session_manager
+                .start_session(&cwd, &project_root)
+                .context("failed to start session")?;
+
+            (session_id, Vec::new(), TodoList::new(), Vec::new())
+        };
+
+    eprintln!("Session ID: {}", session_id);
+
+    // Print resume warnings
+    for warning in &resume_warnings {
+        eprintln!("[WARN] {}", warning);
+    }
+
+    // Get the prompt from CLI
+    let prompt = if cli.resume.is_some() {
+        prompt.unwrap_or_else(|| "Continue from previous session.".to_string())
+    } else {
+        prompt.unwrap_or_else(|| {
+            eprintln!("Error: prompt is required in interactive mode");
+            std::process::exit(1);
+        })
+    };
+
+    // Dry-run mode: show execution plan and exit
+    if cli.dry_run {
+        return run_dry_run(
+            &prompt,
+            &model_capabilities,
+            &generation_params,
+            &tools_list(),
+        );
+    }
+
+    // Create event channel for logging
+    let (event_tx, _event_rx) = okeanos::events::event_channel();
+
+    // Determine model tier from capabilities
+    let model_tier = model_capabilities.tier;
+
+    // Determine context cap from config or capabilities
+    let context_cap = config
+        .context
+        .as_ref()
+        .and_then(|c| c.cap)
+        .unwrap_or(model_capabilities.max_context)
+        .max(1);
+
+    // Create model: real OpenRouter/OpenAI-compatible provider when an API key
+    // is configured, otherwise fall back to the mock model for testing.
+    let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
+        && let Some(api_key) = &provider.api_key
+        && !api_key.is_empty()
+    {
+        let base_url = provider
+            .base_url
+            .as_deref()
+            .unwrap_or(okeanos::model::DEFAULT_BASE_URL);
+        let client = reqwest::Client::new();
+        let pricing = None;
+        Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
+            client,
+            base_url,
+            api_key,
+            &model_name,
+            model_capabilities.clone(),
+            pricing,
+        )))
+    } else {
+        let m = MockModel::new(model_capabilities.clone(), model_name.clone());
+        m.push_response(okeanos::model::mock::MockModel::text_response(
+            "Task complete. I've finished the requested work.",
+        ));
+        Arc::new(ActiveModel::Mock(m))
+    };
+
+    // Build conversation with system prompt and context cap
+    let system_prompt = build_system_prompt(
+        model_tier,
+        config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
     )
-    .context("interactive mode is not yet implemented (Milestone 12)")
+    .context("failed to build system prompt")?;
+
+    // Create cost tracker from config (opt-in, disabled by default)
+    let cost_tracker = if let Some(cost_section) = &config.cost {
+        let cost_config = CostBudgetConfig::from_config_section(cost_section);
+        if cost_config.is_enabled() {
+            let pricing = Arc::new(default_pricing_table());
+            Some(CostTracker::new(
+                cost_config,
+                model_name.clone(),
+                pricing,
+                model_capabilities.clone(),
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Extract edit_format before model_capabilities is moved into Conversation
+    let edit_format = model_capabilities.edit_format;
+
+    let mut conversation =
+        Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
+
+    // Restore conversation messages if resuming
+    for msg in restored_messages {
+        match msg.role {
+            okeanos::events::MessageRole::User => {
+                if let Err(e) = conversation.add_user_message(msg.content) {
+                    eprintln!("[WARN] Failed to restore user message: {e}");
+                }
+            }
+            okeanos::events::MessageRole::Assistant => {
+                if let Err(e) = conversation.add_assistant_message(msg.content, msg.tool_calls) {
+                    eprintln!("[WARN] Failed to restore assistant message: {e}");
+                }
+            }
+            okeanos::events::MessageRole::Tool => {
+                if let Some(tool_call_id) = msg.tool_call_id
+                    && let Err(e) = conversation.add_tool_message(msg.content, tool_call_id)
+                {
+                    eprintln!("[WARN] Failed to restore tool message: {e}");
+                }
+            }
+            okeanos::events::MessageRole::System => {}
+        }
+    }
+
+    // Create tool registry with ALL built-in tools (using restored todo list)
+    let todo_list = restored_todos;
+    let mut tools = ToolRegistry::new();
+    tools.register(TodoTool::new(todo_list));
+    tools.register(ReadTool::new());
+    tools.register(WriteTool::new());
+    tools.register(EditTool::with_format(edit_format));
+    tools.register(DeleteTool::new());
+    tools.register(RunTool::new());
+    tools.register(GrepTool::new());
+
+    // Build permission policy from config (global + project allow-list).
+    let allow_list = config
+        .permissions
+        .as_ref()
+        .and_then(|p| p.allow_list.clone())
+        .unwrap_or_else(|| vec!["todo".to_string()]);
+    let policy = Policy::new(allow_list);
+
+    // Configure ReAct loop from config + CLI overrides
+    let react_config = ReactConfig {
+        max_iterations: config
+            .context
+            .as_ref()
+            .and_then(|c| c.max_iterations)
+            .unwrap_or(50),
+        max_elapsed_sec: config
+            .context
+            .as_ref()
+            .and_then(|c| c.max_elapsed_sec)
+            .unwrap_or(300),
+        generation_params,
+        ..Default::default()
+    };
+
+    // Create the TUI app
+    let theme_variant = config
+        .ui
+        .as_ref()
+        .and_then(|u| u.theme.as_deref())
+        .and_then(|t| t.parse::<ThemeVariant>().ok())
+        .unwrap_or(ThemeVariant::Dark);
+
+    let mut tui_app = TerminalApp::new(theme_variant).context("failed to create TUI app")?;
+
+    // Get the approval receiver from the TUI app for the ReAct loop
+    let approval_rx = tui_app
+        .take_approval_receiver()
+        .context("approval receiver not available")?;
+
+    // Create and run the ReAct loop with policy + approval wiring + session logging.
+    let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
+        .with_policy(policy)
+        .with_approval_receiver(approval_rx)
+        .with_session(session_manager);
+
+    if let Some(tracker) = cost_tracker {
+        loop_ = loop_.with_cost_tracker(tracker);
+    }
+
+    // Run the ReAct loop in a separate task, feeding events to TUI
+    let mut loop_handle = tokio::spawn(async move {
+        
+        loop_.run(prompt).await
+    });
+
+    // Run the TUI event loop, processing events from the ReAct loop
+    let mut tui_handle = tokio::spawn(async move { tui_app.run().await });
+
+    // Wait for either the loop or TUI to complete
+    let result = tokio::select! {
+        loop_result = &mut loop_handle => {
+            // ReAct loop finished
+            tui_handle.abort();
+            match loop_result {
+                Ok(Ok(output)) => {
+                    println!("{}", output);
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    eprintln!("ReAct loop error: {}", e);
+                    Err(e.into())
+                }
+                Err(e) => {
+                    eprintln!("ReAct loop task error: {}", e);
+                    Err(e.into())
+                }
+            }
+        }
+        tui_result = &mut tui_handle => {
+            // TUI exited (user quit)
+            loop_handle.abort();
+            tui_result??;
+            Ok(())
+        }
+    };
+    result
 }
 
 async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {

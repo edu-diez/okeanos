@@ -48,6 +48,7 @@ tempfile = "3.15"
 
 [features]
 default = []
+tui = ["ratatui", "crossterm"]
 rpc = ["jsonrpsee"]
 mcp = []
 mock-provider = []

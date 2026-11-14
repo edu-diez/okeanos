@@ -1,0 +1,71 @@
+# okeanos TUI Theme - Dark Mode
+# Design tokens per DESIGN.md §2, §8
+
+# Canvas colors
+[canvas]
+bg = "#0b0e11"        # Near-black, cool
+fg = "#e2e8f0"        # Primary foreground
+muted = "#94a3b8"     # Muted text, timestamps, retry counts
+border = "#1e293b"    # Structural borders
+
+# Semantic colors - paired with glyphs for accessibility
+[semantic]
+ok = "#4ade80"        # Successful tool result, completed todo (✓)
+warn = "#fbbf24"      # Retrying, rate-limit warning, stale snapshot (⚠)
+error = "#f87171"     # Failed tool call, auth error, parse error (✗)
+pending = "#94a3b8"   # In-progress stream, queued call (⟳)
+tool = "#818cf8"      # Tool-call name, args chip
+system = "#cbd5e1"    # Log lines, file paths, meta text
+user = "#e2e8f0"      # User message bubble
+assistant = "#818cf8" # Assistant message bubble
+
+# Typography scales (relative to body)
+[typography]
+heading_scale = 1.1   # Pane titles, modal titles
+label_scale = 0.9     # Chip labels ("tool", "ok")
+body_scale = 1.0      # Message text, args, results
+mono_data_scale = 0.9 # JSON, file paths, diff hunks
+muted_scale = 0.9     # Timestamps, retry counts, log tail
+
+# Spacing (in character cells)
+[spacing]
+unit = 1
+gap_small = 1
+gap_medium = 2
+pad = 1
+modal_pad = 2
+
+# Frame styles (unicode box-drawing)
+[frames]
+single = "single"     # ┌─┐│└┘
+double = "double"     # ╔═╗║╚╝
+rounded = "rounded"   # ╭─╮│╰╯
+ascii = "ascii"       # +-+|++ (legacy fallback)
+
+# Animation durations (milliseconds)
+[animation]
+modal = 180           # Modal open/close slide-in + fade
+typing_cycle = 600    # Typing indicator pulse cycle
+spinner_frame = 100   # Braille spinner frame duration
+badge = 150           # Status badge color cross-fade
+progress = 0          # Linear (no easing)
+
+# Layer z-order (for overlay rendering)
+[layers]
+background = 0
+pane = 1
+right_rail = 2
+status_bar = 3
+modal = 4
+command_palette = 5
+
+# Breakpoints (terminal cells)
+[breakpoints]
+width_min = 80
+width_comfortable = 120
+height_min = 24
+height_comfortable = 40
+
+# Reduced motion: when true, all animations disabled
+[reduced_motion]
+enabled = false

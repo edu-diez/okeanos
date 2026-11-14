@@ -13,4 +13,7 @@ pub mod model;
 pub mod session;
 pub mod tool;
 
+#[cfg(feature = "tui")]
+pub mod ui;
+
 pub use harness::error::HarnessError;

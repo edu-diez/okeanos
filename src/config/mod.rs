@@ -28,6 +28,8 @@ pub struct Config {
     pub permissions: Option<PermissionsSection>,
     #[serde(default)]
     pub cost: Option<CostSection>,
+    #[serde(default)]
+    pub ui: Option<UiSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -42,6 +44,7 @@ impl std::fmt::Debug for Config {
             .field("context", &self.context)
             .field("permissions", &self.permissions)
             .field("cost", &self.cost)
+            .field("ui", &self.ui)
             .finish()
     }
 }
@@ -125,6 +128,11 @@ pub struct PermissionsSection {
 pub struct CostSection {
     pub session_cap_usd: Option<f64>,
     pub per_turn_warning_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UiSection {
+    pub theme: Option<String>, // "dark" or "light"
 }
 
 /// Errors raised while loading or validating configuration.
