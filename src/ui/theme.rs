@@ -160,12 +160,13 @@ impl Theme {
     fn theme_dir() -> anyhow::Result<std::path::PathBuf> {
         // First try relative to the current executable
         if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent() {
-                let themes = dir.join("assets").join("themes");
-                if themes.exists() {
-                    return Ok(themes);
-                }
+            && let Some(dir) = exe.parent()
+        {
+            let themes = dir.join("assets").join("themes");
+            if themes.exists() {
+                return Ok(themes);
             }
+        }
 
         // Fallback to CARGO_MANIFEST_DIR for development
         if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
