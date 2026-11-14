@@ -693,10 +693,7 @@ async fn run_interactive_tui(
     }
 
     // Run the ReAct loop in a separate task, feeding events to TUI
-    let mut loop_handle = tokio::spawn(async move {
-        
-        loop_.run(prompt).await
-    });
+    let mut loop_handle = tokio::spawn(async move { loop_.run(prompt).await });
 
     // Run the TUI event loop, processing events from the ReAct loop
     let mut tui_handle = tokio::spawn(async move { tui_app.run().await });
