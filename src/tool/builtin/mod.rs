@@ -5,12 +5,14 @@
 //! overflow indication; truncated output counts against the context cap.
 
 pub mod delete;
+pub mod edit;
 pub mod grep;
 pub mod read;
 pub mod run;
 pub mod write;
 
 pub use delete::DeleteTool;
+pub use edit::{EditFormat, EditTool};
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use run::RunTool;

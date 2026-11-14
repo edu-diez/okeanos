@@ -395,6 +395,7 @@ fn classify_by_family(name: &str) -> Option<ModelTier> {
 /// Get default capabilities for a tier.
 pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapabilities {
     use crate::model::{ModelCapabilities, ModelTier};
+    use crate::tool::builtin::EditFormat;
     match tier {
         ModelTier::Small => ModelCapabilities {
             tool_calling: false,
@@ -404,6 +405,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             max_output: 4096,
             temperature_supported: true,
             tier: ModelTier::Small,
+            edit_format: EditFormat::WholeFile,
         },
         ModelTier::Mid => ModelCapabilities {
             tool_calling: true,
@@ -413,6 +415,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             max_output: 8192,
             temperature_supported: true,
             tier: ModelTier::Mid,
+            edit_format: EditFormat::Diff,
         },
         ModelTier::Frontier => ModelCapabilities {
             tool_calling: true,
@@ -422,6 +425,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             max_output: 8192,
             temperature_supported: true,
             tier: ModelTier::Frontier,
+            edit_format: EditFormat::Diff,
         },
     }
 }

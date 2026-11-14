@@ -11,6 +11,7 @@ use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
     ModelStreamChunk, Usage,
 };
+use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -251,6 +252,7 @@ impl OpenRouterModel {
             max_output: discovered.max_output_tokens,
             temperature_supported: true,
             tier: discovered.tier,
+            edit_format: EditFormat::default_for_tier(discovered.tier),
         };
 
         let pricing = Some(ModelPricing {
@@ -759,6 +761,7 @@ mod tests {
             max_output: 8192,
             temperature_supported: true,
             tier: ModelTier::Frontier,
+            edit_format: EditFormat::Diff,
         }
     }
 

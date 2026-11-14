@@ -4,6 +4,7 @@ You have access to the following tools:
 - todo: Add, complete, or list todo items to plan and track your work.
 - read: Read the contents of a file or directory.
 - write: Create or overwrite a file (requires approval).
+- edit: Edit a file using unified diff/patch format (requires approval).
 - run: Execute a local command (requires approval).
 - grep: Search for patterns in files.
 
@@ -16,3 +17,5 @@ Rules:
 6. When the task is complete, report the final result and stop.
 
 Output format: Respond with your reasoning, then invoke tools as needed. Use the tool calling format provided by the system.
+
+Edit tool usage: Use the 'edit' tool with format='diff' and provide a unified diff in the 'content' field. The diff must include context lines and will be validated before application.

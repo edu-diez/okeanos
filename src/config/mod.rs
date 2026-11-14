@@ -96,6 +96,8 @@ pub struct ModelCapabilitiesSection {
     pub temperature_supported: Option<bool>,
     /// Model tier for tiered prompts and tool selection.
     pub tier: Option<String>,
+    /// Preferred edit format: "diff", "whole_file", or "str_replace".
+    pub edit_format: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -307,6 +309,16 @@ impl Config {
                         ),
                     });
                 }
+                // Validate edit_format in capabilities section
+                if let Some(ef) = &caps.edit_format
+                    && !matches!(ef.as_str(), "diff" | "whole_file" | "str_replace")
+                {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "model.capabilities.edit_format must be 'diff', 'whole_file', or 'str_replace', got '{ef}'"
+                        ),
+                    });
+                }
             }
 
             // Validate tier if provided
@@ -346,6 +358,7 @@ impl Config {
     /// model metadata from OpenRouter (async version recommended for discovery).
     pub fn to_model_capabilities(&self, _api_key: Option<&str>) -> crate::model::ModelCapabilities {
         use crate::model::{ModelCapabilities, ModelTier};
+        use crate::tool::builtin::EditFormat;
 
         let mut caps = ModelCapabilities::default();
 
@@ -384,6 +397,11 @@ impl Config {
                 {
                     caps.tier = parsed_tier;
                 }
+                if let Some(ef) = &c.edit_format
+                    && let Ok(parsed) = ef.parse::<EditFormat>()
+                {
+                    caps.edit_format = parsed;
+                }
             }
 
             // Override with model section values if set
@@ -392,6 +410,11 @@ impl Config {
             }
             if let Some(v) = model.max_output {
                 caps.max_output = v;
+            }
+            if let Some(ef) = &model.edit_format
+                && let Ok(parsed) = ef.parse::<EditFormat>()
+            {
+                caps.edit_format = parsed;
             }
 
             // If no explicit capabilities, use auto-classification (with discovery if API key available)
@@ -421,6 +444,7 @@ impl Config {
         api_key: Option<&str>,
     ) -> crate::model::ModelCapabilities {
         use crate::model::{ModelCapabilities, ModelTier};
+        use crate::tool::builtin::EditFormat;
 
         let mut caps = ModelCapabilities::default();
 
@@ -457,6 +481,11 @@ impl Config {
                 {
                     caps.tier = parsed_tier;
                 }
+                if let Some(ef) = &c.edit_format
+                    && let Ok(parsed) = ef.parse::<EditFormat>()
+                {
+                    caps.edit_format = parsed;
+                }
             }
 
             if let Some(v) = model.max_context {
@@ -464,6 +493,11 @@ impl Config {
             }
             if let Some(v) = model.max_output {
                 caps.max_output = v;
+            }
+            if let Some(ef) = &model.edit_format
+                && let Ok(parsed) = ef.parse::<EditFormat>()
+            {
+                caps.edit_format = parsed;
             }
 
             if model.capabilities.is_none() {

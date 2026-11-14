@@ -3,6 +3,7 @@ use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse,
     ModelStreamChunk, ModelTier, Usage,
 };
+use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
 use async_trait::async_trait;
 use futures::Stream;
@@ -51,6 +52,7 @@ impl MockModel {
                 max_output: 2048,
                 temperature_supported: true,
                 tier: ModelTier::Small,
+                edit_format: EditFormat::WholeFile,
             },
             model_id,
         )
@@ -67,6 +69,7 @@ impl MockModel {
                 max_output: 8192,
                 temperature_supported: true,
                 tier: ModelTier::Frontier,
+                edit_format: EditFormat::Diff,
             },
             model_id,
         )

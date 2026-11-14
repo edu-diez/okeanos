@@ -1,4 +1,5 @@
 use crate::events::ToolCall;
+use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,8 @@ pub struct ModelCapabilities {
     pub temperature_supported: bool,
     /// Model tier for tiered prompts and tool selection
     pub tier: ModelTier,
+    /// Preferred edit format for this model
+    pub edit_format: EditFormat,
 }
 
 /// Model capability tier, determines prompt template, tool subset, and generation params.

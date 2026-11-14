@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -389,6 +389,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 11 — Edit format
 
+**Status:** complete — tagged v0.1.0-milestone-11
+
 **Scope:**
 - Diff/patch default for frontier models; whole-file / str_replace fallback for small local models.
 - Per-model edit-format hint in config.
@@ -404,7 +406,19 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Unit tests for patch validation, fallback behavior, no silent truncation. No network.
 
-**Definition of Done:** CI green; milestone tagged.
+**Definition of Done:** CI green; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (229 unit tests)
+- `cargo build --release` produces a single binary
+- Diff/patch applied with preflight validation for frontier models
+- Whole-file/str_replace fallback used for small models
+- No silent truncation or partial application
+- Config validation accepts "diff", "whole_file", "str_replace" and rejects invalid values
+- Per-model edit-format hint in config (model.edit_format and model.capabilities.edit_format)
+- Tier-aware defaults: Frontier/Mid → diff, Small → whole_file
+- System prompts updated for all tiers with edit tool usage instructions
+- Tagged v0.1.0-milestone-11
 
 ---
 
@@ -512,7 +526,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 8 | Session log & resume | 1 | M2 |
 | 9 | **OpenRouter / OpenAI-compatible provider** | 2 | M3, M4 |
 | 10 | ✅ Cost budget | 1 | M2, M3, M9 |
-| 11 | Edit format | 1 | M6, M9 |
+| 11 | ✅ Edit format | 1 | M6, M9 |
 | 12 | TUI shell | 2–3 | M2, M4, M5, M9, M11 |
 | 13 | Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |

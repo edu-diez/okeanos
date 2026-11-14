@@ -12,7 +12,7 @@ use okeanos::model::{
     ModelStreamChunk, OpenRouterModel,
 };
 use okeanos::session::{SessionManager, replay_events};
-use okeanos::tool::builtin::{DeleteTool, GrepTool, ReadTool, RunTool, WriteTool};
+use okeanos::tool::builtin::{DeleteTool, EditTool, GrepTool, ReadTool, RunTool, WriteTool};
 use okeanos::tool::{TodoList, TodoTool};
 use okeanos::tool::{ToolRegistry, ToolSpec};
 use std::pin::Pin;
@@ -585,6 +585,9 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         None
     };
 
+    // Extract edit_format before model_capabilities is moved into Conversation
+    let edit_format = model_capabilities.edit_format;
+
     let mut conversation =
         Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
@@ -620,6 +623,7 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     tools.register(TodoTool::new(todo_list));
     tools.register(ReadTool::new());
     tools.register(WriteTool::new());
+    tools.register(EditTool::with_format(edit_format));
     tools.register(DeleteTool::new());
     tools.register(RunTool::new());
     tools.register(GrepTool::new());
@@ -816,7 +820,7 @@ fn apply_cli_overrides(
 
 /// List of available tools for dry-run display.
 fn tools_list() -> Vec<&'static str> {
-    vec!["todo", "read", "write", "delete", "run", "grep"]
+    vec!["todo", "read", "write", "edit", "delete", "run", "grep"]
 }
 
 /// Dry-run mode: show execution plan without executing.
