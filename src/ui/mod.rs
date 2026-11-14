@@ -9,8 +9,7 @@ pub mod theme;
 
 use crate::events::{Event, EventReceiver, EventSender, event_channel};
 use crate::ui::components::{
-    ApprovalModal, CommandPalette, ConversationPane, LogTailPanel,
-    StatusBar, TodoPanel, ToolPanel,
+    ApprovalModal, CommandPalette, ConversationPane, LogTailPanel, StatusBar, TodoPanel, ToolPanel,
 };
 use crate::ui::layout::LayoutRects;
 
@@ -319,24 +318,25 @@ impl TerminalApp {
 
             // Handle command execution from palette
             if let Event::Message(msg) = &event
-                && msg.content.starts_with('/') {
-                    // Parse slash command
-                    let parts: Vec<&str> = msg.content[1..].split_whitespace().collect();
-                    if let Some(cmd) = parts.first() {
-                        match *cmd {
-                            "help" => { /* show help */ }
-                            "undo" => { /* emit undo event */ }
-                            "redo" => { /* emit redo event */ }
-                            "approve" => { /* approve pending */ }
-                            "deny" => { /* deny pending */ }
-                            "todos" => {
-                                self.todo_panel.toggle_expanded();
-                            }
-                            "logs" => { /* toggle logs */ }
-                            _ => {}
+                && msg.content.starts_with('/')
+            {
+                // Parse slash command
+                let parts: Vec<&str> = msg.content[1..].split_whitespace().collect();
+                if let Some(cmd) = parts.first() {
+                    match *cmd {
+                        "help" => { /* show help */ }
+                        "undo" => { /* emit undo event */ }
+                        "redo" => { /* emit redo event */ }
+                        "approve" => { /* approve pending */ }
+                        "deny" => { /* deny pending */ }
+                        "todos" => {
+                            self.todo_panel.toggle_expanded();
                         }
+                        "logs" => { /* toggle logs */ }
+                        _ => {}
                     }
                 }
+            }
         }
     }
 
