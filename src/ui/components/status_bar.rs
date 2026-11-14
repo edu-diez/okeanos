@@ -8,7 +8,7 @@ use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect as RRect},
-    style::{Modifier, Style, Stylize},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
@@ -21,7 +21,6 @@ pub struct StatusBar {
     status: Option<Status>,
     theme: Arc<Theme>,
     reduced_motion: bool,
-    start_time: Instant,
     last_render: Instant,
     mode: String, // "interactive" | "headless" | "rpc"
     width: u16,
@@ -34,7 +33,6 @@ impl StatusBar {
             status: None,
             theme,
             reduced_motion,
-            start_time: Instant::now(),
             last_render: Instant::now(),
             mode: "interactive".to_string(),
             width: 80,

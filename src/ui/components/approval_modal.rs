@@ -10,7 +10,7 @@ use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect as RRect},
-    style::{Modifier, Style, Stylize},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
@@ -137,7 +137,7 @@ impl ApprovalModal {
         Clear.render(area, buf);
 
         // Modal dimensions
-        let modal_width = (area.width as f32 * 0.8).min(80.0).max(50.0) as u16;
+        let modal_width = (area.width as f32 * 0.8).clamp(50.0, 80.0) as u16;
         let modal_height = 12u16; // Fixed height for modal
 
         let modal_area = centered_rect(modal_width, modal_height, area);

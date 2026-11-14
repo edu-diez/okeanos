@@ -351,6 +351,7 @@ impl TerminalApp {
     }
 
     /// Render the UI.
+    #[allow(clippy::too_many_arguments)]
     fn render_ui(
         frame: &mut ratatui::Frame,
         layout: &LayoutRects,
@@ -404,6 +405,7 @@ impl TerminalApp {
     }
 
     /// Render comfortable layout (3 regions) - static version.
+    #[allow(clippy::too_many_arguments)]
     fn render_comfortable_static(
         frame: &mut ratatui::Frame,
         layout: &LayoutRects,
@@ -432,6 +434,7 @@ impl TerminalApp {
     }
 
     /// Render stacked layout (minimum/narrow/short) - static version.
+    #[allow(clippy::too_many_arguments)]
     fn render_stacked_static(
         frame: &mut ratatui::Frame,
         layout: &LayoutRects,
@@ -515,108 +518,6 @@ impl TerminalApp {
         log_tail.render(layout[2], frame.buffer_mut());
     }
 
-    /// Render comfortable layout (3 regions).
-    fn render_comfortable(&mut self, frame: &mut ratatui::Frame, theme: &Theme) {
-        // Header
-        self.render_header(frame, self.layout.header, theme);
-
-        // Conversation (left)
-        self.conversation
-            .render(self.layout.conversation, frame.buffer_mut());
-
-        // Right rail (tool panel + todo + log tail)
-        if let Some(right_rail) = self.layout.right_rail {
-            self.render_right_rail(frame, right_rail, theme);
-        }
-
-        // Status bar (bottom)
-        self.status_bar
-            .render(self.layout.status_bar, frame.buffer_mut());
-    }
-
-    /// Render stacked layout (minimum/narrow/short).
-    fn render_stacked(&mut self, frame: &mut ratatui::Frame, theme: &Theme) {
-        // Header
-        self.render_header(frame, self.layout.header, theme);
-
-        // Conversation (main area)
-        self.conversation
-            .render(self.layout.conversation, frame.buffer_mut());
-
-        // Folded right rail content at bottom of conversation
-        if self.layout.mode != crate::ui::layout::LayoutMode::Minimum {
-            let rail_area = self.layout.right_rail_area();
-            if rail_area.height > 2 {
-                self.render_right_rail(frame, rail_area, theme);
-            }
-        }
-
-        // Status bar (bottom)
-        self.status_bar
-            .render(self.layout.status_bar, frame.buffer_mut());
-    }
-
-    /// Render header region.
-    fn render_header(
-        &self,
-        frame: &mut ratatui::Frame,
-        area: ratatui::layout::Rect,
-        theme: &Theme,
-    ) {
-        let line = ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled(
-                " okeanos ",
-                theme
-                    .style(crate::ui::theme::SemanticRole::Tool)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
-            ),
-            ratatui::text::Span::styled(
-                "│",
-                theme.style(crate::ui::theme::SemanticRole::CanvasBorder),
-            ),
-            ratatui::text::Span::styled(
-                " interactive ",
-                theme.style(crate::ui::theme::SemanticRole::System),
-            ),
-        ]);
-        let paragraph = ratatui::widgets::Paragraph::new(line)
-            .style(theme.style(crate::ui::theme::SemanticRole::CanvasBg));
-        ratatui::widgets::Widget::render(paragraph, area, frame.buffer_mut());
-    }
-
-    /// Render right rail (tool panel, todo panel, log tail stacked).
-    fn render_right_rail(
-        &mut self,
-        frame: &mut ratatui::Frame,
-        area: ratatui::layout::Rect,
-        _theme: &Theme,
-    ) {
-        let sections = 3;
-        let section_height = area.height / sections;
-
-        let layout = ratatui::layout::Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
-            .constraints([
-                ratatui::layout::Constraint::Length(section_height.max(5)), // Tool panel
-                ratatui::layout::Constraint::Length(section_height.max(5)), // Todo panel
-                ratatui::layout::Constraint::Min(3),                        // Log tail
-            ])
-            .split(area);
-
-        self.tool_panel.render(layout[0], frame.buffer_mut());
-        self.todo_panel.render(layout[1], frame.buffer_mut());
-        self.log_tail.render(layout[2], frame.buffer_mut());
-    }
-
-    /// Cleanup terminal state.
-    fn cleanup(&mut self) -> Result<()> {
-        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
-        crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
-        crossterm::terminal::disable_raw_mode()?;
-        self.terminal.show_cursor()?;
-        Ok(())
-    }
-
     /// Suspend the TUI (for running external commands).
     pub fn suspend(&mut self) -> Result<()> {
         self.cleanup()?;
@@ -632,6 +533,15 @@ impl TerminalApp {
         self.suspended = false;
         Ok(())
     }
+
+    /// Cleanup terminal state.
+    fn cleanup(&mut self) -> Result<()> {
+        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
+        crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+        crossterm::terminal::disable_raw_mode()?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
 }
 
 impl Drop for TerminalApp {
@@ -642,7 +552,6 @@ impl Drop for TerminalApp {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::ui::theme::ThemeVariant;
 
     #[test]

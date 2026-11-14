@@ -7,7 +7,7 @@ use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
     buffer::Buffer,
     layout::Rect as RRect,
-    style::{Modifier, Style, Stylize},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation},
 };

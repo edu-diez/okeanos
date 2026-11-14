@@ -7,7 +7,7 @@ use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect as RRect},
-    style::{Modifier, Style, Stylize},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
 };
@@ -257,7 +257,7 @@ impl CommandPalette {
         Clear.render(area, buf);
 
         // Palette dimensions
-        let palette_width = (area.width as f32 * 0.8).min(80.0).max(50.0) as u16;
+        let palette_width = (area.width as f32 * 0.8).clamp(50.0, 80.0) as u16;
         let item_height = (self.filtered.len() as u16 + 3).min(15); // max 15 items
         let palette_height = item_height + 4; // border + padding
 

@@ -8,7 +8,7 @@ use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
     buffer::Buffer,
     layout::Rect as RRect,
-    style::{Modifier, Style, Stylize},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
 };
@@ -142,29 +142,6 @@ impl ToolPanel {
     /// Get selected item index.
     pub fn selected(&self) -> Option<usize> {
         self.list_state.selected()
-    }
-
-    /// Get the item at the given index (combined calls + results).
-    fn get_item(&self, index: usize) -> Option<(String, bool, bool)> {
-        // Calls first, then results
-        let calls: Vec<_> = self.tool_calls.keys().cloned().collect();
-        if index < calls.len() {
-            return Some((
-                calls[index].clone(),
-                true,
-                self.tool_calls[&calls[index]].expanded,
-            ));
-        }
-        let results: Vec<_> = self.tool_results.keys().cloned().collect();
-        let result_idx = index - calls.len();
-        if result_idx < results.len() {
-            return Some((
-                results[result_idx].clone(),
-                false,
-                self.tool_results[&results[result_idx]].expanded,
-            ));
-        }
-        None
     }
 
     /// Render the tool panel.
