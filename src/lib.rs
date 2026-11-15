@@ -11,6 +11,7 @@ pub mod events;
 pub mod harness;
 pub mod model;
 pub mod session;
+pub mod snapshot;
 pub mod tool;
 
 #[cfg(feature = "tui")]

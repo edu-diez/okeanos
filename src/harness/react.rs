@@ -12,7 +12,9 @@ use crate::model::{
     GenerationParams, Model, ModelError, ModelMessage, ModelResponse, ModelRole, ModelTier,
 };
 use crate::session::SessionManager;
+use crate::snapshot::store::SnapshotStore;
 use crate::tool::ToolRegistry;
+use crate::tool::tool_trait::ToolCategory;
 use anyhow::Context as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,6 +127,10 @@ pub struct ReactLoop<M: Model> {
     session: Option<SessionManager>,
     /// Optional cost tracker for budget enforcement.
     cost_tracker: Option<CostTracker>,
+    /// Optional snapshot store for git snapshots before destructive actions.
+    snapshot_store: Option<SnapshotStore>,
+    /// Event index counter for snapshot metadata.
+    event_index: usize,
 }
 
 impl<M: Model> ReactLoop<M> {
@@ -150,6 +156,8 @@ impl<M: Model> ReactLoop<M> {
             approval_rx: None,
             session: None,
             cost_tracker: None,
+            snapshot_store: None,
+            event_index: 0,
         }
     }
 
@@ -199,6 +207,12 @@ impl<M: Model> ReactLoop<M> {
         self
     }
 
+    /// Set the snapshot store for git snapshots before destructive actions.
+    pub fn with_snapshot_store(mut self, store: SnapshotStore) -> Self {
+        self.snapshot_store = Some(store);
+        self
+    }
+
     /// Run the ReAct loop until completion or termination.
     pub async fn run(mut self, initial_prompt: String) -> Result<String, ReactError> {
         // Add initial user message
@@ -208,6 +222,9 @@ impl<M: Model> ReactLoop<M> {
 
         // Emit initial status
         self.emit_status().await;
+
+        // Take initial snapshot
+        self.take_snapshot("Session start").await?;
 
         // Set up cross-platform signal handling for Ctrl-C / SIGINT
         let (shutdown_tx, mut shutdown_rx) = self
@@ -280,9 +297,13 @@ impl<M: Model> ReactLoop<M> {
             match self.iterate(&mut shutdown_rx).await? {
                 LoopDecision::Continue => {
                     self.iteration += 1;
+                    // Take snapshot at loop boundary
+                    self.take_boundary_snapshot().await?;
                     continue;
                 }
                 LoopDecision::Complete(result) => {
+                    // Take final snapshot before completing
+                    self.take_snapshot("Session complete").await?;
                     return Ok(result);
                 }
                 LoopDecision::Stop(reason) => {
@@ -666,6 +687,8 @@ impl<M: Model> ReactLoop<M> {
     /// Tool execution is interruptible: if a shutdown signal is received on
     /// `shutdown_rx`, execution is aborted and [`ReactError::Interrupted`]
     /// is returned.
+    ///
+    /// Takes a git snapshot before executing destructive tools (Write, Delete, Network).
     async fn execute_tool(
         &mut self,
         tool_call: ToolCall,
@@ -717,6 +740,25 @@ impl<M: Model> ReactLoop<M> {
 
         // Check cost budget before executing the tool.
         self.check_cost_budget(&tool_call).await?;
+
+        // Take a snapshot before destructive actions (Write, Delete, Network).
+        // We do this after approval is granted but before execution.
+        if matches!(
+            spec.category,
+            ToolCategory::Write | ToolCategory::Delete | ToolCategory::Network
+        ) {
+            self.take_snapshot(&format!("Before {} tool", tool_call.name))
+                .await?;
+        }
+
+        // Emit tool call started event (before re-fetching tool to avoid borrow conflict)
+        self.emit_tool_call(ToolCall {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            args: tool_call.args.clone(),
+            status: ToolCallStatus::Pending,
+        })
+        .await;
 
         // Emit tool call started event (before re-fetching tool to avoid borrow conflict)
         self.emit_tool_call(ToolCall {
@@ -825,6 +867,64 @@ impl<M: Model> ReactLoop<M> {
             return; // Cost tracking not enabled
         };
         tracker.record_usage(usage);
+    }
+
+    /// Take a git snapshot with the given description.
+    ///
+    /// Increments the event index and stores the snapshot metadata.
+    /// Emits SnapshotProgress events for UI integration.
+    async fn take_snapshot(&mut self, description: &str) -> Result<(), ReactError> {
+        let Some(store) = &mut self.snapshot_store else {
+            return Ok(()); // Snapshots not enabled
+        };
+
+        let event_index = self.event_index;
+        self.event_index += 1;
+
+        // Emit progress event
+        let progress = crate::events::SnapshotProgress {
+            phase: "Creating snapshot".to_string(),
+            percent: 0.0,
+            elapsed_ms: self.start_time.elapsed().as_millis() as u64,
+        };
+        let _ = self.event_tx.send(Event::SnapshotProgress(progress));
+
+        // Create the snapshot
+        match store.snapshot(description, event_index) {
+            Ok(snapshot_id) => {
+                // Emit completion progress event
+                let progress = crate::events::SnapshotProgress {
+                    phase: "Snapshot created".to_string(),
+                    percent: 100.0,
+                    elapsed_ms: self.start_time.elapsed().as_millis() as u64,
+                };
+                let _ = self.event_tx.send(Event::SnapshotProgress(progress));
+
+                // Log the snapshot creation
+                self.emit_log(
+                    LogLevel::Debug,
+                    format!(
+                        "Created snapshot: {} ({})",
+                        &snapshot_id[..8.min(snapshot_id.len())],
+                        description
+                    ),
+                )
+                .await;
+
+                Ok(())
+            }
+            Err(e) => {
+                // Log but don't fail the loop if snapshot creation fails
+                self.emit_log(LogLevel::Warn, format!("Failed to create snapshot: {}", e))
+                    .await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Take a snapshot at a loop boundary (after each iteration).
+    async fn take_boundary_snapshot(&mut self) -> Result<(), ReactError> {
+        self.take_snapshot("Loop boundary").await
     }
 
     /// Wait for an `Approval` decision matching `approval_id` on the approval

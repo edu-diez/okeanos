@@ -12,6 +12,7 @@ use okeanos::model::{
     ModelStreamChunk, OpenRouterModel,
 };
 use okeanos::session::{SessionManager, replay_events};
+use okeanos::snapshot::store::SnapshotStore;
 use okeanos::tool::builtin::{DeleteTool, EditTool, GrepTool, ReadTool, RunTool, WriteTool};
 use okeanos::tool::{TodoList, TodoTool};
 use okeanos::tool::{ToolRegistry, ToolSpec};
@@ -432,7 +433,11 @@ fn clap_version() -> String {
         .to_string()
 }
 
-async fn run_interactive(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {
+async fn run_interactive(
+    cli: &Cli,
+    config: &Config,
+    _prompt: Option<String>,
+) -> anyhow::Result<()> {
     #[cfg(feature = "tui")]
     {
         run_interactive_tui(cli, config, prompt).await
@@ -537,6 +542,10 @@ async fn run_interactive_tui(
 
     // Create event channel for logging
     let (event_tx, _event_rx) = okeanos::events::event_channel();
+
+    // Create snapshot store for git snapshots
+    let snapshot_store =
+        SnapshotStore::new(&project_root).context("failed to create snapshot store")?;
 
     // Determine model tier from capabilities
     let model_tier = model_capabilities.tier;
@@ -686,7 +695,8 @@ async fn run_interactive_tui(
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
-        .with_session(session_manager);
+        .with_session(session_manager)
+        .with_snapshot_store(snapshot_store);
 
     if let Some(tracker) = cost_tracker {
         loop_ = loop_.with_cost_tracker(tracker);
@@ -808,6 +818,10 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
 
     // Create event channel for logging
     let (event_tx, mut event_rx) = okeanos::events::event_channel();
+
+    // Create snapshot store for git snapshots
+    let snapshot_store =
+        SnapshotStore::new(&project_root).context("failed to create snapshot store")?;
 
     // Determine model tier from capabilities
     let model_tier = model_capabilities.tier;
@@ -952,7 +966,8 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
-        .with_session(session_manager);
+        .with_session(session_manager)
+        .with_snapshot_store(snapshot_store);
 
     if let Some(tracker) = cost_tracker {
         loop_ = loop_.with_cost_tracker(tracker);

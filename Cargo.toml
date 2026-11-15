@@ -31,6 +31,7 @@ rand = "0.8"
 bytes = "1"
 nix = { version = "0.28", features = ["signal"] }
 
+
 # Optional dependencies (feature-flagged)
 ratatui = { version = "0.28", optional = true }
 crossterm = { version = "0.28", optional = true }

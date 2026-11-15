@@ -379,6 +379,9 @@ impl Config {
             .unwrap_or(ModelTier::Frontier);
         caps.tier = tier;
 
+        // Apply tier-based defaults as baseline
+        caps = crate::model::default_capabilities_for_tier(caps.tier);
+
         // Apply explicit capabilities if provided
         if let Some(model) = &self.model {
             if let Some(c) = &model.capabilities {
