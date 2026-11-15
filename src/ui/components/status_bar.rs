@@ -240,7 +240,6 @@ impl Default for StatusBar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::Status;
     use std::sync::Arc;
 
     fn test_theme() -> Arc<Theme> {
