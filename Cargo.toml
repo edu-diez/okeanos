@@ -41,7 +41,7 @@ tempfile = { version = "3.15", optional = true }
 tempfile = "3.15"
 
 [features]
-default = []
+default = ["tui"]
 tui = ["ratatui", "crossterm"]
 mcp = []
 mock-provider = []
