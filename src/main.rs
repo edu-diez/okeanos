@@ -433,11 +433,7 @@ fn clap_version() -> String {
         .to_string()
 }
 
-async fn run_interactive(
-    cli: &Cli,
-    config: &Config,
-    prompt: Option<String>,
-) -> anyhow::Result<()> {
+async fn run_interactive(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {
     #[cfg(feature = "tui")]
     {
         run_interactive_tui(cli, config, prompt).await
