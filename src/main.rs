@@ -436,7 +436,7 @@ fn clap_version() -> String {
 async fn run_interactive(
     cli: &Cli,
     config: &Config,
-    _prompt: Option<String>,
+    prompt: Option<String>,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "tui")]
     {

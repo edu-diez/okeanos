@@ -296,13 +296,13 @@ mod tests {
         // Check for progress events
         let mut snapshot_created = false;
         for _ in 0..10 {
-            if let Ok(event) = event_rx.try_recv() {
-                if let crate::events::Event::SnapshotProgress(sp) = event {
-                    if sp.phase == "Snapshot created" && sp.percent == 100.0 {
-                        snapshot_created = true;
-                        break;
-                    }
-                }
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::SnapshotProgress(sp) = event
+                && sp.phase == "Snapshot created"
+                && sp.percent == 100.0
+            {
+                snapshot_created = true;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
