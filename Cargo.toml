@@ -30,6 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 bytes = "1"
 nix = { version = "0.28", features = ["signal"] }
+atty = "0.2"
 
 
 # Optional dependencies (feature-flagged)

@@ -15,6 +15,7 @@ use crate::ui::layout::LayoutRects;
 
 pub use crate::ui::theme::{Theme, ThemeManager, ThemeVariant};
 use anyhow::Result;
+use atty;
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
@@ -52,15 +53,26 @@ impl TerminalApp {
 
         // Initialize crossterm backend
         let backend = CrosstermBackend::new(io::stdout());
-        let terminal = Terminal::new(backend)?;
+        let terminal = Terminal::new(backend)
+            .map_err(|e| anyhow::anyhow!("failed to create terminal backend: {}", e))?;
 
         // Enable raw mode and alternate screen
-        crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
-        crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)?;
+        // Check if stdout is a TTY first for better error message
+        if !atty::is(atty::Stream::Stdout) {
+            return Err(anyhow::anyhow!(
+                "stdout is not a TTY (is it redirected?). Interactive TUI requires a real terminal."
+            ));
+        }
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| anyhow::anyhow!("failed to enable raw mode: {}", e))?;
+        crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)
+            .map_err(|e| anyhow::anyhow!("failed to enter alternate screen: {}", e))?;
+        crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture)
+            .map_err(|e| anyhow::anyhow!("failed to enable mouse capture: {}", e))?;
 
         // Get initial terminal size
-        let size = terminal.size()?;
+        let size = terminal.size()
+            .map_err(|e| anyhow::anyhow!("failed to get terminal size: {}", e))?;
         let width = size.width;
         let height = size.height;
 
