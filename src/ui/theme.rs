@@ -162,8 +162,7 @@ impl Theme {
             ThemeVariant::Dark => (EMBEDDED_DARK_TOML, ThemeVariant::Dark),
             ThemeVariant::Light => (EMBEDDED_LIGHT_TOML, ThemeVariant::Light),
         };
-        let mut theme: Theme = toml::from_str(content)
-            .context("failed to parse embedded theme")?;
+        let mut theme: Theme = toml::from_str(content).context("failed to parse embedded theme")?;
         theme.variant = variant;
         Ok(Arc::new(theme))
     }
