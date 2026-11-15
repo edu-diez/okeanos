@@ -519,11 +519,11 @@ async fn run_interactive_tui(
     // Get the prompt from CLI
     let prompt = if cli.resume.is_some() {
         prompt.unwrap_or_else(|| "Continue from previous session.".to_string())
+    } else if let Some(p) = prompt {
+        p
     } else {
-        prompt.unwrap_or_else(|| {
-            eprintln!("Error: prompt is required in interactive mode");
-            std::process::exit(1);
-        })
+        // No prompt provided - start with an interactive session prompt
+        "Start an interactive coding session. Wait for user input in the TUI.".to_string()
     };
 
     // Dry-run mode: show execution plan and exit
