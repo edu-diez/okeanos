@@ -71,7 +71,8 @@ impl TerminalApp {
             .map_err(|e| anyhow::anyhow!("failed to enable mouse capture: {}", e))?;
 
         // Get initial terminal size
-        let size = terminal.size()
+        let size = terminal
+            .size()
             .map_err(|e| anyhow::anyhow!("failed to get terminal size: {}", e))?;
         let width = size.width;
         let height = size.height;
