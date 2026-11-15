@@ -2,11 +2,17 @@
 //!
 //! Loads dark.toml / light.toml at runtime. Changing one file re-themes the app;
 //! no visual rework. Per DESIGN.md §8.
+//!
+//! Themes are also embedded in the binary for standalone distribution.
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+
+// Embedded theme TOML strings for standalone binary operation
+const EMBEDDED_DARK_TOML: &str = include_str!("../../assets/themes/dark.toml");
+const EMBEDDED_LIGHT_TOML: &str = include_str!("../../assets/themes/light.toml");
 
 /// Theme variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -132,15 +138,34 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Load theme from the default assets directory.
+    /// Load theme from the default assets directory, with embedded fallback for standalone binaries.
     pub fn load(variant: ThemeVariant) -> anyhow::Result<Arc<Self>> {
-        let theme_dir = Self::theme_dir()?;
-        let file_name = match variant {
-            ThemeVariant::Dark => "dark.toml",
-            ThemeVariant::Light => "light.toml",
+        // Try loading from filesystem first (allows live theme editing in development)
+        if let Some(theme_dir) = Self::theme_dir() {
+            let file_name = match variant {
+                ThemeVariant::Dark => "dark.toml",
+                ThemeVariant::Light => "light.toml",
+            };
+            let path = theme_dir.join(file_name);
+            if path.exists() {
+                return Self::load_from_path(&path);
+            }
+        }
+
+        // Fallback to embedded themes (for standalone binaries without assets/themes/)
+        Self::load_embedded(variant)
+    }
+
+    /// Load theme from embedded TOML strings.
+    fn load_embedded(variant: ThemeVariant) -> anyhow::Result<Arc<Self>> {
+        let (content, variant) = match variant {
+            ThemeVariant::Dark => (EMBEDDED_DARK_TOML, ThemeVariant::Dark),
+            ThemeVariant::Light => (EMBEDDED_LIGHT_TOML, ThemeVariant::Light),
         };
-        let path = theme_dir.join(file_name);
-        Self::load_from_path(&path)
+        let mut theme: Theme = toml::from_str(content)
+            .context("failed to parse embedded theme")?;
+        theme.variant = variant;
+        Ok(Arc::new(theme))
     }
 
     /// Load theme from a specific path.
@@ -157,14 +182,15 @@ impl Theme {
     }
 
     /// Get the default theme directory (assets/themes/).
-    fn theme_dir() -> anyhow::Result<std::path::PathBuf> {
+    /// Returns None if not found (caller should fall back to embedded themes).
+    fn theme_dir() -> Option<std::path::PathBuf> {
         // First try relative to the current executable
         if let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
         {
             let themes = dir.join("assets").join("themes");
             if themes.exists() {
-                return Ok(themes);
+                return Some(themes);
             }
         }
 
@@ -174,18 +200,19 @@ impl Theme {
                 .join("assets")
                 .join("themes");
             if themes.exists() {
-                return Ok(themes);
+                return Some(themes);
             }
         }
 
         // Fallback to CWD
-        let cwd = std::env::current_dir()?;
-        let themes = cwd.join("assets").join("themes");
-        if themes.exists() {
-            return Ok(themes);
+        if let Ok(cwd) = std::env::current_dir() {
+            let themes = cwd.join("assets").join("themes");
+            if themes.exists() {
+                return Some(themes);
+            }
         }
 
-        anyhow::bail!("could not find assets/themes directory")
+        None
     }
 
     /// Get the default dark theme.
