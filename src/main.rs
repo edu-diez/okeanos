@@ -517,12 +517,11 @@ async fn run_interactive_tui(
     }
 
     // Get the prompt from CLI (for initial prompt if provided)
-    let initial_prompt = if cli.resume.is_some() {
-        prompt.unwrap_or_else(|| "Continue from previous session.".to_string())
-    } else if let Some(p) = prompt {
-        p
-    } else {
-        String::new() // No initial prompt - wait for user input in TUI
+    let initial_prompt = match (cli.resume.is_some(), prompt) {
+        (true, Some(p)) => p,
+        (true, None) => "Continue from previous session.".to_string(),
+        (false, Some(p)) => p,
+        (false, None) => String::new(), // No initial prompt - wait for user input in TUI
     };
 
     // Dry-run mode: show execution plan and exit
@@ -583,9 +582,10 @@ async fn run_interactive_tui(
     };
 
     // Check provider configuration status for welcome screen
-    let provider_configured = config.provider.as_ref().map_or(false, |p| {
-        p.api_key.as_ref().map_or(false, |k| !k.is_empty())
-    });
+    let provider_configured = config
+        .provider
+        .as_ref()
+        .is_some_and(|p| p.api_key.as_ref().is_some_and(|k| !k.is_empty()));
     let configured_model = config.model.as_ref().and_then(|m| m.name.clone());
 
     // Build conversation with system prompt and context cap
@@ -697,7 +697,7 @@ async fn run_interactive_tui(
         .context("approval receiver not available")?;
 
     // Get the composer receiver for user prompts
-    let mut composer_rx = tui_app
+    let composer_rx = tui_app
         .take_composer_receiver()
         .context("composer receiver not available")?;
 
