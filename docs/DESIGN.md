@@ -84,10 +84,10 @@ Grid unit: 1 terminal character cell. Regions stack vertically by default; colum
 
 | Size | Mode | Layout |
 |------|------|--------|
-| 80×24 | minimum | Single column: header (1 row), conversation (rest − 2), status bar (2 rows). Right-rail content folds into the conversation bottom as collapsible sections. |
-| 120×40 | comfortable | 3 regions: conversation left (~60%), right rail (~40%: tool panel + todos + log tail), status bar bottom (2 rows). |
+| 80×24 | minimum | Single column: header (1 row), conversation (rest − 4), **input composer (1–2 rows)**, status bar (2 rows). Right-rail content folds into the conversation bottom as collapsible sections. |
+| 120×40 | comfortable | 3 regions: conversation left (~60%), right rail (~40%: tool panel + todos + log tail), **input composer (1–3 rows)**, status bar bottom (2 rows). |
 | < 100 cols | narrow | Right rail collapses; tool results and todos show as inline sections below the conversation. |
-| < 40 rows | short | Status bar compresses to 1 row; todo panel hidden by default; conversation shrinks. |
+| < 40 rows | short | Status bar compresses to 1 row; todo panel hidden by default; input composer min 1 row; conversation shrinks. |
 
 ### Region definitions
 
@@ -95,6 +95,7 @@ Grid unit: 1 terminal character cell. Regions stack vertically by default; colum
 - **Conversation pane** (main): scrollback of user/assistant/tool messages; assistant streams with typewriter cursor.
 - **Right rail** (comfortable only): tool-call invocation panel, todo panel, log tail panel (tabbed or stacked).
 - **Status bar** (1–2 rows, bottom): model, tokens in/out, cost, elapsed, retry count, headless/RPC indicator. Always visible.
+- **Input composer** (1+ rows, above status bar): multi-line text area for user prompts; shows key hints (`Enter` send, `Shift+Enter` newline, `Ctrl+C` cancel turn, `Ctrl+D` exit); disabled during in-flight turn.
 - **Modal layer** (overlay): approval/confirm, command palette. Centered, dims background.
 - **Command palette** (overlay): center-bottom, searchable command list (`/undo`, `/redo`, `/help`, …).
 
@@ -107,11 +108,14 @@ No code here — structural descriptions for implementation.
 1. **Conversation pane** — vertical message list. User messages left-aligned with a `user` chip; assistant messages with an `assistant` chip and streaming token render; tool results indented under the assistant turn, collapsed by default with an expand affordance. Newest message at bottom; autoscroll follows the stream unless the user scrolls up.
 2. **Streaming token render** — monospace text with a blinking block cursor at the insert point; typing indicator (three pulsing dots) while the model is thinking between tokens.
 3. **Tool-call invocation panel** — name chip (`tool` color), arguments as scrollable mono-data with key/string coloring, result block (expandable), status badge (`pending` → `ok`/`error`), retry counter next to the badge.
-4. **Approval/confirm modal** — centered, full width at narrow sizes. Title “Approve tool call?”, tool name + args preview, three actions: Allow / Deny / Allow always for this session. Keyboard-first: Enter allows, Esc denies, arrow keys move focus. High-contrast focus ring.
+4. **Approval/confirm modal** — centered, full width at narrow sizes. Title "Approve tool call?", tool name + args preview, three actions: Allow / Deny / Allow always for this session. Keyboard-first: Enter allows, Esc denies, arrow keys move focus. High-contrast focus ring.
 5. **Todo panel** — ordered list; each row shows checkbox glyph (`[ ]` / `[x]`), short title, status chip. Add via `/todo`; completing toggles the row. Completed items fade to `muted`.
 6. **Status bar** — left-to-right: model name, `tokens in / out`, cost estimate, elapsed time, retry count, mode dot (interactive / headless / RPC). Two rows at comfortable height, one row at minimum height.
 7. **Command palette** — centered overlay listing `/undo`, `/redo`, `/help`, `/approve`, `/deny`, `/todos`, `/logs`. Prefix/fuzzy match as you type; Esc closes; Enter runs.
 8. **Log tail panel** — newest JSONL line at bottom; autoscroll on new lines; level color (`system`/`ok`/`error`); optional filter chips.
+9. **Input composer** — multi-line text area (grows to ~40% of height, min 1 row). Placeholder: "Describe what you want to do…" (no config) or "Type your prompt…" (config loaded). Key hints on right: `Enter` send · `Shift+Enter` newline · `Ctrl+C` cancel · `Ctrl+D` exit. During in-flight turn: disabled, shows spinner + "Running…" status. Supports slash commands inline (`/undo`, `/redo`, `/help`, `/todos`, `/logs`, `/approve`, `/deny`).
+
+10. **Welcome screen** — shown on startup when no config exists and no prompt provided. Centered panel with: app name/version, provider/model status (configured / not configured), key bindings summary (`:` palette, `Ctrl+C` cancel, `Ctrl+D` quit), "Press any key to begin" or "Run `okeanos init` to configure". Dismisses on first keystroke or when composer receives focus.
 
 ## 6. Motion & transitions
 
@@ -183,6 +187,7 @@ Named constants to be encoded in one theme file (Phase 2). Changing one file re-
 - Contrast audit: automated check that every semantic color meets its ratio target on both canvases.
 - Reduced-motion test: with animations disabled, no time-dependent frame changes occur.
 - Event-parity test: every TUI state transition produces the matching JSON event in headless mode.
+- **Interactive flow test**: simulated keystrokes in composer → `run_turn()` invoked → events rendered → composer re-enabled → next input; verifies single-turn execution and no autonomous loop.
 
 ---
 

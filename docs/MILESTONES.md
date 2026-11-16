@@ -426,7 +426,9 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Scope:**
 - ratatui + crossterm TUI per DESIGN.md: theme tokens from `assets/themes/dark.toml`/`light.toml`, responsive layout grid (80×24 min, 120×40 comfortable).
-- Components: conversation pane, streaming token render, tool-call panel, approval modal, todo panel, status bar, command palette, log tail.
+- Components: conversation pane, streaming token render, tool-call panel, approval modal, todo panel, status bar, command palette, log tail, **input composer**.
+- **Interactive mode architecture**: TUI owns the input loop. User types in composer → TUI sends prompt to harness → harness runs **exactly one ReAct turn** (think→tool→observe) → returns control → TUI renders events → repeat. No autonomous loop spinning on dummy prompts.
+- **Harness API**: add `ReactLoop::run_turn(&mut self, prompt: String) -> Result<LoopDecision, ReactError>` — runs exactly one `iterate()` call, returns control to caller. Used by TUI; headless/RPC continue using `run()`.
 - Command palette with slash commands: `/help`, `/todos`, `/logs`, `/undo`, `/redo`.
 - Headless/RPC event parity: same event structs feed TUI renderer and JSON emitter (DESIGN.md §7).
 - Resize handling, scroll preservation, reduced-motion toggle.
@@ -435,12 +437,15 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Acceptance criteria:**
 - TUI renders all regions at 80×24 and 120×40; regions reflow on resize.
+- **Input composer at bottom**: multi-line editing, Enter to submit, Shift+Enter for newline, Ctrl+C to cancel in-flight turn, Ctrl+D to exit.
+- **Welcome screen on startup** (no config, no prompt): shows provider/model status, key bindings, empty conversation — waits for user input.
 - Approval modal is keyboard-first (Enter allow / Esc deny) with high-contrast focus ring.
 - Streaming tokens render with typewriter cursor; typing indicator present.
 - Command palette opens with `:`; `/help`, `/todos`, `/logs`, `/undo`, `/redo` work.
+- **Single-turn execution**: each user prompt triggers exactly one ReAct iteration via `run_turn()`; TUI controls when the next turn runs.
 - Snapshot tests pass for golden frames; contrast audit passes (WCAG AA/AAA); reduced-motion disables all animations.
 
-**Testing requirements:** TUI snapshot tests, resize tests, contrast audit, reduced-motion test, event-parity test (TUI state → JSON event).
+**Testing requirements:** TUI snapshot tests, resize tests, contrast audit, reduced-motion test, event-parity test (TUI state → JSON event), **interactive flow test** (composer input → single turn → render → next input), `run_turn()` unit tests.
 
 **Definition of Done:** Visual design review sign-off; CI green including snapshot/contrast tests; DESIGN.md not deviated from without design review; milestone tagged.
 
@@ -452,6 +457,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - gix-based snapshot store: snapshot before destructive actions and on loop boundaries.
 - `/undo` / `/redo` commands restoring prior snapshots; undo/redo cursor.
 - Snapshot progress UI (TUI status bar + JSON `snapshot_progress` event).
+- **Session log module restructure**: split `src/session/mod.rs` into `log.rs` (append-only JSONL), `header.rs` (session header), `resume.rs` (`ResumeStore` for `--resume`), `mod.rs` (re-exports). Align with ARCHITECTURE.md folder structure.
 
 **Out of scope:** Snapshot pruning/retention policy, remote git operations, branch management, compressed logs.
 
@@ -459,22 +465,25 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - `/undo` restores prior working-tree state; `/redo` re-applies it.
 - Snapshots taken before any `write`/`delete`/destructive `run`.
 - Undo/redo cursor bounded; cannot undo past oldest snapshot.
+- Session log types (`SessionLog`, `SessionHeader`, `ResumeStore`) exist as separate modules per ARCHITECTURE.md.
 
-**Testing requirements:** Integration tests for snapshot round-trip, undo/redo sequences, snapshot-log reference integrity.
+**Testing requirements:** Integration tests for snapshot round-trip, undo/redo sequences, snapshot-log reference integrity, `--resume` round-trip with split modules.
 
-**Definition of Done:** CI green; undo/redo verified end-to-end in headless and TUI modes; milestone tagged.
+**Definition of Done:** CI green; undo/redo verified end-to-end in headless and TUI modes; session log modules match ARCHITECTURE.md; milestone tagged.
 
 ---
 
 ## Milestone 14 — Headless/RPC mode
 
 **Scope:**
+- **Shared event emitter**: extract `src/headless.rs` with `EventEmitter` used by both TUI and headless mode (eliminate duplicate event logging in `main.rs`).
 - `--headless`: no terminal; JSON event stream to stdout identical to TUI events.
-- `--rpc`: JSON-RPC over stdio (feature-gated `jsonrpsee` server); optional HTTP transport behind `rpc` feature.
+- `--rpc`: JSON-RPC over stdio (feature-gated `jsonrpsee` server); optional HTTP transport behind `rpc` feature; add `jsonrpsee` to Cargo.toml `rpc` feature.
 - ReAct loop driven identically in all three modes; mode is a renderer/transport choice only.
 - RPC accepts `approve`/`deny` commands resolving pending approvals.
 - Slash command support via JSON events: `/help`, `/todos`, `/logs`, `/undo`, `/redo` emitted as structured events for script consumption.
 - **Headless approval handling:** `--approval-policy auto|deny|prompt` flag: `auto` = allow-all, `deny` = block all privileged ops, `prompt` = emit `ApprovalRequest` event and wait for JSON `Approval` on stdin (for scripted approval). Timeout configurable via `--approval-timeout-sec`.
+- **CLI flag**: add `--rpc` flag to `Cli` (currently missing).
 
 **Out of scope:** WebSocket transport (deferred), MCP client (deferred, `mcp` feature).
 
@@ -484,8 +493,10 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - Headless mode works piped/non-TTY.
 - Slash commands emit corresponding JSON events (not interactive).
 - `--approval-policy auto` allows writes without pausing; `deny` blocks them with clear error; `prompt` waits for stdin JSON.
+- `src/headless.rs` exists and is used by both TUI and headless paths.
+- `--rpc` flag accepted and starts JSON-RPC server.
 
-**Testing requirements:** Event-parity test across modes; RPC request/response round-trip tests.
+**Testing requirements:** Event-parity test across modes; RPC request/response round-trip tests; headless.rs unit tests.
 
 **Definition of Done:** CI green; parity test covers every event in DESIGN.md §7; milestone tagged.
 
@@ -531,3 +542,31 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 13 | Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | Apple Silicon support | 1–2 | M0 |
+
+---
+
+## Technical Debt / Architecture Fixes (post-MVP or parallel)
+
+These issues were identified during M12 design review and should be addressed in follow-up milestones:
+
+| Issue | Description | Suggested Milestone |
+|-------|-------------|---------------------|
+| **Config layer violation** | `toml` crate in workspace deps (should be CLI-only per ARCHITECTURE.md §Dependency rules). Config validation logic mixed with loading. | M16: Config layer cleanup |
+| **Mock model approval hack** | Mock returns `write` tool call on startup to keep TUI alive. Root cause: no "wait for user input" state in ReAct loop. Fixed by `run_turn()` in M12. | M12 (prerequisite) |
+| **Session log module structure** | ARCHITECTURE.md shows `log.rs`, `header.rs`, `resume.rs`; reality is single `mod.rs`. | M13 (added to scope) |
+| **Missing `headless.rs`** | ARCHITECTURE.md references `src/headless.rs` as shared event emitter; doesn't exist. Headless mode inline in `main.rs`. | M14 (added to scope) |
+| **RPC vaporware** | Status bar has `"rpc"` mode; CLI has no `--rpc` flag; no `jsonrpsee` dep; no server impl. | M14 (added to scope) |
+| **No graceful shutdown flush in TUI** | SIGINT should flush session log, teardown alternate screen, drain in-flight work. Currently TUI cleanup only on normal exit. | M14 or M16 |
+| **Config validation at wrong layer** | `Config::load()` does validation; should be separate `validate()` call for CI gating. | M16: Config layer cleanup |
+
+**M16 — Config layer cleanup** (suggested)
+- Move `toml` to CLI-only dependency (optional feature or separate crate)
+- Split config loading from validation
+- Add `Config::validate()` for CI gating
+- Ensure secrets never logged during validation
+
+**M17 — Graceful shutdown hardening** (suggested)
+- SIGINT/SIGTERM flush session log in all modes
+- TUI alternate screen teardown on signal
+- Drain in-flight tool execution with timeout
+- Escalation: SIGTERM → grace → SIGKILL

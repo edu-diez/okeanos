@@ -517,6 +517,8 @@ async fn run_interactive_tui(
     }
 
     // Get the prompt from CLI
+    // Track if we're in interactive mode with no user-provided prompt (for mock model behavior)
+    let is_interactive_no_prompt = prompt.is_none() && cli.resume.is_none();
     let prompt = if cli.resume.is_some() {
         prompt.unwrap_or_else(|| "Continue from previous session.".to_string())
     } else if let Some(p) = prompt {
@@ -576,9 +578,26 @@ async fn run_interactive_tui(
         )))
     } else {
         let m = MockModel::new(model_capabilities.clone(), model_name.clone());
-        m.push_response(okeanos::model::mock::MockModel::text_response(
-            "Task complete. I've finished the requested work.",
-        ));
+        // In interactive mode with no user prompt, return a tool call requiring approval
+        // so the TUI stays alive and shows the approval modal for user interaction.
+        if is_interactive_no_prompt {
+            m.push_response(okeanos::model::mock::MockModel::tool_call_response(
+                "Ready to start. I'll create a todo list to track our work.",
+                vec![okeanos::events::ToolCall {
+                    id: "call-init-todo".into(),
+                    name: "write".into(), // write requires approval (not in default allow_list)
+                    args: serde_json::json!({
+                        "path": "TODO.md",
+                        "content": "# Session TODO\n\n- [ ] Understand the task\n- [ ] Implement solution\n- [ ] Test and verify\n"
+                    }),
+                    status: okeanos::events::ToolCallStatus::Pending,
+                }],
+            ));
+        } else {
+            m.push_response(okeanos::model::mock::MockModel::text_response(
+                "Task complete. I've finished the requested work.",
+            ));
+        }
         Arc::new(ActiveModel::Mock(m))
     };
 

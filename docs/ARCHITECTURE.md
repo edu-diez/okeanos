@@ -41,7 +41,7 @@
 - **Permission layer owns:** The allow-list and approval decisions. No tool executes a write/delete/network operation without policy approval.
 - **Session log owns:** Append-only durability. It is write-only after creation; snapshots reference log positions.
 - **Snapshot store owns:** Git object writes via gix; undo/redo cursor. It never mutates the working tree outside policy-approved operations.
-- **TUI owns:** Rendering only. It consumes the event stream produced by the harness/headless layer and displays it. It does not drive the ReAct loop.
+- **TUI owns:** Rendering and **input loop for interactive mode**. In interactive mode, the TUI owns the input composer; user input triggers a single ReAct turn via the harness, then control returns to the TUI. The TUI does not run an autonomous loop — it drives the harness turn-by-turn. In headless/RPC mode, the harness runs the full ReAct loop autonomously.
 - **Headless/RPC owns:** Transport serialization (JSON over stdout/stdio/HTTP). Same event structs as the TUI renderer.
 
 ## Public vs private state
@@ -78,14 +78,42 @@
 
 ## Data flow
 
+### Interactive mode (TUI-driven)
+
+```
+User types in composer
+        │
+        ▼
+TUI (input loop) ──► Harness.run_turn(prompt) ──► Single ReAct iteration
+        │                    │
+        │                    ├─► Context (tiered prompt + skills/ + history + selective files, cap check, warnings)
+        │                    ├─► Model (chat completion / stream; capabilities; thinking channel)
+        │                    ├─► Text tool parsing (for models without native FC)
+        │                    │         └─► Validate parsed calls against schema before execution
+        │                    ├─► Edit format (diff/patch or whole-file per tier; preflight validate)
+        │                    ├─► Permission (allow-list / approve)
+        │                    │         ├─► Tool (execute, JSON schema or text-parsed)
+        │                    │         │         └─► Tool execution (streaming, timeout, cancel)
+        │                    │         └─► run: local process at boundary
+        │                    ├─► Cost budget (check before tool call; refuse if over cap)
+        │                    ├─► Session log (append JSONL)
+        │                    ├─► Snapshot store (git, before destructive)
+        │                    └─► Event stream (emitted during turn)
+        │
+        ▼
+TUI renders events ──► Wait for next user input
+```
+
+### Headless/RPC mode (harness-driven)
+
 ```
 User prompt / RPC request
         │
         ▼
-CLI entry ──► Config load (global + project) ──► Mode (interactive | headless | rpc)
+CLI entry ──► Config load (global + project) ──► Mode (headless | rpc)
         │
         ▼
-Harness (ReAct loop)
+Harness (ReAct loop) ──► Autonomous: think → tool → observe → repeat
         ├─► Context (tiered prompt + skills/ + history + selective files, cap check, warnings)
         ├─► Model (chat completion / stream; capabilities; thinking channel) ◄──┐
         │                                                                       │
@@ -102,17 +130,26 @@ Harness (ReAct loop)
         ├─► Cost budget (check before tool call; refuse if over cap)            │
         ├─► Session log (append JSONL)              │
         ├─► Snapshot store (git, before destructive)│
-        └─► Event stream (TUI + headless JSON)      │
+        └─► Event stream (headless JSON / RPC)      │
                                                         │
         ▼                                               │
-TUI renderer (ratatui) ────────────────────────────────┘
-Headless/RPC (JSON over stdout/stdio/HTTP)
+Headless/RPC (JSON over stdout/stdio/HTTP)            │
 ```
 
-- The ReAct loop emits events to a single broadcast channel.
-- The TUI subscribes and renders; the headless driver serializes the same events to JSON.
-- Approval requests pause the loop; the loop resumes on an `Approval` event (from TUI modal or RPC).
-- Context cap errors propagate as a terminal `error` event; the loop stops cleanly.
+### Key differences
+
+| Aspect | Interactive (TUI) | Headless / RPC |
+|--------|-------------------|----------------|
+| Loop driver | TUI (turn-by-turn) | Harness (autonomous) |
+| Input | Composer (user types) | CLI arg / RPC request |
+| Turn control | One `run_turn()` per user prompt | Continuous until done/error/cap |
+| Approval | Modal blocks composer | JSON event on stdout / RPC call |
+| Exit | Ctrl+D / `/quit` | Task complete / error / SIGINT |
+
+- In both modes, the harness emits the **same event structs** (DESIGN.md §7).
+- The TUI is a **renderer + input driver** in interactive mode; a **passive renderer** in headless mode (not used).
+- Approval requests pause the harness turn; the loop resumes on an `Approval` event (from TUI modal or RPC).
+- Context cap errors propagate as a terminal `error` event; the turn stops cleanly.
 
 ## Service boundaries
 
@@ -188,9 +225,9 @@ okeanos/
 │   │   ├── selective.rs   # selective file inclusion (ripgrep symbol scan, pure Rust)
 │   │   └── warnings.rs    # context window warnings before hard cap
 │   ├── session/
-│   │   ├── log.rs         # append-only JSONL
-│   │   ├── header.rs      # session id, cwd, version
-│   │   └── resume.rs      # --resume <id>, project-scoped storage
+│   │   ├── log.rs         # append-only JSONL (TODO: not yet split)
+│   │   ├── header.rs      # session id, cwd, version (TODO: not yet split)
+│   │   └── resume.rs      # --resume <id>, project-scoped storage (TODO: not yet split)
 │   ├── snapshot/
 │   │   ├── mod.rs
 │   │   ├── store.rs       # gix-based snapshot store
@@ -200,7 +237,7 @@ okeanos/
 │   │   ├── theme.rs       # design tokens from assets/themes/
 │   │   ├── layout.rs      # responsive grid per DESIGN.md §4
 │   │   └── components/    # conversation, tool_panel, modal, status_bar, …
-│   ├── headless.rs        # JSON event emitter, stdio/JSON-RPC transports
+│   ├── headless.rs        # JSON event emitter, stdio/JSON-RPC transports (TODO: not yet created)
 │   └── events.rs          # shared event structs (Message, ToolCall, Approval, …)
 ├── tests/                 # integration tests (mock provider, harness logic)
 ├── Cargo.toml
@@ -208,6 +245,22 @@ okeanos/
 ├── .gitignore
 └── LICENSE
 ```
+
+### Current Implementation Gaps (as of M11 complete)
+
+| Spec (this doc) | Reality | Tracking |
+|-----------------|---------|----------|
+| `src/headless.rs` exists | Missing; headless logic inline in `main.rs::run_headless()` | M14 |
+| `src/session/log.rs`, `header.rs`, `resume.rs` | Single `src/session/mod.rs` | M13 |
+| `toml` crate in harness deps | In workspace `[dependencies]` (violates CLI-only rule) | M16 |
+| `--rpc` CLI flag | Not defined in `cli.rs` | M14 |
+| `jsonrpsee` in `rpc` feature | Not in `Cargo.toml` | M14 |
+| `ReactLoop::run_turn()` | Not implemented; only `run()` exists | M12 |
+| TUI input composer | Not implemented | M12 |
+| Welcome screen | Not implemented | M12 |
+| Graceful shutdown flush on SIGINT | Only normal exit cleanup | M17 |
+
+These gaps are tracked in MILESTONES.md Technical Debt section and will be resolved in the indicated milestones.
 
 ## Security model
 
