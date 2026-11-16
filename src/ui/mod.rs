@@ -9,7 +9,8 @@ pub mod theme;
 
 use crate::events::{Event, EventReceiver, EventSender, event_channel};
 use crate::ui::components::{
-    ApprovalModal, CommandPalette, ConversationPane, LogTailPanel, StatusBar, TodoPanel, ToolPanel,
+    ApprovalModal, CommandAction, CommandPalette, ConversationPane, InputComposer, LogTailPanel,
+    StatusBar, TodoPanel, ToolPanel, WelcomeScreen,
 };
 use crate::ui::layout::LayoutRects;
 
@@ -19,30 +20,42 @@ use atty;
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// TUI application state.
+/// TUI application state for single-turn interactive mode.
 pub struct TerminalApp {
-    theme_manager: ThemeManager,
-    layout: LayoutRects,
-    conversation: ConversationPane,
-    tool_panel: ToolPanel,
-    todo_panel: TodoPanel,
-    status_bar: StatusBar,
-    log_tail: LogTailPanel,
-    approval_modal: ApprovalModal,
-    command_palette: CommandPalette,
-    event_rx: EventReceiver,
-    event_tx: EventSender,
-    approval_tx: mpsc::Sender<crate::events::Approval>,
-    approval_rx: Option<mpsc::Receiver<crate::events::Approval>>,
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    last_tick: Instant,
-    running: bool,
-    suspended: bool,
-    width: u16,
-    height: u16,
+    pub theme_manager: ThemeManager,
+    pub layout: LayoutRects,
+    pub conversation: ConversationPane,
+    pub tool_panel: ToolPanel,
+    pub todo_panel: TodoPanel,
+    pub status_bar: StatusBar,
+    pub log_tail: LogTailPanel,
+    pub approval_modal: ApprovalModal,
+    pub command_palette: CommandPalette,
+    pub input_composer: InputComposer,
+    pub welcome_screen: WelcomeScreen,
+    pub event_rx: EventReceiver,
+    pub event_tx: EventSender,
+    pub approval_tx: mpsc::Sender<crate::events::Approval>,
+    pub approval_rx: Option<mpsc::Receiver<crate::events::Approval>>,
+    pub composer_tx: mpsc::Sender<String>,
+    pub composer_rx: Option<mpsc::Receiver<String>>,
+    /// Channel for command palette actions
+    pub palette_tx: mpsc::Sender<CommandAction>,
+    pub palette_rx: mpsc::Receiver<CommandAction>,
+    pub terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    pub last_tick: Instant,
+    pub running: bool,
+    pub suspended: bool,
+    pub width: u16,
+    pub height: u16,
+    /// Whether we're waiting for a turn to complete
+    pub turn_in_progress: bool,
+    /// Pending turn result from the harness
+    pub pending_decision: Option<crate::harness::react::LoopDecision>,
 }
 
 impl TerminalApp {
@@ -80,6 +93,8 @@ impl TerminalApp {
         // Create event channel (shared with harness)
         let (event_tx, event_rx) = event_channel();
         let (approval_tx, approval_rx) = mpsc::channel(16);
+        let (composer_tx, composer_rx) = mpsc::channel(16);
+        let (palette_tx, palette_rx) = mpsc::channel(16);
 
         // Create layout
         let area = ratatui::layout::Rect::new(0, 0, width, height);
@@ -93,12 +108,20 @@ impl TerminalApp {
         let log_tail = LogTailPanel::new(theme.clone());
         let approval_modal = ApprovalModal::new(theme.clone());
         let command_palette = CommandPalette::new(theme.clone());
+        let input_composer = InputComposer::new(theme.clone());
+        let welcome_screen =
+            WelcomeScreen::new(theme.clone(), env!("CARGO_PKG_VERSION").to_string());
 
         // Set up command palette callback
         let mut command_palette = command_palette;
-        command_palette.on_execute(move |_action| {
-            // Commands are handled in the main loop
+        let palette_tx_clone = palette_tx.clone();
+        command_palette.on_execute(move |action| {
+            let _ = palette_tx_clone.try_send(action);
         });
+
+        // Set up input composer callback
+        let mut input_composer = input_composer;
+        input_composer.on_submit(composer_tx.clone());
 
         Ok(Self {
             theme_manager,
@@ -110,16 +133,24 @@ impl TerminalApp {
             log_tail,
             approval_modal,
             command_palette,
+            input_composer,
+            welcome_screen,
             event_rx,
             event_tx,
             approval_tx,
             approval_rx: Some(approval_rx),
+            composer_tx,
+            composer_rx: Some(composer_rx),
+            palette_tx,
+            palette_rx,
             terminal,
             last_tick: Instant::now(),
             running: true,
             suspended: false,
             width,
             height,
+            turn_in_progress: false,
+            pending_decision: None,
         })
     }
 
@@ -138,7 +169,155 @@ impl TerminalApp {
         self.approval_rx.take()
     }
 
-    /// Run the TUI event loop.
+    /// Get the composer receiver for receiving user prompts.
+    pub fn take_composer_receiver(&mut self) -> Option<mpsc::Receiver<String>> {
+        self.composer_rx.take()
+    }
+
+    /// Check if a turn is in progress.
+    pub fn is_turn_in_progress(&self) -> bool {
+        self.turn_in_progress
+    }
+
+    /// Set the turn in progress state.
+    pub fn set_turn_in_progress(&mut self, in_progress: bool) {
+        self.turn_in_progress = in_progress;
+        self.input_composer.set_disabled(in_progress);
+        if in_progress {
+            self.status_bar.set_mode("running");
+        } else {
+            self.status_bar.set_mode("interactive");
+        }
+    }
+
+    /// Set the pending turn decision.
+    pub fn set_pending_decision(&mut self, decision: crate::harness::react::LoopDecision) {
+        self.pending_decision = Some(decision);
+    }
+
+    /// Take the pending turn decision.
+    pub fn take_pending_decision(&mut self) -> Option<crate::harness::react::LoopDecision> {
+        self.pending_decision.take()
+    }
+
+    /// Get a reference to the pending turn decision.
+    pub fn pending_decision(&self) -> Option<&crate::harness::react::LoopDecision> {
+        self.pending_decision.as_ref()
+    }
+
+    /// Set provider/model configuration status for welcome screen.
+    pub fn set_config_status(&mut self, provider_configured: bool, model_name: Option<String>) {
+        self.welcome_screen
+            .set_config_status(provider_configured, model_name);
+    }
+
+    /// Check if welcome screen is visible.
+    pub fn welcome_screen_visible(&self) -> bool {
+        self.welcome_screen.is_visible()
+    }
+
+    /// Get a reference to the welcome screen for rendering.
+    pub fn welcome_screen(&self) -> &WelcomeScreen {
+        &self.welcome_screen
+    }
+
+    /// Get the current theme.
+    pub fn current_theme(&self) -> Arc<Theme> {
+        self.theme_manager.current()
+    }
+
+    /// Handle events from the ReAct loop (public version for external loop).
+    pub async fn handle_events_from_loop<M: crate::model::Model>(
+        &mut self,
+        _loop_: &mut crate::harness::react::ReactLoop<M>,
+    ) {
+        // Process events from the loop's event channel
+        while let Ok(event) = self.event_rx.try_recv() {
+            // Update components
+            self.conversation.handle_event(&event);
+            self.tool_panel.handle_event(&event);
+            self.todo_panel.handle_event(&event);
+            self.log_tail.handle_event(&event);
+            self.input_composer.handle_event(&event);
+
+            // Update status bar
+            if let Event::Status(status) = &event {
+                self.status_bar.update(status.clone());
+            }
+
+            // Show approval modal
+            if let Event::ApprovalRequest(req) = &event {
+                self.approval_modal.show(req.clone());
+            }
+
+            // Handle typing indicator for streaming
+            if let Event::Token(_) = &event {
+                self.conversation.set_typing_indicator(false);
+            }
+        }
+
+        // Also check for command palette actions
+        if let Ok(action) = self.palette_rx.try_recv() {
+            self.handle_command_action(action).await;
+        }
+    }
+
+    /// Called when a turn completes.
+    pub async fn on_turn_complete(&mut self) {
+        if let Some(decision) = self.take_pending_decision() {
+            self.set_turn_in_progress(false);
+
+            match decision {
+                crate::harness::react::LoopDecision::Continue => {
+                    // Turn completed, ready for next input
+                }
+                crate::harness::react::LoopDecision::Complete(result) => {
+                    // Task completed - could show a completion message
+                    self.emit_log(
+                        crate::events::LogLevel::Info,
+                        format!("Task complete: {}", result),
+                    )
+                    .await;
+                }
+                crate::harness::react::LoopDecision::Stop(reason) => {
+                    // Loop stopped
+                    self.emit_log(
+                        crate::events::LogLevel::Warn,
+                        format!("Loop stopped: {}", reason),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Emit a log event.
+    pub async fn emit_log(&self, level: crate::events::LogLevel, message: String) {
+        let event = crate::events::Event::Log(crate::events::Log { level, message });
+        let _ = self.event_tx.send(event);
+    }
+
+    /// Tick animations.
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_tick) >= Duration::from_millis(50) {
+            self.conversation.tick();
+            self.tool_panel.tick();
+            self.input_composer.tick();
+            self.last_tick = now;
+        }
+    }
+
+    /// Cleanup terminal state.
+    pub fn cleanup(&mut self) -> Result<()> {
+        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
+        crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+        crossterm::terminal::disable_raw_mode()?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
+
+    /// Run the TUI event loop (single-turn architecture).
     pub async fn run(&mut self) -> Result<()> {
         while self.running {
             // Handle crossterm events
@@ -152,8 +331,25 @@ impl TerminalApp {
                 }
             }
 
+            // Check for composer input (user submitted a prompt)
+            if let Some(ref mut rx) = self.composer_rx
+                && let Ok(prompt) = rx.try_recv()
+            {
+                self.handle_user_prompt(prompt).await;
+            }
+
+            // Check for command palette actions
+            if let Ok(action) = self.palette_rx.try_recv() {
+                self.handle_command_action(action).await;
+            }
+
             // Handle events from the harness
             self.handle_events().await;
+
+            // Check for completed turn
+            if self.turn_in_progress && self.pending_decision.is_some() {
+                self.on_turn_complete().await;
+            }
 
             // Tick animations
             self.tick();
@@ -171,6 +367,8 @@ impl TerminalApp {
                     &mut self.log_tail,
                     &self.approval_modal,
                     &self.command_palette,
+                    &mut self.input_composer,
+                    &self.welcome_screen,
                     &theme,
                 )
             })?;
@@ -184,12 +382,46 @@ impl TerminalApp {
         Ok(())
     }
 
+    /// Handle a user prompt from the input composer.
+    async fn handle_user_prompt(&mut self, prompt: String) {
+        // Hide welcome screen on first user input
+        if self.welcome_screen.is_visible() {
+            self.welcome_screen.hide();
+        }
+
+        // Emit user message event
+        let user_msg = crate::events::Message {
+            role: crate::events::MessageRole::User,
+            content: prompt.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+            ts: current_timestamp(),
+        };
+        let _ = self.event_tx.send(crate::events::Event::Message(user_msg));
+
+        // Mark turn as in progress
+        self.set_turn_in_progress(true);
+    }
+
     /// Handle a key event.
-    async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+    pub async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        // Handle welcome screen first (any key dismisses it)
+        if self.welcome_screen.is_visible() {
+            self.welcome_screen.handle_key(key);
+            return Ok(true);
+        }
+
         // Global shortcuts
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                self.running = false;
+                if self.turn_in_progress {
+                    // Ctrl+C during turn: cancel the turn
+                    self.input_composer.set_error("Cancelled".to_string());
+                    // The harness will handle the interrupt via shutdown signal
+                } else {
+                    // Ctrl+C at idle: exit
+                    self.running = false;
+                }
                 return Ok(true);
             }
             (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
@@ -198,6 +430,13 @@ impl TerminalApp {
             }
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
                 self.toggle_theme();
+                return Ok(true);
+            }
+            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                // Ctrl+D: exit
+                if !self.turn_in_progress && self.input_composer.get_input().is_empty() {
+                    self.running = false;
+                }
                 return Ok(true);
             }
             _ => {}
@@ -229,8 +468,12 @@ impl TerminalApp {
             return Ok(true);
         }
 
-        // Handle other keys based on focus
-        // For now, conversation pane gets scroll keys
+        // Let input composer handle keys if not in a turn
+        if !self.turn_in_progress && self.input_composer.handle_key(key) {
+            return Ok(true);
+        }
+
+        // Handle other keys based on focus (conversation scroll, etc.)
         match key.code {
             KeyCode::Up => {
                 self.conversation.scroll_up();
@@ -266,6 +509,9 @@ impl TerminalApp {
             }
             KeyCode::Enter => {
                 // Expand/collapse tool call/result at selection
+                if let Some(_msg_idx) = self.conversation.selected() {
+                    // Could expand tool calls here
+                }
             }
             _ => {}
         }
@@ -273,8 +519,71 @@ impl TerminalApp {
         Ok(true)
     }
 
+    /// Handle a command palette action.
+    async fn handle_command_action(&mut self, action: CommandAction) {
+        match action {
+            CommandAction::Help => {
+                self.emit_log(
+                    crate::events::LogLevel::Info,
+                    "Help: Commands: /help, /undo, /redo, /todos, /logs, /approve, /deny"
+                        .to_string(),
+                )
+                .await;
+            }
+            CommandAction::Undo => {
+                // Emit undo event for harness to handle
+                let _ = self
+                    .event_tx
+                    .send(crate::events::Event::Log(crate::events::Log {
+                        level: crate::events::LogLevel::Info,
+                        message: "Undo requested".to_string(),
+                    }));
+                // The harness would need to handle this via snapshot store
+            }
+            CommandAction::Redo => {
+                let _ = self
+                    .event_tx
+                    .send(crate::events::Event::Log(crate::events::Log {
+                        level: crate::events::LogLevel::Info,
+                        message: "Redo requested".to_string(),
+                    }));
+            }
+            CommandAction::Approve => {
+                // Approve pending approval (if any)
+                if let Some(req) = self.approval_modal.request() {
+                    let _ = self
+                        .approval_tx
+                        .send(crate::events::Approval {
+                            id: req.id.clone(),
+                            decision: crate::events::ApprovalDecision::Allow,
+                        })
+                        .await;
+                }
+            }
+            CommandAction::Deny => {
+                // Deny pending approval (if any)
+                if let Some(req) = self.approval_modal.request() {
+                    let _ = self
+                        .approval_tx
+                        .send(crate::events::Approval {
+                            id: req.id.clone(),
+                            decision: crate::events::ApprovalDecision::Deny,
+                        })
+                        .await;
+                }
+            }
+            CommandAction::Todos => {
+                self.todo_panel.toggle_expanded();
+            }
+            CommandAction::Logs => {
+                self.log_tail.cycle_filter();
+            }
+            CommandAction::Custom(_) => {}
+        }
+    }
+
     /// Handle terminal resize.
-    fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
+    pub fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
         self.width = width;
         self.height = height;
 
@@ -286,6 +595,7 @@ impl TerminalApp {
         self.conversation
             .set_max_width(self.layout.conversation.width);
         self.status_bar.set_width(width);
+        self.input_composer.set_max_width(width);
 
         // Resize terminal
         self.terminal.resize(area)?;
@@ -303,6 +613,8 @@ impl TerminalApp {
             self.log_tail.set_theme(theme.clone());
             self.approval_modal.set_theme(theme.clone());
             self.command_palette.set_theme(theme.clone());
+            self.input_composer.set_theme(theme.clone());
+            self.welcome_screen.set_theme(theme.clone());
             self.layout = LayoutRects::new(
                 ratatui::layout::Rect::new(0, 0, self.width, self.height),
                 &theme,
@@ -318,6 +630,7 @@ impl TerminalApp {
             self.tool_panel.handle_event(&event);
             self.todo_panel.handle_event(&event);
             self.log_tail.handle_event(&event);
+            self.input_composer.handle_event(&event);
 
             // Update status bar
             if let Event::Status(status) = &event {
@@ -329,43 +642,16 @@ impl TerminalApp {
                 self.approval_modal.show(req.clone());
             }
 
-            // Handle command execution from palette
-            if let Event::Message(msg) = &event
-                && msg.content.starts_with('/')
-            {
-                // Parse slash command
-                let parts: Vec<&str> = msg.content[1..].split_whitespace().collect();
-                if let Some(cmd) = parts.first() {
-                    match *cmd {
-                        "help" => { /* show help */ }
-                        "undo" => { /* emit undo event */ }
-                        "redo" => { /* emit redo event */ }
-                        "approve" => { /* approve pending */ }
-                        "deny" => { /* deny pending */ }
-                        "todos" => {
-                            self.todo_panel.toggle_expanded();
-                        }
-                        "logs" => { /* toggle logs */ }
-                        _ => {}
-                    }
-                }
+            // Handle typing indicator for streaming
+            if let Event::Token(_) = &event {
+                self.conversation.set_typing_indicator(false);
             }
         }
     }
 
-    /// Tick animations.
-    fn tick(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.last_tick) >= Duration::from_millis(50) {
-            self.conversation.tick();
-            self.tool_panel.tick();
-            self.last_tick = now;
-        }
-    }
-
-    /// Render the UI.
+    /// Render the UI (public for external loop integration).
     #[allow(clippy::too_many_arguments)]
-    fn render_ui(
+    pub fn render_ui(
         frame: &mut ratatui::Frame,
         layout: &LayoutRects,
         conversation: &mut ConversationPane,
@@ -375,14 +661,22 @@ impl TerminalApp {
         log_tail: &mut LogTailPanel,
         approval_modal: &ApprovalModal,
         command_palette: &CommandPalette,
+        input_composer: &mut InputComposer,
+        welcome_screen: &WelcomeScreen,
         theme: &Theme,
     ) {
         let area = frame.area();
 
+        // If welcome screen is visible, render only that
+        if welcome_screen.is_visible() {
+            welcome_screen.render(area, frame.buffer_mut());
+            return;
+        }
+
         // Render main layout regions
         if layout.has_right_rail() {
-            // Comfortable layout: conversation | right rail | status bar
-            Self::render_comfortable_static(
+            // Comfortable layout: header | conversation | right rail | input composer | status bar
+            Self::render_comfortable(
                 frame,
                 layout,
                 conversation,
@@ -390,11 +684,12 @@ impl TerminalApp {
                 todo_panel,
                 log_tail,
                 status_bar,
+                input_composer,
                 theme,
             );
         } else {
             // Minimum/narrow/short layout: stacked
-            Self::render_stacked_static(
+            Self::render_stacked(
                 frame,
                 layout,
                 conversation,
@@ -402,6 +697,7 @@ impl TerminalApp {
                 todo_panel,
                 log_tail,
                 status_bar,
+                input_composer,
                 theme,
             );
         }
@@ -417,9 +713,9 @@ impl TerminalApp {
         }
     }
 
-    /// Render comfortable layout (3 regions) - static version.
+    /// Render comfortable layout (3+ regions) with input composer.
     #[allow(clippy::too_many_arguments)]
-    fn render_comfortable_static(
+    fn render_comfortable(
         frame: &mut ratatui::Frame,
         layout: &LayoutRects,
         conversation: &mut ConversationPane,
@@ -427,28 +723,37 @@ impl TerminalApp {
         todo_panel: &mut TodoPanel,
         log_tail: &mut LogTailPanel,
         status_bar: &mut StatusBar,
+        input_composer: &mut InputComposer,
         theme: &Theme,
     ) {
         // Header
-        Self::render_header_static(frame, layout.header, theme);
+        Self::render_header(frame, layout.header, theme);
 
         // Conversation (left)
         conversation.render(layout.conversation, frame.buffer_mut());
 
         // Right rail (tool panel + todo + log tail)
         if let Some(right_rail) = layout.right_rail {
-            Self::render_right_rail_static(
-                frame, right_rail, tool_panel, todo_panel, log_tail, theme,
-            );
+            Self::render_right_rail(frame, right_rail, tool_panel, todo_panel, log_tail, theme);
         }
+
+        // Input composer (above status bar)
+        let composer_height = input_composer.required_height();
+        let composer_area = ratatui::layout::Rect {
+            x: layout.status_bar.x,
+            y: layout.status_bar.y.saturating_sub(composer_height),
+            width: layout.status_bar.width,
+            height: composer_height,
+        };
+        input_composer.render(composer_area, frame.buffer_mut());
 
         // Status bar (bottom)
         status_bar.render(layout.status_bar, frame.buffer_mut());
     }
 
-    /// Render stacked layout (minimum/narrow/short) - static version.
+    /// Render stacked layout (minimum/narrow/short) with input composer.
     #[allow(clippy::too_many_arguments)]
-    fn render_stacked_static(
+    fn render_stacked(
         frame: &mut ratatui::Frame,
         layout: &LayoutRects,
         conversation: &mut ConversationPane,
@@ -456,34 +761,63 @@ impl TerminalApp {
         todo_panel: &mut TodoPanel,
         log_tail: &mut LogTailPanel,
         status_bar: &mut StatusBar,
+        input_composer: &mut InputComposer,
         theme: &Theme,
     ) {
         // Header
-        Self::render_header_static(frame, layout.header, theme);
+        Self::render_header(frame, layout.header, theme);
 
-        // Conversation (main area)
-        conversation.render(layout.conversation, frame.buffer_mut());
+        // Calculate composer area (above status bar)
+        let composer_height = input_composer.required_height();
+        let composer_area = ratatui::layout::Rect {
+            x: layout.status_bar.x,
+            y: layout.status_bar.y.saturating_sub(composer_height),
+            width: layout.status_bar.width,
+            height: composer_height,
+        };
+
+        // Conversation area (header to composer)
+        let conversation_area = ratatui::layout::Rect {
+            x: layout.conversation.x,
+            y: layout.conversation.y,
+            width: layout.conversation.width,
+            height: layout.conversation.height.saturating_sub(composer_height),
+        };
+        conversation.render(conversation_area, frame.buffer_mut());
 
         // Folded right rail content at bottom of conversation
         if layout.mode != crate::ui::layout::LayoutMode::Minimum {
             let rail_area = layout.right_rail_area();
             if rail_area.height > 2 {
-                Self::render_right_rail_static(
-                    frame, rail_area, tool_panel, todo_panel, log_tail, theme,
+                let rail_height = rail_area
+                    .height
+                    .min(conversation_area.height.saturating_sub(5));
+                let rail_area_adjusted = ratatui::layout::Rect {
+                    x: rail_area.x,
+                    y: conversation_area.y + conversation_area.height.saturating_sub(rail_height),
+                    width: rail_area.width,
+                    height: rail_height,
+                };
+                Self::render_right_rail(
+                    frame,
+                    rail_area_adjusted,
+                    tool_panel,
+                    todo_panel,
+                    log_tail,
+                    theme,
                 );
             }
         }
+
+        // Input composer
+        input_composer.render(composer_area, frame.buffer_mut());
 
         // Status bar (bottom)
         status_bar.render(layout.status_bar, frame.buffer_mut());
     }
 
-    /// Render header region - static version.
-    fn render_header_static(
-        frame: &mut ratatui::Frame,
-        area: ratatui::layout::Rect,
-        theme: &Theme,
-    ) {
+    /// Render header region.
+    fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme) {
         let line = ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(
                 " okeanos ",
@@ -505,8 +839,8 @@ impl TerminalApp {
         ratatui::widgets::Widget::render(paragraph, area, frame.buffer_mut());
     }
 
-    /// Render right rail - static version.
-    fn render_right_rail_static(
+    /// Render right rail.
+    fn render_right_rail(
         frame: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
         tool_panel: &mut ToolPanel,
@@ -546,21 +880,20 @@ impl TerminalApp {
         self.suspended = false;
         Ok(())
     }
-
-    /// Cleanup terminal state.
-    fn cleanup(&mut self) -> Result<()> {
-        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
-        crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
-        crossterm::terminal::disable_raw_mode()?;
-        self.terminal.show_cursor()?;
-        Ok(())
-    }
 }
 
 impl Drop for TerminalApp {
     fn drop(&mut self) {
         let _ = self.cleanup();
     }
+}
+
+/// Get current Unix timestamp in milliseconds.
+pub fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]

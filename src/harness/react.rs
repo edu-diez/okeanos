@@ -161,6 +161,11 @@ impl<M: Model> ReactLoop<M> {
         }
     }
 
+    /// Get the event sender for emitting events.
+    pub fn event_tx(&self) -> EventSender {
+        self.event_tx.clone()
+    }
+
     /// Set the session manager for logging events to a session log.
     pub fn with_session(mut self, session: SessionManager) -> Self {
         self.session = Some(session);
@@ -311,6 +316,77 @@ impl<M: Model> ReactLoop<M> {
                 }
             }
         }
+    }
+
+    /// Run exactly one ReAct turn with the given prompt.
+    ///
+    /// This is the single-turn entry point used by the TUI in interactive mode.
+    /// The TUI owns the input loop and calls this method once per user prompt.
+    /// Returns the LoopDecision so the caller can decide whether to continue.
+    ///
+    /// Unlike `run()`, this method does NOT:
+    /// - Set up signal handlers
+    /// - Loop until completion
+    /// - Take session start/end snapshots automatically
+    ///
+    /// The caller is responsible for checking iteration/time limits and context caps.
+    pub async fn run_turn(&mut self, prompt: String) -> Result<LoopDecision, ReactError> {
+        // Add user message to conversation
+        self.conversation
+            .add_user_message(prompt)
+            .context("failed to add user prompt")?;
+
+        // Emit status update
+        self.emit_status().await;
+
+        // Check limits before iterating
+        if self.iteration >= self.config.max_iterations {
+            return Err(ReactError::MaxIterations {
+                max_iter: self.config.max_iterations,
+            });
+        }
+        if self.start_time.elapsed() >= Duration::from_secs(self.config.max_elapsed_sec) {
+            return Err(ReactError::MaxElapsed {
+                max_elapsed_sec: self.config.max_elapsed_sec,
+            });
+        }
+
+        // Check context cap warning
+        if self.conversation.warning_level() == crate::context::cap::ContextWarning::Warning {
+            self.emit_log(
+                crate::events::LogLevel::Warn,
+                format!(
+                    "Context usage at {}% ({}/{} tokens)",
+                    (self.conversation.estimated_tokens() as f64
+                        / self.conversation.cap().max_tokens as f64
+                        * 100.0) as u32,
+                    self.conversation.estimated_tokens(),
+                    self.conversation.cap().max_tokens
+                ),
+            )
+            .await;
+        }
+
+        // Create a shutdown receiver for this turn
+        let (_shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
+
+        // Run exactly one iteration
+        let decision = self.iterate(&mut shutdown_rx).await?;
+
+        match &decision {
+            LoopDecision::Continue => {
+                self.iteration += 1;
+                // Take snapshot at loop boundary
+                self.take_boundary_snapshot().await?;
+            }
+            LoopDecision::Complete(_) => {
+                // Take final snapshot
+                self.take_snapshot("Session complete").await?;
+            }
+            LoopDecision::Stop(_) => {}
+        }
+
+        Ok(decision)
     }
 
     /// Run a single ReAct iteration: think → tool → observe.

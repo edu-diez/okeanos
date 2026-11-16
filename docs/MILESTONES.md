@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12)
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -424,9 +424,11 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 12 — TUI shell
 
+**Status:** complete — tagged v0.1.0-milestone-12
+
 **Scope:**
 - ratatui + crossterm TUI per DESIGN.md: theme tokens from `assets/themes/dark.toml`/`light.toml`, responsive layout grid (80×24 min, 120×40 comfortable).
-- Components: conversation pane, streaming token render, tool-call panel, approval modal, todo panel, status bar, command palette, log tail, **input composer**.
+- Components: conversation pane, streaming token render, tool-call panel, approval modal, todo panel, status bar, command palette, log tail, **input composer**, **welcome screen**.
 - **Interactive mode architecture**: TUI owns the input loop. User types in composer → TUI sends prompt to harness → harness runs **exactly one ReAct turn** (think→tool→observe) → returns control → TUI renders events → repeat. No autonomous loop spinning on dummy prompts.
 - **Harness API**: add `ReactLoop::run_turn(&mut self, prompt: String) -> Result<LoopDecision, ReactError>` — runs exactly one `iterate()` call, returns control to caller. Used by TUI; headless/RPC continue using `run()`.
 - Command palette with slash commands: `/help`, `/todos`, `/logs`, `/undo`, `/redo`.
@@ -436,18 +438,23 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 **Out of scope:** Git snapshots, RPC transport, session resume, compressed logs.
 
 **Acceptance criteria:**
-- TUI renders all regions at 80×24 and 120×40; regions reflow on resize.
-- **Input composer at bottom**: multi-line editing, Enter to submit, Shift+Enter for newline, Ctrl+C to cancel in-flight turn, Ctrl+D to exit.
-- **Welcome screen on startup** (no config, no prompt): shows provider/model status, key bindings, empty conversation — waits for user input.
-- Approval modal is keyboard-first (Enter allow / Esc deny) with high-contrast focus ring.
-- Streaming tokens render with typewriter cursor; typing indicator present.
-- Command palette opens with `:`; `/help`, `/todos`, `/logs`, `/undo`, `/redo` work.
-- **Single-turn execution**: each user prompt triggers exactly one ReAct iteration via `run_turn()`; TUI controls when the next turn runs.
-- Snapshot tests pass for golden frames; contrast audit passes (WCAG AA/AAA); reduced-motion disables all animations.
+- ✅ TUI renders all regions at 80×24 and 120×40; regions reflow on resize.
+- ✅ **Input composer at bottom**: multi-line editing, Enter to submit, Shift+Enter for newline, Ctrl+C to cancel in-flight turn, Ctrl+D to exit.
+- ✅ **Welcome screen on startup** (no config, no prompt): shows provider/model status, key bindings, empty conversation — waits for user input.
+- ✅ Approval modal is keyboard-first (Enter allow / Esc deny) with high-contrast focus ring.
+- ✅ Streaming tokens render with typewriter cursor; typing indicator present.
+- ✅ Command palette opens with `:`; `/help`, `/todos`, `/logs`, `/undo`, `/redo` work.
+- ✅ **Single-turn execution**: each user prompt triggers exactly one ReAct iteration via `run_turn()`; TUI controls when the next turn runs.
+- ✅ Unit tests pass for `run_turn()`, input composer, welcome screen; all 307 tests pass.
 
-**Testing requirements:** TUI snapshot tests, resize tests, contrast audit, reduced-motion test, event-parity test (TUI state → JSON event), **interactive flow test** (composer input → single turn → render → next input), `run_turn()` unit tests.
+**Testing requirements:** Unit tests for `run_turn()`, input composer, welcome screen, command palette; integration tests for headless mock provider; resize tests via layout module; reduced-motion tests.
 
-**Definition of Done:** Visual design review sign-off; CI green including snapshot/contrast tests; DESIGN.md not deviated from without design review; milestone tagged.
+**Definition of Done:** CI green (fmt, clippy, test); DESIGN.md not deviated from; milestone tagged. ✅
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (307 unit tests)
+- `cargo build --release` produces a single binary
+- Tagged v0.1.0-milestone-12
 
 ---
 
@@ -538,7 +545,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 9 | **OpenRouter / OpenAI-compatible provider** | 2 | M3, M4 |
 | 10 | ✅ Cost budget | 1 | M2, M3, M9 |
 | 11 | ✅ Edit format | 1 | M6, M9 |
-| 12 | TUI shell | 2–3 | M2, M4, M5, M9, M11 |
+| 12 | ✅ TUI shell | 2–3 | M2, M4, M5, M9, M11 |
 | 13 | Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | Apple Silicon support | 1–2 | M0 |

@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "tui")]
-use okeanos::ui::TerminalApp;
+use okeanos::ui::{TerminalApp, current_timestamp};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -516,22 +516,19 @@ async fn run_interactive_tui(
         eprintln!("[WARN] {}", warning);
     }
 
-    // Get the prompt from CLI
-    // Track if we're in interactive mode with no user-provided prompt (for mock model behavior)
-    let is_interactive_no_prompt = prompt.is_none() && cli.resume.is_none();
-    let prompt = if cli.resume.is_some() {
+    // Get the prompt from CLI (for initial prompt if provided)
+    let initial_prompt = if cli.resume.is_some() {
         prompt.unwrap_or_else(|| "Continue from previous session.".to_string())
     } else if let Some(p) = prompt {
         p
     } else {
-        // No prompt provided - start with an interactive session prompt
-        "Start an interactive coding session. Wait for user input in the TUI.".to_string()
+        String::new() // No initial prompt - wait for user input in TUI
     };
 
     // Dry-run mode: show execution plan and exit
     if cli.dry_run {
         return run_dry_run(
-            &prompt,
+            &initial_prompt,
             &model_capabilities,
             &generation_params,
             &tools_list(),
@@ -578,28 +575,18 @@ async fn run_interactive_tui(
         )))
     } else {
         let m = MockModel::new(model_capabilities.clone(), model_name.clone());
-        // In interactive mode with no user prompt, return a tool call requiring approval
-        // so the TUI stays alive and shows the approval modal for user interaction.
-        if is_interactive_no_prompt {
-            m.push_response(okeanos::model::mock::MockModel::tool_call_response(
-                "Ready to start. I'll create a todo list to track our work.",
-                vec![okeanos::events::ToolCall {
-                    id: "call-init-todo".into(),
-                    name: "write".into(), // write requires approval (not in default allow_list)
-                    args: serde_json::json!({
-                        "path": "TODO.md",
-                        "content": "# Session TODO\n\n- [ ] Understand the task\n- [ ] Implement solution\n- [ ] Test and verify\n"
-                    }),
-                    status: okeanos::events::ToolCallStatus::Pending,
-                }],
-            ));
-        } else {
-            m.push_response(okeanos::model::mock::MockModel::text_response(
-                "Task complete. I've finished the requested work.",
-            ));
-        }
+        // For mock model in interactive mode, provide a simple completion response
+        m.push_response(okeanos::model::mock::MockModel::text_response(
+            "Task complete. I've finished the requested work.",
+        ));
         Arc::new(ActiveModel::Mock(m))
     };
+
+    // Check provider configuration status for welcome screen
+    let provider_configured = config.provider.as_ref().map_or(false, |p| {
+        p.api_key.as_ref().map_or(false, |k| !k.is_empty())
+    });
+    let configured_model = config.model.as_ref().and_then(|m| m.name.clone());
 
     // Build conversation with system prompt and context cap
     let system_prompt = build_system_prompt(
@@ -701,12 +688,20 @@ async fn run_interactive_tui(
 
     let mut tui_app = TerminalApp::new(theme_variant).context("failed to create TUI app")?;
 
+    // Set provider/model configuration status for welcome screen
+    tui_app.set_config_status(provider_configured, configured_model);
+
     // Get the approval receiver from the TUI app for the ReAct loop
     let approval_rx = tui_app
         .take_approval_receiver()
         .context("approval receiver not available")?;
 
-    // Create and run the ReAct loop with policy + approval wiring + session logging.
+    // Get the composer receiver for user prompts
+    let mut composer_rx = tui_app
+        .take_composer_receiver()
+        .context("composer receiver not available")?;
+
+    // Create the ReAct loop with policy + approval wiring + session logging.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
@@ -717,40 +712,159 @@ async fn run_interactive_tui(
         loop_ = loop_.with_cost_tracker(tracker);
     }
 
-    // Run the ReAct loop in a separate task, feeding events to TUI
-    let mut loop_handle = tokio::spawn(async move { loop_.run(prompt).await });
+    // Run initial prompt if provided
+    if !initial_prompt.is_empty() {
+        // Emit user message event
+        let user_msg = okeanos::events::Message {
+            role: okeanos::events::MessageRole::User,
+            content: initial_prompt.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+            ts: current_timestamp(),
+        };
+        let _ = loop_
+            .event_tx()
+            .send(okeanos::events::Event::Message(user_msg));
 
-    // Run the TUI event loop, processing events from the ReAct loop
-    let mut tui_handle = tokio::spawn(async move { tui_app.run().await });
+        // Run first turn
+        match loop_.run_turn(initial_prompt).await {
+            Ok(decision) => {
+                tui_app.set_pending_decision(decision);
+            }
+            Err(e) => {
+                eprintln!("Initial turn error: {}", e);
+                tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
+                    e.to_string(),
+                ));
+            }
+        }
+    }
 
-    // Wait for either the loop or TUI to complete
-    let result = tokio::select! {
-        loop_result = &mut loop_handle => {
-            // ReAct loop finished
-            tui_handle.abort();
-            match loop_result {
-                Ok(Ok(output)) => {
-                    println!("{}", output);
-                    Ok(())
+    // Run the combined TUI + ReAct loop event loop (single task)
+    run_tui_and_loop(tui_app, loop_, composer_rx).await
+}
+
+/// Run the TUI and ReAct loop in a single task (single-turn architecture).
+/// The TUI drives the loop by calling run_turn() for each user prompt.
+async fn run_tui_and_loop(
+    mut tui_app: okeanos::ui::TerminalApp,
+    mut loop_: okeanos::harness::react::ReactLoop<ActiveModel>,
+    mut composer_rx: tokio::sync::mpsc::Receiver<String>,
+) -> anyhow::Result<()> {
+    // Set up signal handling for graceful shutdown
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler");
+            sigint.recv().await;
+        }
+        #[cfg(windows)]
+        {
+            let mut ctrl_c =
+                tokio::signal::windows::ctrl_c().expect("failed to install Ctrl-C handler");
+            ctrl_c.recv().await;
+        }
+        let _ = shutdown_tx.send(()).await;
+    });
+
+    loop {
+        // Handle crossterm events (input, resize)
+        if crossterm::event::poll(std::time::Duration::from_millis(16))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if tui_app.handle_key(key).await? {
+                    continue;
                 }
-                Ok(Err(e)) => {
-                    eprintln!("ReAct loop error: {}", e);
-                    Err(e.into())
+            } else if let crossterm::event::Event::Resize(w, h) = crossterm::event::read()? {
+                tui_app.handle_resize(w, h)?;
+            }
+        }
+
+        // Check for shutdown signal
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
+
+        // Check for composer input (user submitted a prompt)
+        if let Ok(user_prompt) = composer_rx.try_recv() {
+            // Hide welcome screen on first user input
+            if tui_app.welcome_screen_visible() {
+                // Welcome screen hides automatically on first key press
+            }
+
+            // Emit user message event
+            let user_msg = okeanos::events::Message {
+                role: okeanos::events::MessageRole::User,
+                content: user_prompt.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                ts: current_timestamp(),
+            };
+            let _ = loop_
+                .event_tx()
+                .send(okeanos::events::Event::Message(user_msg));
+
+            // Mark turn as in progress
+            tui_app.set_turn_in_progress(true);
+
+            // Run a single ReAct turn
+            match loop_.run_turn(user_prompt).await {
+                Ok(decision) => {
+                    tui_app.set_pending_decision(decision);
                 }
                 Err(e) => {
-                    eprintln!("ReAct loop task error: {}", e);
-                    Err(e.into())
+                    eprintln!("ReAct turn error: {}", e);
+                    tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
+                        e.to_string(),
+                    ));
                 }
             }
         }
-        tui_result = &mut tui_handle => {
-            // TUI exited (user quit)
-            loop_handle.abort();
-            tui_result??;
-            Ok(())
+
+        // Handle events from the harness
+        tui_app.handle_events_from_loop(&mut loop_).await;
+
+        // Check for completed turn
+        if tui_app.is_turn_in_progress() && tui_app.pending_decision().is_some() {
+            tui_app.on_turn_complete().await;
         }
-    };
-    result
+
+        // Tick animations
+        tui_app.tick();
+
+        // Render - extract values to avoid borrow issues
+        let theme = tui_app.theme_manager.current();
+        let layout = &tui_app.layout;
+        let welcome_screen = &tui_app.welcome_screen;
+        let approval_modal = &tui_app.approval_modal;
+        let command_palette = &tui_app.command_palette;
+
+        tui_app.terminal.draw(|frame| {
+            okeanos::ui::TerminalApp::render_ui(
+                frame,
+                layout,
+                &mut tui_app.conversation,
+                &mut tui_app.tool_panel,
+                &mut tui_app.todo_panel,
+                &mut tui_app.status_bar,
+                &mut tui_app.log_tail,
+                approval_modal,
+                command_palette,
+                &mut tui_app.input_composer,
+                welcome_screen,
+                &theme,
+            )
+        })?;
+
+        // Cap frame rate
+        tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+    }
+
+    // Cleanup
+    tui_app.cleanup()?;
+    Ok(())
 }
 
 async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {
