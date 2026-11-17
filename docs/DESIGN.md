@@ -84,10 +84,12 @@ Grid unit: 1 terminal character cell. Regions stack vertically by default; colum
 
 | Size | Mode | Layout |
 |------|------|--------|
-| 80×24 | minimum | Single column: header (1 row), conversation (rest − 4), **input composer (1–2 rows)**, status bar (2 rows). Right-rail content folds into the conversation bottom as collapsible sections. |
+| 80×24 | minimum | Single column: header (1 row), conversation (rest − 5), **input composer (2–3 rows, always visible)**, status bar (2 rows). Right-rail content folds into conversation bottom as collapsible sections. Welcome screen overlays as a centered modal; composer remains visible and focused beneath it. |
 | 120×40 | comfortable | 3 regions: conversation left (~60%), right rail (~40%: tool panel + todos + log tail), **input composer (1–3 rows)**, status bar bottom (2 rows). |
 | < 100 cols | narrow | Right rail collapses; tool results and todos show as inline sections below the conversation. |
 | < 40 rows | short | Status bar compresses to 1 row; todo panel hidden by default; input composer min 1 row; conversation shrinks. |
+
+**Input composer visibility**: The input composer is **always rendered** in the main layout (above status bar). The welcome screen renders as a centered modal overlay that does **not** replace the main layout. On first run with no config, the composer starts focused with placeholder "Describe what you want to do…" and key hints visible. The welcome modal offers a "Configure provider" action (Enter) alongside "Dismiss" (Esc).
 
 ### Region definitions
 
@@ -95,8 +97,9 @@ Grid unit: 1 terminal character cell. Regions stack vertically by default; colum
 - **Conversation pane** (main): scrollback of user/assistant/tool messages; assistant streams with typewriter cursor.
 - **Right rail** (comfortable only): tool-call invocation panel, todo panel, log tail panel (tabbed or stacked).
 - **Status bar** (1–2 rows, bottom): model, tokens in/out, cost, elapsed, retry count, headless/RPC indicator. Always visible.
-- **Input composer** (1+ rows, above status bar): multi-line text area for user prompts; shows key hints (`Enter` send, `Shift+Enter` newline, `Ctrl+C` cancel turn, `Ctrl+D` exit); disabled during in-flight turn.
-- **Modal layer** (overlay): approval/confirm, command palette. Centered, dims background.
+- **Input composer** (1+ rows, above status bar): multi-line text area for user prompts; **always rendered in layout**; shows key hints (`Enter` send, `Shift+Enter` newline, `Ctrl+C` cancel turn, `Ctrl+D` exit); disabled during in-flight turn. Placeholder reflects config state. Supports slash commands inline (`/undo`, `/redo`, `/help`, `/todos`, `/logs`, `/approve`, `/deny`, `/config`).
+- **Modal layer** (overlay): approval/confirm, command palette, welcome screen, configuration modal. Centered, dims background.
+- **Welcome overlay** (centered modal): shown on first run when no config; offers "Configure provider" and "Dismiss" actions; dims background; input composer stays visible and focused beneath.
 - **Command palette** (overlay): center-bottom, searchable command list (`/undo`, `/redo`, `/help`, …).
 
 Responsive behavior: on resize, regions reflow immediately; modal overlays re-center; conversation scroll position is preserved.
@@ -113,9 +116,10 @@ No code here — structural descriptions for implementation.
 6. **Status bar** — left-to-right: model name, `tokens in / out`, cost estimate, elapsed time, retry count, mode dot (interactive / headless / RPC). Two rows at comfortable height, one row at minimum height.
 7. **Command palette** — centered overlay listing `/undo`, `/redo`, `/help`, `/approve`, `/deny`, `/todos`, `/logs`. Prefix/fuzzy match as you type; Esc closes; Enter runs.
 8. **Log tail panel** — newest JSONL line at bottom; autoscroll on new lines; level color (`system`/`ok`/`error`); optional filter chips.
-9. **Input composer** — multi-line text area (grows to ~40% of height, min 1 row). Placeholder: "Describe what you want to do…" (no config) or "Type your prompt…" (config loaded). Key hints on right: `Enter` send · `Shift+Enter` newline · `Ctrl+C` cancel · `Ctrl+D` exit. During in-flight turn: disabled, shows spinner + "Running…" status. Supports slash commands inline (`/undo`, `/redo`, `/help`, `/todos`, `/logs`, `/approve`, `/deny`).
+9. **Input composer** — multi-line text area (grows to ~40% of height, min 1 row). **Always rendered in layout**, not hidden by welcome screen. Placeholder: "Describe what you want to do…" (no config) or "Type your prompt…" (config loaded). Key hints on right: `Enter` send · `Shift+Enter` newline · `Ctrl+C` cancel · `Ctrl+D` exit. During in-flight turn: disabled, shows spinner + "Running…" status. Supports slash commands inline (`/undo`, `/redo`, `/help`, `/todos`, `/logs`, `/approve`, `/deny`, `/config`).
 
-10. **Welcome screen** — shown on startup when no config exists and no prompt provided. Centered panel with: app name/version, provider/model status (configured / not configured), key bindings summary (`:` palette, `Ctrl+C` cancel, `Ctrl+D` quit), "Press any key to begin" or "Run `okeanos init` to configure". Dismisses on first keystroke or when composer receives focus.
+10. **Welcome screen** — centered modal overlay (not a full-screen replacement) shown on startup when no config exists and no prompt provided via CLI. Panel contains: app name/version, provider/model status (configured / not configured), key bindings summary (`:` palette, `Enter` send, `Shift+Enter` newline, `Ctrl+C` cancel, `Ctrl+D` quit), and two actions: **[Enter] Configure provider** · **[Esc] Dismiss**. Does not auto-dismiss on arbitrary keys. Dismisses on Esc or when "Configure provider" completes. Input composer remains visible and focused underneath.
+11. **Configuration modal** — centered overlay (~70% width, max 100 cols). Stepper flow: **Step 1: Provider kind** (radio/list: OpenRouter, Custom OpenAI-compatible, Ollama; default OpenRouter) → **Step 2: Base URL** (prefilled per provider, editable) → **Step 3: API key** (password masking toggle; hint: use `{env:VAR}` or `{file:path}`; validation: non-empty unless Ollama) → **Step 4: Model** (searchable list if provider supports discovery, else free-text with suggestions) → **Step 5: Confirm & write** (summary panel; Enter writes `okeanos.toml` at git root/CWD, emits config event, dismisses modal, updates welcome status to "Configured ✓", composer placeholder changes to "Type your prompt…"). Navigation: `Tab`/`Shift+Tab` between fields, `Enter` next step, `Esc` back/cancel, `Ctrl+C` abort entirely. High-contrast focus ring; reduced-motion respected.
 
 ## 6. Motion & transitions
 
@@ -144,10 +148,14 @@ The TUI consumes the same event stream that headless/RPC mode emits to stdout. E
 | Approval requested | `approval_request` | `id`, `tool`, `args` |
 | Approval resolved | `approval` | `id`, `decision` (allow/deny/allow-always) |
 | Todo added/completed | `todo` | `id`, `title`, `done` |
-| Status bar fields | `status` | `model`, `tokens_in`, `tokens_out`, `cost_usd`, `elapsed_ms`, `retries`, `mode` |
+| Status bar fields | `status` | `model`, `provider_configured`, `tokens_in`, `tokens_out`, `cost_usd`, `elapsed_ms`, `retries`, `mode` |
 | Git snapshot progress | `snapshot_progress` | `phase`, `percent`, `elapsed_ms` |
 | Log line | `log` | `level`, `message` |
 | Error | `error` | `code`, `message` |
+| Config modal opened | `config_modal` | `action: "open"`, `step: 1` |
+| Config step changed | `config_modal` | `action: "step"`, `step: 1-5`, `data: {provider_kind?, base_url?, api_key?, model?}` |
+| Config saved | `config_saved` | `path`, `provider_kind`, `model`, `base_url` |
+| Config modal closed | `config_modal` | `action: "close"`, `completed: boolean` |
 
 Headless mode prints identical JSON to stdout/RPC; screen readers and automation consume the canonical JSON UI. The TUI is a renderer of this stream, not a parallel state machine.
 

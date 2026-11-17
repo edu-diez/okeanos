@@ -820,7 +820,7 @@ impl TerminalApp {
     fn render_header(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, theme: &Theme) {
         let line = ratatui::text::Line::from(vec![
             ratatui::text::Span::styled(
-                " okeanos ",
+                " okeanos ∼ ",
                 theme
                     .style(crate::ui::theme::SemanticRole::Tool)
                     .add_modifier(ratatui::style::Modifier::BOLD),

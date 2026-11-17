@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12)
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 planned, Milestone 12.5 planned, Milestone 13 in progress (partially implemented, not tagged), Milestone 14 not started, Milestone 15 not started.
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -458,13 +458,44 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
-## Milestone 13 — Git snapshots + undo/redo
+## Milestone 12.5 — Model Generation Interruption
+
+**Status:** planned
 
 **Scope:**
-- gix-based snapshot store: snapshot before destructive actions and on loop boundaries.
+- Wire `run_turn()`'s `shutdown_tx` so the TUI (and headless) can signal an in-turn interrupt — currently the sender is discarded (`_shutdown_tx`), so no key press can reach a running model.
+- Make `call_model()` interruptible: use `model.stream()` with a `tokio::select!` on the shutdown channel, aborting the in-flight reqwest request when cancelled.
+- Add `Esc` key binding in TUI `handle_key` (when `turn_in_progress`) to send the interrupt signal; return control to the input composer with a "Turn cancelled" notice.
+- Add `interrupted` event to the `Event` enum (DESIGN.md §7) and emit it on cancel, for headless/RPC parity.
+- `run_turn()` returns `ReactError::Interrupted` on cancel; TUI shows it as a non-fatal warning, not a crash.
+- Headless mode: SIGINT during a turn sends the interrupt signal on the turn's shutdown channel.
+
+**Out of scope:** Tool execution interruption (already M6); model-provider-level abort beyond reqwest cancellation; thinking-channel cancellation.
+
+**Acceptance criteria:**
+- `Esc` during an in-flight TUI turn cancels model generation and returns to the composer.
+- `ReactError::Interrupted` is returned from `run_turn()` on cancel.
+- `interrupted` JSON event emitted in headless parity.
+- Unit tests for `call_model` cancellation via shutdown signal and `run_turn` interrupt path.
+- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` pass.
+
+**Testing requirements:** Unit tests for model stream cancellation, `run_turn` interrupt path, TUI Esc key handling. No network (mock provider).
+
+**Definition of Done:** CI green; interruption verified end-to-end in TUI and headless modes; milestone tagged.
+
+---
+
+## Milestone 13 — Git snapshots + undo/redo
+
+**Status:** in progress — `src/snapshot/store.rs` exists but uses `git` CLI instead of `gix`; session log module not yet split into `log.rs`/`header.rs`/`resume.rs`.
+
+**Scope:**
+- gix-based snapshot store: snapshot before destructive actions and on loop boundaries (replace `git` CLI shelling in `src/snapshot/store.rs` with pure-Rust `gix`; no C deps).
+- **Git initialization opt-in/deferred**: `SnapshotStore::new` must NOT run `git init` or create a `.git` folder just to launch the TUI/headless binary. Git repo initialization is deferred until the first snapshot is actually taken, or gated behind an explicit opt-in (`[snapshots] enabled = true` in config or `--snapshots` CLI flag).
 - `/undo` / `/redo` commands restoring prior snapshots; undo/redo cursor.
 - Snapshot progress UI (TUI status bar + JSON `snapshot_progress` event).
 - **Session log module restructure**: split `src/session/mod.rs` into `log.rs` (append-only JSONL), `header.rs` (session header), `resume.rs` (`ResumeStore` for `--resume`), `mod.rs` (re-exports). Align with ARCHITECTURE.md folder structure.
+- **Graceful shutdown flush**: `run_tui_and_loop` calls `session_manager.end_session()` on SIGINT/exit so the JSONL log is flushed and the alternate screen is torn down before the process ends (NF-09).
 
 **Out of scope:** Snapshot pruning/retention policy, remote git operations, branch management, compressed logs.
 
@@ -473,6 +504,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 - Snapshots taken before any `write`/`delete`/destructive `run`.
 - Undo/redo cursor bounded; cannot undo past oldest snapshot.
 - Session log types (`SessionLog`, `SessionHeader`, `ResumeStore`) exist as separate modules per ARCHITECTURE.md.
+- SIGINT during a TUI turn flushes the session log and tears down the alternate screen before exit.
+- Launching the TUI or headless binary in a directory without `.git` does not create a `.git` folder unless snapshots are explicitly enabled or a snapshot is taken.
 
 **Testing requirements:** Integration tests for snapshot round-trip, undo/redo sequences, snapshot-log reference integrity, `--resume` round-trip with split modules.
 
@@ -546,7 +579,9 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 10 | ✅ Cost budget | 1 | M2, M3, M9 |
 | 11 | ✅ Edit format | 1 | M6, M9 |
 | 12 | ✅ TUI shell | 2–3 | M2, M4, M5, M9, M11 |
-| 13 | Git snapshots + undo/redo | 2 | M6 |
+| 12.1 | TUI Configuration & Input UX | 1–2 | M12 |
+| 12.5 | Model generation interruption | 1–2 | M6, M12 |
+| 13 | Git snapshots + undo/redo (in progress) | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | Apple Silicon support | 1–2 | M0 |
 
@@ -554,26 +589,58 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Technical Debt / Architecture Fixes (post-MVP or parallel)
 
-These issues were identified during M12 design review and should be addressed in follow-up milestones:
+These issues were identified during M12 design review and gap analysis; most are now scheduled in M12.5–M14. Remaining post-MVP items:
 
 | Issue | Description | Suggested Milestone |
 |-------|-------------|---------------------|
 | **Config layer violation** | `toml` crate in workspace deps (should be CLI-only per ARCHITECTURE.md §Dependency rules). Config validation logic mixed with loading. | M16: Config layer cleanup |
-| **Mock model approval hack** | Mock returns `write` tool call on startup to keep TUI alive. Root cause: no "wait for user input" state in ReAct loop. Fixed by `run_turn()` in M12. | M12 (prerequisite) |
-| **Session log module structure** | ARCHITECTURE.md shows `log.rs`, `header.rs`, `resume.rs`; reality is single `mod.rs`. | M13 (added to scope) |
-| **Missing `headless.rs`** | ARCHITECTURE.md references `src/headless.rs` as shared event emitter; doesn't exist. Headless mode inline in `main.rs`. | M14 (added to scope) |
-| **RPC vaporware** | Status bar has `"rpc"` mode; CLI has no `--rpc` flag; no `jsonrpsee` dep; no server impl. | M14 (added to scope) |
-| **No graceful shutdown flush in TUI** | SIGINT should flush session log, teardown alternate screen, drain in-flight work. Currently TUI cleanup only on normal exit. | M14 or M16 |
 | **Config validation at wrong layer** | `Config::load()` does validation; should be separate `validate()` call for CI gating. | M16: Config layer cleanup |
 
-**M16 — Config layer cleanup** (suggested)
-- Move `toml` to CLI-only dependency (optional feature or separate crate)
-- Split config loading from validation
-- Add `Config::validate()` for CI gating
-- Ensure secrets never logged during validation
+Items now scheduled in active milestones (removed from this list):
+- Model generation not interruptible → **M12.5** (wire `shutdown_tx`, streaming + `select!` cancel, `Esc` binding, `interrupted` event).
+- `--rpc` flag / `src/headless.rs` / `jsonrpsee` → **M14** (already in scope).
+- Snapshot store uses `git` CLI instead of `gix` → **M13** (added to scope).
+- Session log module not split into `log.rs`/`header.rs`/`resume.rs` → **M13** (added to scope).
+- No graceful shutdown flush in TUI on SIGINT → **M13** (added to scope).
+- Git initialization not opt-in/deferred (creates `.git` on launch) → **M13** (added to scope).
+- No in-TUI provider/config configuration → **M12.1** (new milestone below).
+- No visible input composer in main TUI screen → **M12.1** (new milestone below).
 
-**M17 — Graceful shutdown hardening** (suggested)
-- SIGINT/SIGTERM flush session log in all modes
-- TUI alternate screen teardown on signal
-- Drain in-flight tool execution with timeout
-- Escalation: SIGTERM → grace → SIGKILL
+New gaps found during review (post-MVP, not yet scheduled):
+- **No `interrupted` event in `Event` enum** (DESIGN.md §7) — tracked as M12.5 acceptance criteria.
+- **No thinking channel event** (FR-30): `ModelStreamChunk.thinking` and `ModelResponse.thinking` exist but `Event` has no `Thinking` variant; not replayed into context for small models.
+- **Tiered tool set not implemented** (FR-25): all 6 tools registered for every tier; small models should get minimal set (read, edit, run).
+- **Selective context inclusion not implemented** (FR-26): no ripgrep-based symbol scan / file selection; all context is included.
+- **`/approve`, `/deny` missing from command palette** (DESIGN §5): palette lists `/help`, `/todos`, `/logs`, `/undo`, `/redo` but not approval decisions.
+- **No in-TUI provider configuration**: launching `./okeanos` with no config requires external `okeanos init` + TOML editing before the TUI is usable; no in-TUI setup flow.
+- **No visible input composer in main screen**: the idle TUI shows empty panes with no focusable place to type a prompt; nothing to click or write in until the welcome screen is dismissed.
+
+**M12.1 — TUI Configuration & Input UX** (planned)
+
+**Scope:**
+- **Visible input composer always rendered**: main layout includes input composer at bottom (above status bar) at all times; welcome screen renders as centered modal overlay, not full-screen replacement. Composer focused on startup with config-aware placeholder.
+- **In-TUI provider configuration**: first-run flow as a stepper modal (provider kind → base URL → API key → model → confirm) writing `okeanos.toml` at git root/CWD. Supports `{env:VAR}` / `{file:path}` secret substitution. Welcome screen offers **[Enter] Configure provider** action.
+- **Config events**: add `config_modal`, `config_saved` to event stream (DESIGN.md §7); `status` event gains `provider_configured` field.
+- **Key binding updates**: welcome screen no longer dismisses on arbitrary keys; uses `Esc` to dismiss, `Enter` to open config. Composer key hints unchanged.
+
+**Out of scope:** Full settings palette, theme selection, key binding customization.
+
+**Acceptance criteria:**
+- Launching `./okeanos` with no config opens TUI with **visible, focused input composer** at bottom showing placeholder "Describe what you want to do…" and key hints.
+- Welcome screen appears as **centered modal overlay** (not full screen) with "Configure provider" (Enter) and "Dismiss" (Esc) actions.
+- Pressing **Enter** on welcome screen opens config stepper modal; user can complete provider setup entirely within TUI.
+- On config save: `okeanos.toml` written at git root/CWD, welcome modal updates to "Provider: Configured ✓", composer placeholder changes to "Type your prompt…", user can immediately submit a prompt.
+- No terminal commands required beyond `./okeanos` to reach a working interactive state.
+- Headless mode emits `config_saved` event on completion for script consumption.
+
+**Testing requirements:** Unit tests for config stepper modal (validation, secret syntax, file write), welcome overlay key handling (Esc/Enter), input composer visibility when welcome overlay active. Integration test: cold start → config → prompt → turn. No network (mock provider).
+
+**Definition of Done:** CI green; TUI usable without external config commands; milestone tagged.
+
+---
+
+**M16 — Config layer cleanup** (suggested)
+- Move `toml` to CLI-only dependency (optional feature or separate crate).
+- Split config loading from validation.
+- Add `Config::validate()` for CI gating.
+- Ensure secrets never logged during validation.

@@ -771,6 +771,12 @@ async fn run_tui_and_loop(
     });
 
     loop {
+        // Allow quitting via Ctrl+C / Ctrl+D handled in TerminalApp::handle_key,
+        // which sets running = false.
+        if !tui_app.running {
+            break;
+        }
+
         // Handle crossterm events (input, resize)
         if crossterm::event::poll(std::time::Duration::from_millis(16))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
