@@ -1083,6 +1083,7 @@ impl<M: Model> ReactLoop<M> {
 
         let status = crate::events::Status {
             model: self.model.model_id().to_string(),
+            provider_configured: !self.model.model_id().is_empty(),
             tokens_in: self.conversation.estimated_tokens() as u64,
             tokens_out: 0,
             cost_usd,

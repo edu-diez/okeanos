@@ -1,8 +1,11 @@
 //! Welcome screen component — shown on startup when no config and no prompt.
 //!
-//! Per DESIGN.md §5.10: centered panel with app name/version, provider/model status,
-//! key bindings summary, "Press any key to begin" or "Run `okeanos init` to configure".
-//! Dismisses on first keystroke or when composer receives focus.
+//! Per DESIGN.md §5.10: centered modal overlay (not a full-screen replacement)
+//! shown on startup when no config exists and no prompt provided via CLI.
+//! Panel contains: app name/version, provider/model status, key bindings summary,
+//! and two actions: [Enter] Configure provider · [Esc] Dismiss.
+//! Does not auto-dismiss on arbitrary keys. Input composer remains visible and
+//! focused underneath.
 
 use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
@@ -13,6 +16,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use std::sync::Arc;
+
+/// Action returned by the welcome screen when a key is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WelcomeAction {
+    /// Dismiss the welcome screen.
+    Dismiss,
+    /// Open the configuration modal.
+    ConfigureProvider,
+}
 
 /// Welcome screen state.
 #[derive(Debug)]
@@ -70,18 +82,25 @@ impl WelcomeScreen {
         self.visible
     }
 
-    /// Handle keyboard input. Returns true if the key was handled (dismissing the screen).
-    pub fn handle_key(&mut self, _key: crossterm::event::KeyEvent) -> bool {
+    /// Handle keyboard input. Returns an action if a key was handled.
+    pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<WelcomeAction> {
         if !self.visible {
-            return false;
+            return None;
         }
 
-        // Any key dismisses the welcome screen
-        self.hide();
-        true
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.hide();
+                Some(WelcomeAction::Dismiss)
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => Some(WelcomeAction::ConfigureProvider),
+            _ => None,
+        }
     }
 
-    /// Render the welcome screen.
+    /// Render the welcome screen as a centered modal overlay.
     pub fn render(&self, area: RRect, buf: &mut Buffer) {
         if !self.visible {
             return;
@@ -169,10 +188,10 @@ impl WelcomeScreen {
 
         let bindings = [
             (":", "Open command palette"),
-            ("Ctrl+C", "Cancel in-flight turn / Exit"),
-            ("Ctrl+D", "Exit"),
             ("Enter", "Send prompt (in composer)"),
             ("Shift+Enter", "New line (in composer)"),
+            ("Ctrl+C", "Cancel in-flight turn / Exit"),
+            ("Ctrl+D", "Exit"),
             ("↑/↓", "Scroll conversation"),
             ("PgUp/PgDn", "Page scroll"),
             ("Home/End", "Jump to top/bottom"),
@@ -203,14 +222,33 @@ impl WelcomeScreen {
             )]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("Run ", self.theme.style(SemanticRole::CanvasMuted)),
                 Span::styled(
-                    "`okeanos init`",
+                    "Configure provider",
+                    self.theme
+                        .style(SemanticRole::Ok)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" — "),
+                Span::styled(
+                    "Enter",
                     self.theme
                         .style(SemanticRole::Tool)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" to configure", self.theme.style(SemanticRole::CanvasMuted)),
+                Span::styled("   ", self.theme.style(SemanticRole::CanvasMuted)),
+                Span::styled(
+                    "Dismiss",
+                    self.theme
+                        .style(SemanticRole::Warn)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" — "),
+                Span::styled(
+                    "Esc",
+                    self.theme
+                        .style(SemanticRole::Tool)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
         }
 
@@ -268,14 +306,40 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_key_dismisses() {
+    fn test_handle_key_esc_dismisses() {
         let mut screen = WelcomeScreen::new(test_theme(), "0.1.0".to_string());
         assert!(screen.is_visible());
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let action = screen.handle_key(key);
+        assert_eq!(action, Some(WelcomeAction::Dismiss));
+        assert!(!screen.is_visible());
+    }
+
+    #[test]
+    fn test_handle_key_enter_opens_config() {
+        let mut screen = WelcomeScreen::new(test_theme(), "0.1.0".to_string());
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let action = screen.handle_key(key);
+        assert_eq!(action, Some(WelcomeAction::ConfigureProvider));
+        // Enter does NOT dismiss; screen stays visible until config modal closes
+        assert!(screen.is_visible());
+    }
+
+    #[test]
+    fn test_handle_key_other_key_ignored() {
+        let mut screen = WelcomeScreen::new(test_theme(), "0.1.0".to_string());
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('a'),
             crossterm::event::KeyModifiers::NONE,
         );
-        screen.handle_key(key);
-        assert!(!screen.is_visible());
+        let action = screen.handle_key(key);
+        assert_eq!(action, None);
+        assert!(screen.is_visible());
     }
 }

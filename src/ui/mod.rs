@@ -8,9 +8,10 @@ pub mod layout;
 pub mod theme;
 
 use crate::events::{Event, EventReceiver, EventSender, event_channel};
+use crate::ui::components::welcome_screen::WelcomeAction;
 use crate::ui::components::{
-    ApprovalModal, CommandAction, CommandPalette, ConversationPane, InputComposer, LogTailPanel,
-    StatusBar, TodoPanel, ToolPanel, WelcomeScreen,
+    ApprovalModal, CommandAction, CommandPalette, ConfigModal, ConfigModalResult, ConversationPane,
+    InputComposer, LogTailPanel, StatusBar, TodoPanel, ToolPanel, WelcomeScreen,
 };
 use crate::ui::layout::LayoutRects;
 
@@ -37,6 +38,9 @@ pub struct TerminalApp {
     pub command_palette: CommandPalette,
     pub input_composer: InputComposer,
     pub welcome_screen: WelcomeScreen,
+    pub config_modal: ConfigModal,
+    pub config_modal_tx: mpsc::Sender<ConfigModalResult>,
+    pub config_modal_rx: Option<mpsc::Receiver<ConfigModalResult>>,
     pub event_rx: EventReceiver,
     pub event_tx: EventSender,
     pub approval_tx: mpsc::Sender<crate::events::Approval>,
@@ -56,6 +60,8 @@ pub struct TerminalApp {
     pub turn_in_progress: bool,
     /// Pending turn result from the harness
     pub pending_decision: Option<crate::harness::react::LoopDecision>,
+    /// Whether a provider is configured (from config load or config save)
+    pub provider_configured: bool,
 }
 
 impl TerminalApp {
@@ -111,6 +117,8 @@ impl TerminalApp {
         let input_composer = InputComposer::new(theme.clone());
         let welcome_screen =
             WelcomeScreen::new(theme.clone(), env!("CARGO_PKG_VERSION").to_string());
+        let config_modal = ConfigModal::new(theme.clone());
+        let (config_modal_tx, config_modal_rx) = mpsc::channel(16);
 
         // Set up command palette callback
         let mut command_palette = command_palette;
@@ -135,6 +143,9 @@ impl TerminalApp {
             command_palette,
             input_composer,
             welcome_screen,
+            config_modal,
+            config_modal_tx,
+            config_modal_rx: Some(config_modal_rx),
             event_rx,
             event_tx,
             approval_tx,
@@ -151,6 +162,7 @@ impl TerminalApp {
             height,
             turn_in_progress: false,
             pending_decision: None,
+            provider_configured: false,
         })
     }
 
@@ -207,13 +219,81 @@ impl TerminalApp {
 
     /// Set provider/model configuration status for welcome screen.
     pub fn set_config_status(&mut self, provider_configured: bool, model_name: Option<String>) {
+        self.provider_configured = provider_configured;
         self.welcome_screen
             .set_config_status(provider_configured, model_name);
+        // Update composer placeholder based on config state
+        if provider_configured {
+            self.input_composer
+                .set_placeholder("Type your prompt…".to_string());
+        } else {
+            self.input_composer
+                .set_placeholder("Describe what you want to do…".to_string());
+        }
+    }
+
+    /// Handle a config save event: mark provider configured and update UI.
+    pub fn on_config_saved(&mut self, _saved: &crate::events::ConfigSaved) {
+        self.provider_configured = true;
+        self.welcome_screen.set_config_status(true, None);
+        self.input_composer
+            .set_placeholder("Type your prompt…".to_string());
     }
 
     /// Check if welcome screen is visible.
     pub fn welcome_screen_visible(&self) -> bool {
         self.welcome_screen.is_visible()
+    }
+
+    /// Check if config modal is visible.
+    pub fn config_modal_visible(&self) -> bool {
+        self.config_modal.is_visible()
+    }
+
+    /// Open the configuration modal (stepper form for provider setup).
+    pub fn open_config_modal(&mut self) {
+        self.config_modal
+            .set_result_tx(self.config_modal_tx.clone());
+        self.config_modal.show();
+        // Emit config_modal open event
+        let _ = self.event_tx.send(crate::events::Event::config_modal(
+            crate::events::ConfigModalAction::Open,
+            Some(1),
+            None,
+        ));
+    }
+
+    /// Check for and handle config modal results (saved/cancelled).
+    pub fn check_config_modal_result(&mut self) {
+        if let Some(ref mut rx) = self.config_modal_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            match result {
+                ConfigModalResult::Saved { path, data } => {
+                    let provider_kind = data
+                        .provider_kind
+                        .as_ref()
+                        .map(|p| p.label().to_string())
+                        .unwrap_or_default();
+                    let saved = crate::events::ConfigSaved {
+                        path: path.to_string_lossy().to_string(),
+                        provider_kind: provider_kind.clone(),
+                        model: data.model.clone(),
+                        base_url: data.base_url.clone(),
+                    };
+                    let _ = self.event_tx.send(crate::events::Event::config_saved(
+                        saved.path.clone(),
+                        saved.provider_kind.clone(),
+                        saved.model.clone(),
+                        saved.base_url.clone(),
+                    ));
+                    self.on_config_saved(&saved);
+                }
+                ConfigModalResult::Cancelled => {
+                    // Modal cancelled, no state change needed
+                }
+            }
+        }
     }
 
     /// Get a reference to the welcome screen for rendering.
@@ -369,6 +449,7 @@ impl TerminalApp {
                     &self.command_palette,
                     &mut self.input_composer,
                     &self.welcome_screen,
+                    &self.config_modal,
                     &theme,
                 )
             })?;
@@ -405,9 +486,24 @@ impl TerminalApp {
 
     /// Handle a key event.
     pub async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        // Handle welcome screen first (any key dismisses it)
+        // If config modal is visible, route keys to it first
+        if self.config_modal.is_visible() {
+            self.config_modal.handle_key(key);
+            return Ok(true);
+        }
+
+        // Handle welcome screen (Esc dismiss, Enter configure provider; other keys ignored)
         if self.welcome_screen.is_visible() {
-            self.welcome_screen.handle_key(key);
+            if let Some(action) = self.welcome_screen.handle_key(key) {
+                match action {
+                    WelcomeAction::Dismiss => {
+                        // Welcome dismissed, composer stays focused
+                    }
+                    WelcomeAction::ConfigureProvider => {
+                        self.open_config_modal();
+                    }
+                }
+            }
             return Ok(true);
         }
 
@@ -635,6 +731,8 @@ impl TerminalApp {
             // Update status bar
             if let Event::Status(status) = &event {
                 self.status_bar.update(status.clone());
+                // Track provider_configured from status events
+                self.provider_configured = status.provider_configured;
             }
 
             // Show approval modal
@@ -642,11 +740,19 @@ impl TerminalApp {
                 self.approval_modal.show(req.clone());
             }
 
+            // Handle config saved: update UI state
+            if let Event::ConfigSaved(saved) = &event {
+                self.on_config_saved(saved);
+            }
+
             // Handle typing indicator for streaming
             if let Event::Token(_) = &event {
                 self.conversation.set_typing_indicator(false);
             }
         }
+
+        // Check for config modal results (saved/cancelled)
+        self.check_config_modal_result();
     }
 
     /// Render the UI (public for external loop integration).
@@ -663,17 +769,12 @@ impl TerminalApp {
         command_palette: &CommandPalette,
         input_composer: &mut InputComposer,
         welcome_screen: &WelcomeScreen,
+        config_modal: &ConfigModal,
         theme: &Theme,
     ) {
         let area = frame.area();
 
-        // If welcome screen is visible, render only that
-        if welcome_screen.is_visible() {
-            welcome_screen.render(area, frame.buffer_mut());
-            return;
-        }
-
-        // Render main layout regions
+        // Always render main layout regions (input composer always visible)
         if layout.has_right_rail() {
             // Comfortable layout: header | conversation | right rail | input composer | status bar
             Self::render_comfortable(
@@ -702,7 +803,16 @@ impl TerminalApp {
             );
         }
 
-        // Render modal overlay
+        // Render modal overlays on top
+        if welcome_screen.is_visible() {
+            welcome_screen.render(area, frame.buffer_mut());
+        }
+
+        if config_modal.is_visible() {
+            config_modal.render(area, frame.buffer_mut());
+        }
+
+        // Render approval modal overlay
         if approval_modal.is_visible() {
             approval_modal.render(area, frame.buffer_mut());
         }

@@ -860,6 +860,7 @@ async fn run_tui_and_loop(
                 command_palette,
                 &mut tui_app.input_composer,
                 welcome_screen,
+                &tui_app.config_modal,
                 &theme,
             )
         })?;

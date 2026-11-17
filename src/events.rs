@@ -109,6 +109,7 @@ pub struct Todo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Status {
     pub model: String,
+    pub provider_configured: bool,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_usd: f64,
@@ -149,6 +150,32 @@ pub struct ErrorEvent {
     pub message: String,
 }
 
+/// Action taken on the configuration modal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigModalAction {
+    Open,
+    Step,
+    Close,
+}
+
+/// Payload for `config_modal` events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigModalEvent {
+    pub action: ConfigModalAction,
+    pub step: Option<u8>,
+    pub data: Option<serde_json::Value>,
+}
+
+/// Payload for `config_saved` event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigSaved {
+    pub path: String,
+    pub provider_kind: String,
+    pub model: String,
+    pub base_url: String,
+}
+
 /// Union of all event types for the event stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -164,6 +191,8 @@ pub enum Event {
     SnapshotProgress(SnapshotProgress),
     Log(Log),
     Error(ErrorEvent),
+    ConfigModal(ConfigModalEvent),
+    ConfigSaved(ConfigSaved),
 }
 
 impl Event {
@@ -209,6 +238,28 @@ impl Event {
 
     pub fn error(code: String, message: String) -> Self {
         Event::Error(ErrorEvent { code, message })
+    }
+
+    pub fn config_modal(
+        action: ConfigModalAction,
+        step: Option<u8>,
+        data: Option<serde_json::Value>,
+    ) -> Self {
+        Event::ConfigModal(ConfigModalEvent { action, step, data })
+    }
+
+    pub fn config_saved(
+        path: String,
+        provider_kind: String,
+        model: String,
+        base_url: String,
+    ) -> Self {
+        Event::ConfigSaved(ConfigSaved {
+            path,
+            provider_kind,
+            model,
+            base_url,
+        })
     }
 }
 

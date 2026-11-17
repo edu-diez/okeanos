@@ -2,6 +2,7 @@
 
 pub mod approval_modal;
 pub mod command_palette;
+pub mod config_modal;
 pub mod conversation;
 pub mod input_composer;
 pub mod log_tail;
@@ -12,6 +13,7 @@ pub mod welcome_screen;
 
 pub use approval_modal::ApprovalModal;
 pub use command_palette::{CommandAction, CommandPalette};
+pub use config_modal::{ConfigModal, ConfigModalResult};
 pub use conversation::ConversationPane;
 pub use input_composer::{ComposerStatus, InputComposer};
 pub use log_tail::{LogFilter, LogTailPanel};

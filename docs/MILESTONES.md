@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 planned, Milestone 12.5 planned, Milestone 13 in progress (partially implemented, not tagged), Milestone 14 not started, Milestone 15 not started.
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 planned, Milestone 13 in progress (partially implemented, not tagged), Milestone 14 not started, Milestone 15 not started.
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -615,7 +615,7 @@ New gaps found during review (post-MVP, not yet scheduled):
 - **No in-TUI provider configuration**: launching `./okeanos` with no config requires external `okeanos init` + TOML editing before the TUI is usable; no in-TUI setup flow.
 - **No visible input composer in main screen**: the idle TUI shows empty panes with no focusable place to type a prompt; nothing to click or write in until the welcome screen is dismissed.
 
-**M12.1 — TUI Configuration & Input UX** (planned)
+**M12.1 — TUI Configuration & Input UX** (complete — tagged v0.1.0-milestone-12.1)
 
 **Scope:**
 - **Visible input composer always rendered**: main layout includes input composer at bottom (above status bar) at all times; welcome screen renders as centered modal overlay, not full-screen replacement. Composer focused on startup with config-aware placeholder.
@@ -635,7 +635,12 @@ New gaps found during review (post-MVP, not yet scheduled):
 
 **Testing requirements:** Unit tests for config stepper modal (validation, secret syntax, file write), welcome overlay key handling (Esc/Enter), input composer visibility when welcome overlay active. Integration test: cold start → config → prompt → turn. No network (mock provider).
 
-**Definition of Done:** CI green; TUI usable without external config commands; milestone tagged.
+**Definition of Done:** CI green; TUI usable without external config commands; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (315 unit tests)
+- `cargo build --release` produces a single binary
+- Tagged v0.1.0-milestone-12.1
 
 ---
 

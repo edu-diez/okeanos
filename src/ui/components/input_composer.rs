@@ -52,7 +52,7 @@ impl InputComposer {
             disabled: false,
             status: ComposerStatus::Ready,
             on_submit: None,
-            placeholder: "Type your prompt…".to_string(),
+            placeholder: "Describe what you want to do…".to_string(),
             show_key_hints: true,
         }
     }
