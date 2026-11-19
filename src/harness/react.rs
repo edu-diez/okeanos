@@ -2247,7 +2247,7 @@ mod tests {
 
         // Create loop with external shutdown receiver
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
-        let mut loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx)
+        let loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx)
             .with_shutdown(shutdown_rx);
 
         // Start the run in a background task
