@@ -24,6 +24,18 @@ pub enum Verbosity {
     Debug,
 }
 
+/// Approval policy for headless mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ApprovalPolicy {
+    /// Allow all privileged operations without prompting.
+    #[default]
+    Auto,
+    /// Deny all privileged operations.
+    Deny,
+    /// Emit ApprovalRequest event and wait for Approval on stdin.
+    Prompt,
+}
+
 /// CLI subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -102,6 +114,23 @@ pub struct Cli {
     #[arg(long, conflicts_with = "headless", global = true)]
     pub interactive: bool,
 
+    /// Run in JSON-RPC mode over stdio (requires 'rpc' feature).
+    #[arg(
+        long,
+        conflicts_with = "headless",
+        conflicts_with = "interactive",
+        global = true
+    )]
+    pub rpc: bool,
+
+    /// Approval policy for headless/RPC mode: auto (allow all), deny (block all), prompt (wait for stdin JSON).
+    #[arg(long, value_name = "POLICY", global = true, default_value = "prompt")]
+    pub approval_policy: ApprovalPolicy,
+
+    /// Timeout for approval prompts in seconds (when policy is 'prompt').
+    #[arg(long, value_name = "SECS", global = true, default_value = "30")]
+    pub approval_timeout_sec: u64,
+
     /// Override the model name from config.
     #[arg(long, value_name = "NAME", global = true)]
     pub model: Option<String>,
@@ -132,11 +161,14 @@ pub enum Mode {
     #[default]
     Interactive,
     Headless,
+    Rpc,
 }
 
 impl Cli {
     pub fn mode(&self) -> Mode {
-        if self.headless {
+        if self.rpc {
+            Mode::Rpc
+        } else if self.headless {
             Mode::Headless
         } else {
             Mode::Interactive

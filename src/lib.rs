@@ -9,6 +9,7 @@ pub mod context;
 pub mod cost;
 pub mod events;
 pub mod harness;
+pub mod headless;
 pub mod model;
 pub mod session;
 pub mod snapshot;
