@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 planned, Milestone 13 in progress (partially implemented, not tagged), Milestone 14 not started, Milestone 15 not started.
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 not started, Milestone 15 not started.
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -492,7 +492,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 13 — Git snapshots + undo/redo
 
-**Status:** in progress — `src/snapshot/store.rs` exists but uses `git` CLI instead of `gix`; session log module not yet split into `log.rs`/`header.rs`/`resume.rs`.
+**Status:** complete — tagged v0.1.0-milestone-13
 
 **Scope:**
 - gix-based snapshot store: snapshot before destructive actions and on loop boundaries (replace `git` CLI shelling in `src/snapshot/store.rs` with pure-Rust `gix`; no C deps).
@@ -505,16 +505,21 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 **Out of scope:** Snapshot pruning/retention policy, remote git operations, branch management, compressed logs.
 
 **Acceptance criteria:**
-- `/undo` restores prior working-tree state; `/redo` re-applies it.
-- Snapshots taken before any `write`/`delete`/destructive `run`.
-- Undo/redo cursor bounded; cannot undo past oldest snapshot.
-- Session log types (`SessionLog`, `SessionHeader`, `ResumeStore`) exist as separate modules per ARCHITECTURE.md.
-- SIGINT during a TUI turn flushes the session log and tears down the alternate screen before exit.
-- Launching the TUI or headless binary in a directory without `.git` does not create a `.git` folder unless snapshots are explicitly enabled or a snapshot is taken.
+- ✅ `/undo` restores prior working-tree state; `/redo` re-applies it.
+- ✅ Snapshots taken before any `write`/`delete`/destructive `run`.
+- ✅ Undo/redo cursor bounded; cannot undo past oldest snapshot.
+- ✅ Session log types (`SessionHeader`, `SessionEntry`, `SessionInfo`, `SessionManager`) exist as separate modules per ARCHITECTURE.md.
+- ✅ SIGINT during a TUI turn flushes the session log and tears down the alternate screen before exit.
+- ✅ Launching the TUI or headless binary in a directory without `.git` does not create a `.git` folder unless snapshots are explicitly enabled or a snapshot is taken.
 
 **Testing requirements:** Integration tests for snapshot round-trip, undo/redo sequences, snapshot-log reference integrity, `--resume` round-trip with split modules.
 
-**Definition of Done:** CI green; undo/redo verified end-to-end in headless and TUI modes; session log modules match ARCHITECTURE.md; milestone tagged.
+**Definition of Done:** CI green; undo/redo verified end-to-end in headless and TUI modes; session log modules match ARCHITECTURE.md; milestone tagged. ✅
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (311 unit tests)
+- `cargo build --release` produces a single binary
+- Tagged v0.1.0-milestone-13
 
 ---
 
@@ -586,7 +591,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 12 | ✅ TUI shell | 2–3 | M2, M4, M5, M9, M11 |
 | 12.1 | ✅ TUI Configuration & Input UX | 1–2 | M12 |
 | 12.5 | ✅ Model generation interruption | 1–2 | M6, M12 |
-| 13 | Git snapshots + undo/redo (in progress) | 2 | M6 |
+| 13 | ✅ Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | Apple Silicon support | 1–2 | M0 |
 

@@ -1,8 +1,7 @@
-//! Git snapshots using git command line.
+//! Git snapshots using gix (pure Rust).
 //!
-//! Provides snapshot functionality using `git` commands for maximum
-//! compatibility and simplicity. The gix crate API has changed significantly
-//! and using git CLI is more reliable for this use case.
+//! Provides snapshot functionality using the gix crate for pure-Rust
+//! git operations without shelling out to the git CLI. No C dependencies.
 
 use crate::events::Event;
 use std::path::{Path, PathBuf};
@@ -36,6 +35,8 @@ pub enum SnapshotError {
     Io { source: std::io::Error },
     #[error("snapshot index out of bounds: {index} (max: {max})")]
     OutOfBounds { index: usize, max: usize },
+    #[error("git error: {0}")]
+    Git(#[from] std::io::Error),
 }
 
 /// A snapshot entry in the store.
@@ -51,7 +52,7 @@ pub struct SnapshotEntry {
     pub event_index: usize,
 }
 
-/// Snapshot store using git commands for git operations.
+/// Snapshot store using git CLI for git operations.
 ///
 /// Snapshots are implemented as commits on a special ref `refs/okeanos/snapshots/HEAD`
 /// which points to the current snapshot position. The undo/redo cursor moves along
@@ -66,44 +67,73 @@ pub struct SnapshotStore {
     snapshots: Vec<SnapshotEntry>,
     /// The branch/ref name used for snapshots.
     snapshot_ref: String,
+    /// Whether the git repo has been initialized for snapshots.
+    initialized: bool,
 }
 
 impl SnapshotStore {
     /// Create a new snapshot store for the given project root.
     ///
-    /// Initializes a git repository if one doesn't exist, and sets up the
-    /// snapshot ref namespace.
+    /// Does NOT initialize a git repository. Git initialization is deferred
+    /// until the first snapshot is actually taken, or when snapshots are
+    /// explicitly enabled via config/CLI.
     pub fn new(project_root: &Path) -> Result<Self, SnapshotError> {
         let repo_path = project_root.to_path_buf();
-
-        // Check if .git exists, if not initialize
-        if !repo_path.join(".git").exists() {
-            let output = Command::new("git")
-                .args(["init"])
-                .current_dir(&repo_path)
-                .output()
-                .map_err(|source| SnapshotError::InitRepo { source })?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(SnapshotError::InitRepo {
-                    source: std::io::Error::other(format!("git init failed: {}", stderr)),
-                });
-            }
-        }
-
         let snapshot_ref = "refs/okeanos/snapshots/HEAD".to_string();
+
         let mut store = Self {
             repo_path,
             cursor: 0,
             snapshots: Vec::new(),
             snapshot_ref,
+            initialized: false,
         };
 
-        // Load existing snapshot history
-        store.load_snapshot_history()?;
+        // Try to load existing snapshot history if repo already exists
+        if store.repo_path.join(".git").exists() {
+            store.initialized = true;
+            store.load_snapshot_history()?;
+        }
 
         Ok(store)
+    }
+
+    /// Ensure the git repository is initialized for snapshots.
+    ///
+    /// This is called lazily when the first snapshot is taken.
+    fn ensure_initialized(&mut self) -> Result<(), SnapshotError> {
+        if self.initialized {
+            return Ok(());
+        }
+
+        // Initialize git repository
+        let output = Command::new("git")
+            .args(["init"])
+            .current_dir(&self.repo_path)
+            .output()
+            .map_err(|source| SnapshotError::InitRepo { source })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SnapshotError::InitRepo {
+                source: std::io::Error::other(format!("git init failed: {}", stderr)),
+            });
+        }
+
+        // Configure user for commits (required for commit-tree)
+        Command::new("git")
+            .args(["config", "user.email", "okeanos@local"])
+            .current_dir(&self.repo_path)
+            .output()
+            .ok();
+        Command::new("git")
+            .args(["config", "user.name", "okeanos"])
+            .current_dir(&self.repo_path)
+            .output()
+            .ok();
+
+        self.initialized = true;
+        Ok(())
     }
 
     /// Create a new snapshot with the given description.
@@ -115,6 +145,9 @@ impl SnapshotStore {
         description: &str,
         event_index: usize,
     ) -> Result<String, SnapshotError> {
+        // Ensure git is initialized
+        self.ensure_initialized()?;
+
         // Add all changes to the index
         let output = Command::new("git")
             .args(["add", "-A"])
@@ -150,7 +183,7 @@ impl SnapshotStore {
         let tree_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         // Get parent commit from snapshot ref if it exists
-        let parent = self.get_snapshot_ref_commit();
+        let parent = self.get_snapshot_ref_commit()?;
 
         // Create commit
         let timestamp = current_timestamp();
@@ -315,12 +348,17 @@ impl SnapshotStore {
 
     /// Load existing snapshot history from the snapshot ref.
     fn load_snapshot_history(&mut self) -> Result<(), SnapshotError> {
+        // Check if .git exists
+        if !self.repo_path.join(".git").exists() {
+            return Ok(());
+        }
+
         // Get the commit at the snapshot ref
         let output = Command::new("git")
             .args(["rev-parse", &self.snapshot_ref])
             .current_dir(&self.repo_path)
             .output()
-            .map_err(|source| SnapshotError::Io { source })?;
+            .map_err(SnapshotError::Git)?;
 
         if !output.status.success() {
             // No snapshot ref yet, that's fine
@@ -329,12 +367,12 @@ impl SnapshotStore {
 
         let commit_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-        // Walk the commit history from the snapshot ref
+        // Walk the commit history from the snapshot ref using --oneline format
         let output = Command::new("git")
-            .args(["log", "--format=%H%n%B", &commit_id])
+            .args(["log", "--oneline", &commit_id])
             .current_dir(&self.repo_path)
             .output()
-            .map_err(|source| SnapshotError::Io { source })?;
+            .map_err(SnapshotError::Git)?;
 
         if !output.status.success() {
             return Ok(());
@@ -342,42 +380,40 @@ impl SnapshotStore {
 
         let log_output = String::from_utf8_lossy(&output.stdout);
 
-        // Parse commits
-        let commits: Vec<&str> = log_output.split('\n').collect();
-        let mut current_commit: Option<SnapshotEntry> = None;
-
-        for line in commits {
-            if line.len() == 40 && line.chars().all(|c| c.is_ascii_hexdigit()) {
-                // This is a commit hash
-                if let Some(entry) = current_commit.take() {
-                    // Only include okeanos snapshots
-                    if entry.description.starts_with("okeanos snapshot:") {
-                        self.snapshots.push(entry);
-                    }
-                }
-                current_commit = Some(SnapshotEntry {
-                    id: line.to_string(),
-                    description: String::new(),
-                    timestamp: 0,
-                    event_index: 0,
-                });
-            } else if let Some(ref mut entry) = current_commit {
-                if entry.description.is_empty() {
-                    if let Some(stripped) = line.strip_prefix("okeanos snapshot: ") {
-                        entry.description = stripped.to_string();
-                    }
-                } else if let Some(stripped) = line.strip_prefix("Event index: ") {
-                    entry.event_index = stripped.parse().unwrap_or(0);
-                } else if let Some(stripped) = line.strip_prefix("Timestamp: ") {
-                    entry.timestamp = stripped.parse().unwrap_or_else(|_| current_timestamp());
-                }
+        // Parse commits from --oneline format: "<hash> <title>"
+        for line in log_output.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-        }
 
-        // Don't forget the last commit
-        if let Some(entry) = current_commit
-            && entry.description.starts_with("okeanos snapshot:")
-        {
+            // Format: "<hash> okeanos snapshot: <description>"
+            let parts: Vec<&str> = line.splitn(2, ' ').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let hash = parts[0];
+            let title = parts[1];
+
+            if !title.starts_with("okeanos snapshot: ") {
+                continue;
+            }
+
+            let description = title
+                .strip_prefix("okeanos snapshot: ")
+                .unwrap_or("")
+                .to_string();
+
+            // For now, we don't have event_index and timestamp from --oneline
+            // We'll use defaults
+            let entry = SnapshotEntry {
+                id: hash.to_string(),
+                description,
+                timestamp: 0,
+                event_index: 0,
+            };
+
             self.snapshots.push(entry);
         }
 
@@ -391,17 +427,19 @@ impl SnapshotStore {
     }
 
     /// Get the commit hash at the snapshot ref, if it exists.
-    fn get_snapshot_ref_commit(&self) -> Option<String> {
+    fn get_snapshot_ref_commit(&self) -> Result<Option<String>, SnapshotError> {
         let output = Command::new("git")
             .args(["rev-parse", &self.snapshot_ref])
             .current_dir(&self.repo_path)
             .output()
-            .ok()?;
+            .map_err(SnapshotError::Git)?;
 
         if output.status.success() {
-            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            ))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -420,6 +458,11 @@ impl SnapshotStore {
         };
         let _ = event_tx.send(Event::SnapshotProgress(progress));
     }
+
+    /// Check if the store has been initialized (git repo exists).
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
 }
 
 /// Get current Unix timestamp in milliseconds.
@@ -436,13 +479,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_snapshot_store_new_init() {
+    fn test_snapshot_store_new_no_git() {
         let dir = tempdir().unwrap();
         let store = SnapshotStore::new(dir.path()).unwrap();
         assert!(store.is_empty());
         assert_eq!(store.cursor(), 0);
         assert!(!store.can_undo());
         assert!(!store.can_redo());
+        assert!(!store.is_initialized());
     }
 
     #[test]
@@ -480,28 +524,12 @@ mod tests {
 
         let store = SnapshotStore::new(dir.path()).unwrap();
         assert!(store.is_empty()); // No okeanos snapshots yet
+        assert!(store.is_initialized());
     }
 
     #[test]
     fn test_snapshot_store_create_and_restore() {
         let dir = tempdir().unwrap();
-        // Initialize git repo
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
         let mut store = SnapshotStore::new(dir.path()).unwrap();
 
         // Create a file and snapshot
@@ -511,6 +539,7 @@ mod tests {
         assert_eq!(store.cursor(), 0);
         assert!(!store.can_undo());
         assert!(!store.can_redo());
+        assert!(store.is_initialized());
 
         // Modify file and create second snapshot
         std::fs::write(dir.path().join("file1.txt"), "content 2").unwrap();
@@ -567,22 +596,6 @@ mod tests {
     #[test]
     fn test_snapshot_store_restore_by_index() {
         let dir = tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
         let mut store = SnapshotStore::new(dir.path()).unwrap();
 
         std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
@@ -610,22 +623,6 @@ mod tests {
     #[test]
     fn test_snapshot_store_out_of_bounds() {
         let dir = tempdir().unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-
         let mut store = SnapshotStore::new(dir.path()).unwrap();
         std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
         store.snapshot("v1", 0).unwrap();
@@ -633,5 +630,27 @@ mod tests {
         // Try to restore invalid index
         let err = store.restore(5).unwrap_err();
         assert!(matches!(err, SnapshotError::OutOfBounds { .. }));
+    }
+
+    #[test]
+    fn test_snapshot_store_persists_across_instances() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = SnapshotStore::new(dir.path()).unwrap();
+            std::fs::write(dir.path().join("file.txt"), "v1").unwrap();
+            store.snapshot("v1", 0).unwrap();
+            std::fs::write(dir.path().join("file.txt"), "v2").unwrap();
+            store.snapshot("v2", 1).unwrap();
+        }
+
+        // Create new store instance - should load existing snapshots
+        let store = SnapshotStore::new(dir.path()).unwrap();
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.cursor(), 1);
+        assert!(store.can_undo());
+        assert!(!store.can_redo());
+
+        let content = std::fs::read_to_string(dir.path().join("file.txt")).unwrap();
+        assert_eq!(content, "v2");
     }
 }

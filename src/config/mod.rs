@@ -30,6 +30,8 @@ pub struct Config {
     pub cost: Option<CostSection>,
     #[serde(default)]
     pub ui: Option<UiSection>,
+    #[serde(default)]
+    pub snapshots: Option<SnapshotsSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -45,6 +47,7 @@ impl std::fmt::Debug for Config {
             .field("permissions", &self.permissions)
             .field("cost", &self.cost)
             .field("ui", &self.ui)
+            .field("snapshots", &self.snapshots)
             .finish()
     }
 }
@@ -133,6 +136,12 @@ pub struct CostSection {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct UiSection {
     pub theme: Option<String>, // "dark" or "light"
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SnapshotsSection {
+    /// Enable git snapshots (default: false - opt-in)
+    pub enabled: Option<bool>,
 }
 
 /// Errors raised while loading or validating configuration.

@@ -25,6 +25,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Undo/redo action from command palette.
+#[derive(Debug, Clone, Copy)]
+pub enum UndoRedoAction {
+    Undo,
+    Redo,
+}
+
 /// TUI application state for single-turn interactive mode.
 pub struct TerminalApp {
     pub theme_manager: ThemeManager,
@@ -50,6 +57,9 @@ pub struct TerminalApp {
     /// Channel for command palette actions
     pub palette_tx: mpsc::Sender<CommandAction>,
     pub palette_rx: mpsc::Receiver<CommandAction>,
+    /// Channel for undo/redo actions
+    pub undo_redo_tx: mpsc::Sender<UndoRedoAction>,
+    pub undo_redo_rx: mpsc::Receiver<UndoRedoAction>,
     pub terminal: Terminal<CrosstermBackend<io::Stdout>>,
     pub last_tick: Instant,
     pub running: bool,
@@ -103,6 +113,7 @@ impl TerminalApp {
         let (approval_tx, approval_rx) = mpsc::channel(16);
         let (composer_tx, composer_rx) = mpsc::channel(16);
         let (palette_tx, palette_rx) = mpsc::channel(16);
+        let (undo_redo_tx, undo_redo_rx) = mpsc::channel(16);
 
         // Create layout
         let area = ratatui::layout::Rect::new(0, 0, width, height);
@@ -156,6 +167,8 @@ impl TerminalApp {
             composer_rx: Some(composer_rx),
             palette_tx,
             palette_rx,
+            undo_redo_tx,
+            undo_redo_rx,
             terminal,
             last_tick: Instant::now(),
             running: true,
@@ -644,22 +657,14 @@ impl TerminalApp {
                 .await;
             }
             CommandAction::Undo => {
-                // Emit undo event for harness to handle
-                let _ = self
-                    .event_tx
-                    .send(crate::events::Event::Log(crate::events::Log {
-                        level: crate::events::LogLevel::Info,
-                        message: "Undo requested".to_string(),
-                    }));
-                // The harness would need to handle this via snapshot store
+                let _ = self.undo_redo_tx.try_send(UndoRedoAction::Undo);
+                self.emit_log(crate::events::LogLevel::Info, "Undo requested".to_string())
+                    .await;
             }
             CommandAction::Redo => {
-                let _ = self
-                    .event_tx
-                    .send(crate::events::Event::Log(crate::events::Log {
-                        level: crate::events::LogLevel::Info,
-                        message: "Redo requested".to_string(),
-                    }));
+                let _ = self.undo_redo_tx.try_send(UndoRedoAction::Redo);
+                self.emit_log(crate::events::LogLevel::Info, "Redo requested".to_string())
+                    .await;
             }
             CommandAction::Approve => {
                 // Approve pending approval (if any)

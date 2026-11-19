@@ -32,6 +32,8 @@ bytes = "1"
 nix = { version = "0.28", features = ["signal"] }
 atty = "0.2"
 async-stream = "0.3"
+gix = { version = "0.71", features = ["tree-editor"] }
+gix-actor = "0.34"
 
 
 # Optional dependencies (feature-flagged)

@@ -121,6 +121,10 @@ pub struct Cli {
     /// Dry-run mode: show execution plan without executing.
     #[arg(long, global = true)]
     pub dry_run: bool,
+
+    /// Enable git snapshots (opt-in, default: false).
+    #[arg(long, global = true)]
+    pub snapshots: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

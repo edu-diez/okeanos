@@ -12,7 +12,7 @@ use crate::model::{
     GenerationParams, Model, ModelError, ModelMessage, ModelResponse, ModelRole, ModelTier,
 };
 use crate::session::SessionManager;
-use crate::snapshot::store::SnapshotStore;
+use crate::snapshot::store::{SnapshotEntry, SnapshotError, SnapshotStore};
 use crate::tool::ToolRegistry;
 use crate::tool::tool_trait::ToolCategory;
 use anyhow::Context as _;
@@ -217,6 +217,38 @@ impl<M: Model> ReactLoop<M> {
     pub fn with_snapshot_store(mut self, store: SnapshotStore) -> Self {
         self.snapshot_store = Some(store);
         self
+    }
+
+    /// Undo to the previous snapshot.
+    pub fn undo(&mut self) -> Result<SnapshotEntry, SnapshotError> {
+        let Some(store) = &mut self.snapshot_store else {
+            return Err(SnapshotError::NoSnapshots);
+        };
+        store.undo()
+    }
+
+    /// Redo to the next snapshot.
+    pub fn redo(&mut self) -> Result<SnapshotEntry, SnapshotError> {
+        let Some(store) = &mut self.snapshot_store else {
+            return Err(SnapshotError::NoSnapshots);
+        };
+        store.redo()
+    }
+
+    /// Check if undo is available.
+    pub fn can_undo(&self) -> bool {
+        self.snapshot_store
+            .as_ref()
+            .map(|s| s.can_undo())
+            .unwrap_or(false)
+    }
+
+    /// Check if redo is available.
+    pub fn can_redo(&self) -> bool {
+        self.snapshot_store
+            .as_ref()
+            .map(|s| s.can_redo())
+            .unwrap_or(false)
     }
 
     /// Run the ReAct loop until completion or termination.

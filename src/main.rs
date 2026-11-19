@@ -1,3 +1,5 @@
+//! okeanos - Autonomous coding agent harness
+
 use anyhow::Context as _;
 use clap::Parser;
 use futures::Stream;
@@ -22,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "tui")]
-use okeanos::ui::{TerminalApp, current_timestamp};
+use okeanos::ui::TerminalApp;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -271,6 +273,11 @@ allow_list = ["todo", "read", "grep"]
 [ui]
 # Theme: "dark" or "light"
 # theme = "dark"
+
+# Snapshots configuration (opt-in)
+# [snapshots]
+# Enable git snapshots for undo/redo (default: false)
+# enabled = false
 "#
     .to_string()
 }
@@ -441,12 +448,9 @@ async fn run_interactive(cli: &Cli, config: &Config, prompt: Option<String>) -> 
     #[cfg(not(feature = "tui"))]
     {
         let _ = apply_cli_overrides(cli, config);
-        Err::<(), anyhow::Error>(
-            okeanos::HarnessError::UnsupportedMode(
-                "interactive TUI (compile with --features tui)".into(),
-            )
-            .into(),
-        )
+        Err::<(), anyhow::Error>(okeanos::HarnessError::UnsupportedMode(
+            "interactive TUI (compile with --features tui)".into(),
+        ))
         .context("interactive mode requires the 'tui' feature")
     }
 }
@@ -537,9 +541,19 @@ async fn run_interactive_tui(
     // Create event channel for logging
     let (event_tx, _event_rx) = okeanos::events::event_channel();
 
-    // Create snapshot store for git snapshots
-    let snapshot_store =
-        SnapshotStore::new(&project_root).context("failed to create snapshot store")?;
+    // Create snapshot store for git snapshots (only if enabled via config or CLI)
+    let snapshots_enabled = config
+        .snapshots
+        .as_ref()
+        .and_then(|s| s.enabled)
+        .unwrap_or(false)
+        || cli.snapshots;
+
+    let snapshot_store = if snapshots_enabled {
+        Some(SnapshotStore::new(&project_root).context("failed to create snapshot store")?)
+    } else {
+        None
+    };
 
     // Determine model tier from capabilities
     let model_tier = model_capabilities.tier;
@@ -701,12 +715,17 @@ async fn run_interactive_tui(
         .take_composer_receiver()
         .context("composer receiver not available")?;
 
-    // Create the ReAct loop with policy + approval wiring + session logging.
+    // Create the ReAct loop with policy + approval wiring.
+    // Note: We don't use with_session() here because we need the session_manager
+    // in run_tui_and_loop to call end_session() on exit. Instead, we manually
+    // log events to the session_manager in run_tui_and_loop.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
-        .with_approval_receiver(approval_rx)
-        .with_session(session_manager)
-        .with_snapshot_store(snapshot_store);
+        .with_approval_receiver(approval_rx);
+
+    if let Some(store) = snapshot_store {
+        loop_ = loop_.with_snapshot_store(store);
+    }
 
     if let Some(tracker) = cost_tracker {
         loop_ = loop_.with_cost_tracker(tracker);
@@ -733,7 +752,7 @@ async fn run_interactive_tui(
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         tui_app.turn_shutdown_tx = Some(shutdown_tx);
 
-        // Run first turn with interruptible shutdown
+        // Run a single ReAct turn with interruptible shutdown
         match loop_.run_turn(initial_prompt, shutdown_rx).await {
             Ok(decision) => {
                 tui_app.set_pending_decision(decision);
@@ -761,7 +780,7 @@ async fn run_interactive_tui(
     }
 
     // Run the combined TUI + ReAct loop event loop (single task)
-    run_tui_and_loop(tui_app, loop_, composer_rx).await
+    run_tui_and_loop(tui_app, loop_, composer_rx, session_manager).await
 }
 
 /// Run the TUI and ReAct loop in a single task (single-turn architecture).
@@ -770,6 +789,7 @@ async fn run_tui_and_loop(
     mut tui_app: okeanos::ui::TerminalApp,
     mut loop_: okeanos::harness::react::ReactLoop<ActiveModel>,
     mut composer_rx: tokio::sync::mpsc::Receiver<String>,
+    mut session_manager: okeanos::session::SessionManager,
 ) -> anyhow::Result<()> {
     // Set up signal handling for graceful shutdown
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -811,6 +831,66 @@ async fn run_tui_and_loop(
         // Check for shutdown signal
         if shutdown_rx.try_recv().is_ok() {
             break;
+        }
+
+        // Check for undo/redo actions from command palette
+        if let Ok(action) = tui_app.undo_redo_rx.try_recv() {
+            match action {
+                okeanos::ui::UndoRedoAction::Undo => {
+                    if loop_.can_undo() {
+                        if let Err(e) = loop_.undo() {
+                            eprintln!("Undo failed: {}", e);
+                            let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                                okeanos::events::Log {
+                                    level: okeanos::events::LogLevel::Error,
+                                    message: format!("Undo failed: {}", e),
+                                },
+                            ));
+                        } else {
+                            let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                                okeanos::events::Log {
+                                    level: okeanos::events::LogLevel::Info,
+                                    message: "Undo completed".to_string(),
+                                },
+                            ));
+                        }
+                    } else {
+                        let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                            okeanos::events::Log {
+                                level: okeanos::events::LogLevel::Warn,
+                                message: "Nothing to undo".to_string(),
+                            },
+                        ));
+                    }
+                }
+                okeanos::ui::UndoRedoAction::Redo => {
+                    if loop_.can_redo() {
+                        if let Err(e) = loop_.redo() {
+                            eprintln!("Redo failed: {}", e);
+                            let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                                okeanos::events::Log {
+                                    level: okeanos::events::LogLevel::Error,
+                                    message: format!("Redo failed: {}", e),
+                                },
+                            ));
+                        } else {
+                            let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                                okeanos::events::Log {
+                                    level: okeanos::events::LogLevel::Info,
+                                    message: "Redo completed".to_string(),
+                                },
+                            ));
+                        }
+                    } else {
+                        let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                            okeanos::events::Log {
+                                level: okeanos::events::LogLevel::Warn,
+                                message: "Nothing to redo".to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
         }
 
         // Check for composer input (user submitted a prompt)
@@ -868,6 +948,10 @@ async fn run_tui_and_loop(
 
         // Handle events from the harness
         tui_app.handle_events_from_loop(&mut loop_).await;
+        // Log events to session manager
+        while let Ok(event) = tui_app.event_rx.try_recv() {
+            session_manager.log_event(event).ok();
+        }
 
         // Check for completed turn
         if tui_app.is_turn_in_progress() && tui_app.pending_decision().is_some() {
@@ -908,6 +992,10 @@ async fn run_tui_and_loop(
 
     // Cleanup
     tui_app.cleanup()?;
+    // Flush session log on exit
+    session_manager
+        .end_session()
+        .context("failed to end session")?;
     Ok(())
 }
 
@@ -992,9 +1080,19 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     // Create event channel for logging
     let (event_tx, mut event_rx) = okeanos::events::event_channel();
 
-    // Create snapshot store for git snapshots
-    let snapshot_store =
-        SnapshotStore::new(&project_root).context("failed to create snapshot store")?;
+    // Create snapshot store for git snapshots (only if enabled via config or CLI)
+    let snapshots_enabled = config
+        .snapshots
+        .as_ref()
+        .and_then(|s| s.enabled)
+        .unwrap_or(false)
+        || cli.snapshots;
+
+    let snapshot_store = if snapshots_enabled {
+        Some(SnapshotStore::new(&project_root).context("failed to create snapshot store")?)
+    } else {
+        None
+    };
 
     // Determine model tier from capabilities
     let model_tier = model_capabilities.tier;
@@ -1135,61 +1233,90 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         ..Default::default()
     };
 
-    // Create and run the ReAct loop with policy + approval wiring + session logging.
+    // Create and run the ReAct loop with policy + approval wiring.
+    // Note: We don't use with_session() here because we need the session_manager
+    // for end_session() at the end. Instead, we manually log events.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
-        .with_approval_receiver(approval_rx)
-        .with_session(session_manager)
-        .with_snapshot_store(snapshot_store);
+        .with_approval_receiver(approval_rx);
+
+    if let Some(store) = snapshot_store {
+        loop_ = loop_.with_snapshot_store(store);
+    }
 
     if let Some(tracker) = cost_tracker {
         loop_ = loop_.with_cost_tracker(tracker);
     }
 
-    // Spawn event logger
-    let logger_handle = tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            match event {
-                Event::Log(log) => {
-                    eprintln!("[{:?}] {}", log.level, log.message);
+    // Run the loop in a separate task so we can process events in the main task
+    let loop_handle = tokio::spawn(async move { loop_.run(prompt).await });
+
+    // Process events in the main task
+    loop {
+        tokio::select! {
+            biased;
+            event = event_rx.recv() => {
+                match event {
+                    Ok(event) => {
+                        // Log event to session manager
+                        session_manager.log_event(event.clone()).ok();
+                        // Print to stderr
+                        match event {
+                            Event::Log(log) => {
+                                eprintln!("[{:?}] {}", log.level, log.message);
+                            }
+                            Event::Status(status) => {
+                                eprintln!(
+                                    "[STATUS] model={} tokens={} cost=${:.4} elapsed={}ms",
+                                    status.model, status.tokens_in, status.cost_usd, status.elapsed_ms
+                                );
+                            }
+                            Event::Message(msg) => {
+                                eprintln!("[{:?}] {}", msg.role, msg.content);
+                            }
+                            Event::ToolCall(call) => {
+                                eprintln!("[TOOL CALL] {} {:?}", call.name, call.args);
+                            }
+                            Event::ToolResult(result) => {
+                                eprintln!(
+                                    "[TOOL RESULT] {} ok={} duration={}ms",
+                                    result.name, result.ok, result.duration_ms
+                                );
+                            }
+                            Event::Error(err) => {
+                                eprintln!("[ERROR] {}: {}", err.code, err.message);
+                            }
+                            Event::ApprovalRequest(req) => {
+                                eprintln!("[APPROVAL REQUIRED] tool={} args={}", req.tool, req.args);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => break, // Channel closed
                 }
-                Event::Status(status) => {
-                    eprintln!(
-                        "[STATUS] model={} tokens={} cost=${:.4} elapsed={}ms",
-                        status.model, status.tokens_in, status.cost_usd, status.elapsed_ms
-                    );
-                }
-                Event::Message(msg) => {
-                    eprintln!("[{:?}] {}", msg.role, msg.content);
-                }
-                Event::ToolCall(call) => {
-                    eprintln!("[TOOL CALL] {} {:?}", call.name, call.args);
-                }
-                Event::ToolResult(result) => {
-                    eprintln!(
-                        "[TOOL RESULT] {} ok={} duration={}ms",
-                        result.name, result.ok, result.duration_ms
-                    );
-                }
-                Event::Error(err) => {
-                    eprintln!("[ERROR] {}: {}", err.code, err.message);
-                }
-                Event::ApprovalRequest(req) => {
-                    eprintln!("[APPROVAL REQUIRED] tool={} args={}", req.tool, req.args);
-                }
-                _ => {}
             }
         }
+    }
+
+    // Wait for the loop result
+    let result = loop_handle.await.unwrap_or_else(|_| {
+        Err(okeanos::harness::react::ReactError::Stopped {
+            reason: "loop task panicked".to_string(),
+        })
     });
 
-    // Run the loop
-    let result = loop_.run(prompt).await;
+    // Process any remaining events and log to session manager
+    while let Ok(event) = event_rx.try_recv() {
+        session_manager.log_event(event).ok();
+    }
+
+    // Flush session log on exit
+    session_manager
+        .end_session()
+        .context("failed to end session")?;
 
     // Shutdown approval handler
     approval_handler.abort();
-
-    // Wait for logger to finish
-    let _ = logger_handle.await;
 
     match result {
         Ok(output) => {
@@ -1349,4 +1476,12 @@ fn run_dry_run(
     println!();
     println!("Dry-run complete. No actions were executed.");
     Ok(())
+}
+
+/// Get current Unix timestamp in milliseconds.
+pub fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
