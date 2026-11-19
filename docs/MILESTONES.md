@@ -460,7 +460,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 12.5 — Model Generation Interruption
 
-**Status:** planned
+**Status:** complete — tagged v0.1.0-milestone-12.5
 
 **Scope:**
 - Wire `run_turn()`'s `shutdown_tx` so the TUI (and headless) can signal an in-turn interrupt — currently the sender is discarded (`_shutdown_tx`), so no key press can reach a running model.
@@ -473,15 +473,20 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 **Out of scope:** Tool execution interruption (already M6); model-provider-level abort beyond reqwest cancellation; thinking-channel cancellation.
 
 **Acceptance criteria:**
-- `Esc` during an in-flight TUI turn cancels model generation and returns to the composer.
-- `ReactError::Interrupted` is returned from `run_turn()` on cancel.
-- `interrupted` JSON event emitted in headless parity.
-- Unit tests for `call_model` cancellation via shutdown signal and `run_turn` interrupt path.
-- `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` pass.
+- ✅ `Esc` during an in-flight TUI turn cancels model generation and returns to the composer.
+- ✅ `ReactError::Interrupted` is returned from `run_turn()` on cancel.
+- ✅ `interrupted` JSON event emitted in headless parity.
+- ✅ Unit tests for `call_model` cancellation via shutdown signal and `run_turn` interrupt path.
+- ✅ `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` pass.
 
 **Testing requirements:** Unit tests for model stream cancellation, `run_turn` interrupt path, TUI Esc key handling. No network (mock provider).
 
-**Definition of Done:** CI green; interruption verified end-to-end in TUI and headless modes; milestone tagged.
+**Definition of Done:** CI green; interruption verified end-to-end in TUI and headless modes; milestone tagged. ✅
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (318 unit tests)
+- `cargo build --release` produces a single binary
+- Tagged v0.1.0-milestone-12.5
 
 ---
 
@@ -579,8 +584,8 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 10 | ✅ Cost budget | 1 | M2, M3, M9 |
 | 11 | ✅ Edit format | 1 | M6, M9 |
 | 12 | ✅ TUI shell | 2–3 | M2, M4, M5, M9, M11 |
-| 12.1 | TUI Configuration & Input UX | 1–2 | M12 |
-| 12.5 | Model generation interruption | 1–2 | M6, M12 |
+| 12.1 | ✅ TUI Configuration & Input UX | 1–2 | M12 |
+| 12.5 | ✅ Model generation interruption | 1–2 | M6, M12 |
 | 13 | Git snapshots + undo/redo (in progress) | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | Apple Silicon support | 1–2 | M0 |
@@ -597,7 +602,6 @@ These issues were identified during M12 design review and gap analysis; most are
 | **Config validation at wrong layer** | `Config::load()` does validation; should be separate `validate()` call for CI gating. | M16: Config layer cleanup |
 
 Items now scheduled in active milestones (removed from this list):
-- Model generation not interruptible → **M12.5** (wire `shutdown_tx`, streaming + `select!` cancel, `Esc` binding, `interrupted` event).
 - `--rpc` flag / `src/headless.rs` / `jsonrpsee` → **M14** (already in scope).
 - Snapshot store uses `git` CLI instead of `gix` → **M13** (added to scope).
 - Session log module not split into `log.rs`/`header.rs`/`resume.rs` → **M13** (added to scope).
@@ -606,8 +610,9 @@ Items now scheduled in active milestones (removed from this list):
 - No in-TUI provider/config configuration → **M12.1** (new milestone below).
 - No visible input composer in main TUI screen → **M12.1** (new milestone below).
 
-New gaps found during review (post-MVP, not yet scheduled):
-- **No `interrupted` event in `Event` enum** (DESIGN.md §7) — tracked as M12.5 acceptance criteria.
+Items completed in M12.5:
+- Model generation not interruptible (wire `shutdown_tx`, streaming + `select!` cancel, `Esc` binding, `interrupted` event).
+- No `interrupted` event in `Event` enum (DESIGN.md §7) — now added.
 - **No thinking channel event** (FR-30): `ModelStreamChunk.thinking` and `ModelResponse.thinking` exist but `Event` has no `Thinking` variant; not replayed into context for small models.
 - **Tiered tool set not implemented** (FR-25): all 6 tools registered for every tier; small models should get minimal set (read, edit, run).
 - **Selective context inclusion not implemented** (FR-26): no ripgrep-based symbol scan / file selection; all context is included.

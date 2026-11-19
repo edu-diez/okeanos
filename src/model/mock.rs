@@ -5,9 +5,9 @@ use crate::model::model_trait::{
 };
 use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
+use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
-use futures::stream::{self};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -215,14 +215,15 @@ impl Model for MockModel {
             content.len().max(1)
         };
 
-        let chunks: Vec<Result<ModelStreamChunk, ModelError>> = content
-            .as_bytes()
-            .chunks(chunk_size)
-            .enumerate()
-            .map(|(i, chunk)| {
+        let total_chunks = content.len().div_ceil(chunk_size);
+        let streaming = self.streaming;
+
+        // Create a stream that yields control between chunks when streaming is enabled
+        let chunk_stream = stream! {
+            for (i, chunk) in content.as_bytes().chunks(chunk_size).enumerate() {
                 let delta = String::from_utf8_lossy(chunk).to_string();
-                let finished = i == content.len().div_ceil(chunk_size) - 1;
-                Ok(ModelStreamChunk {
+                let finished = i == total_chunks - 1;
+                yield Ok(ModelStreamChunk {
                     delta,
                     tool_calls: if finished {
                         response.tool_calls.clone()
@@ -235,10 +236,15 @@ impl Model for MockModel {
                         None
                     },
                     finished,
-                })
-            })
-            .collect();
+                });
 
-        Ok(Box::pin(stream::iter(chunks)))
+                // Yield control between chunks when streaming to allow interruption
+                if streaming {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+
+        Ok(Box::pin(chunk_stream))
     }
 }

@@ -150,6 +150,13 @@ pub struct ErrorEvent {
     pub message: String,
 }
 
+/// A turn interruption event (model generation cancelled by user).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Interrupted {
+    /// Whether the interruption was user-initiated (Esc key) or signal-based (SIGINT).
+    pub user_initiated: bool,
+}
+
 /// Action taken on the configuration modal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -193,6 +200,7 @@ pub enum Event {
     Error(ErrorEvent),
     ConfigModal(ConfigModalEvent),
     ConfigSaved(ConfigSaved),
+    Interrupted(Interrupted),
 }
 
 impl Event {
@@ -260,6 +268,10 @@ impl Event {
             model,
             base_url,
         })
+    }
+
+    pub fn interrupted(user_initiated: bool) -> Self {
+        Event::Interrupted(Interrupted { user_initiated })
     }
 }
 

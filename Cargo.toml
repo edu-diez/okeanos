@@ -31,6 +31,7 @@ rand = "0.8"
 bytes = "1"
 nix = { version = "0.28", features = ["signal"] }
 atty = "0.2"
+async-stream = "0.3"
 
 
 # Optional dependencies (feature-flagged)

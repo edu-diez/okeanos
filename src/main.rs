@@ -726,18 +726,38 @@ async fn run_interactive_tui(
             .event_tx()
             .send(okeanos::events::Event::Message(user_msg));
 
-        // Run first turn
-        match loop_.run_turn(initial_prompt).await {
+        // Mark turn as in progress
+        tui_app.set_turn_in_progress(true);
+
+        // Create shutdown channel for this turn
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        tui_app.turn_shutdown_tx = Some(shutdown_tx);
+
+        // Run first turn with interruptible shutdown
+        match loop_.run_turn(initial_prompt, shutdown_rx).await {
             Ok(decision) => {
                 tui_app.set_pending_decision(decision);
             }
             Err(e) => {
-                eprintln!("Initial turn error: {}", e);
-                tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
-                    e.to_string(),
-                ));
+                // Handle interruption gracefully
+                if matches!(e, okeanos::harness::react::ReactError::Interrupted) {
+                    let _ = loop_
+                        .event_tx()
+                        .send(okeanos::events::Event::interrupted(true));
+                    tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
+                        "Turn cancelled by user".to_string(),
+                    ));
+                } else {
+                    eprintln!("Initial turn error: {}", e);
+                    tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
+                        e.to_string(),
+                    ));
+                }
             }
         }
+
+        // Clear the shutdown sender after the turn
+        tui_app.turn_shutdown_tx = None;
     }
 
     // Run the combined TUI + ReAct loop event loop (single task)
@@ -815,18 +835,35 @@ async fn run_tui_and_loop(
             // Mark turn as in progress
             tui_app.set_turn_in_progress(true);
 
-            // Run a single ReAct turn
-            match loop_.run_turn(user_prompt).await {
+            // Create shutdown channel for this turn
+            let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+            tui_app.turn_shutdown_tx = Some(shutdown_tx);
+
+            // Run a single ReAct turn with interruptible shutdown
+            match loop_.run_turn(user_prompt, shutdown_rx).await {
                 Ok(decision) => {
                     tui_app.set_pending_decision(decision);
                 }
                 Err(e) => {
-                    eprintln!("ReAct turn error: {}", e);
-                    tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
-                        e.to_string(),
-                    ));
+                    // Handle interruption gracefully - emit event and return to composer
+                    if matches!(e, okeanos::harness::react::ReactError::Interrupted) {
+                        let _ = loop_
+                            .event_tx()
+                            .send(okeanos::events::Event::interrupted(true));
+                        tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
+                            "Turn cancelled by user".to_string(),
+                        ));
+                    } else {
+                        eprintln!("ReAct turn error: {}", e);
+                        tui_app.set_pending_decision(okeanos::harness::react::LoopDecision::Stop(
+                            e.to_string(),
+                        ));
+                    }
                 }
             }
+
+            // Clear the shutdown sender after the turn
+            tui_app.turn_shutdown_tx = None;
         }
 
         // Handle events from the harness

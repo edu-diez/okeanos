@@ -16,6 +16,7 @@ use crate::snapshot::store::SnapshotStore;
 use crate::tool::ToolRegistry;
 use crate::tool::tool_trait::ToolCategory;
 use anyhow::Context as _;
+use futures::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -265,6 +266,7 @@ impl<M: Model> ReactLoop<M> {
         loop {
             // Check shutdown signal
             if shutdown_rx.try_recv().is_ok() {
+                self.emit_interrupted(false).await; // Signal-based (SIGINT)
                 return Err(ReactError::Interrupted);
             }
 
@@ -330,7 +332,12 @@ impl<M: Model> ReactLoop<M> {
     /// - Take session start/end snapshots automatically
     ///
     /// The caller is responsible for checking iteration/time limits and context caps.
-    pub async fn run_turn(&mut self, prompt: String) -> Result<LoopDecision, ReactError> {
+    /// The caller provides a shutdown receiver to allow interrupting the model generation.
+    pub async fn run_turn(
+        &mut self,
+        prompt: String,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<LoopDecision, ReactError> {
         // Add user message to conversation
         self.conversation
             .add_user_message(prompt)
@@ -367,10 +374,8 @@ impl<M: Model> ReactLoop<M> {
             .await;
         }
 
-        // Create a shutdown receiver for this turn
-        let (_shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
-
-        // Run exactly one iteration
+        // Run exactly one iteration with the provided shutdown receiver
+        let mut shutdown_rx = shutdown_rx;
         let decision = self.iterate(&mut shutdown_rx).await?;
 
         match &decision {
@@ -389,6 +394,12 @@ impl<M: Model> ReactLoop<M> {
         Ok(decision)
     }
 
+    /// Create a shutdown channel for a turn and return the sender to the caller.
+    /// The caller can use the sender to interrupt the turn (e.g., on Esc key press).
+    pub fn create_turn_shutdown(&self) -> (mpsc::Sender<()>, mpsc::Receiver<()>) {
+        mpsc::channel(1)
+    }
+
     /// Run a single ReAct iteration: think → tool → observe.
     async fn iterate(
         &mut self,
@@ -396,7 +407,7 @@ impl<M: Model> ReactLoop<M> {
     ) -> Result<LoopDecision, ReactError> {
         // THINK: Get model completion
         let model_messages = self.build_model_messages();
-        let response = self.call_model(&model_messages).await?;
+        let response = self.call_model(&model_messages, shutdown_rx).await?;
 
         // Record model usage cost
         if let Some(usage) = &response.usage {
@@ -505,7 +516,7 @@ impl<M: Model> ReactLoop<M> {
                 .await;
 
                 let simpler_messages = self.build_simpler_model_messages();
-                let simpler_response = self.call_model(&simpler_messages).await?;
+                let simpler_response = self.call_model(&simpler_messages, shutdown_rx).await?;
 
                 // Add assistant message from fallback attempt.
                 self.conversation
@@ -682,7 +693,15 @@ impl<M: Model> ReactLoop<M> {
     /// Permanent errors (auth failure, invalid request, missing capability,
     /// model not found, context length) are returned immediately without
     /// retry. Every retry attempt is logged as an event.
-    async fn call_model(&mut self, messages: &[ModelMessage]) -> Result<ModelResponse, ModelError> {
+    ///
+    /// This method uses streaming and is interruptible via the shutdown receiver.
+    /// If the shutdown signal is received, the in-flight request is aborted and
+    /// `ReactError::Interrupted` is returned.
+    async fn call_model(
+        &mut self,
+        messages: &[ModelMessage],
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<ModelResponse, ReactError> {
         let retry_policy = self.config.retry_policy.clone();
         let mut attempt = 0usize;
 
@@ -695,16 +714,28 @@ impl<M: Model> ReactLoop<M> {
         };
 
         loop {
-            match self
-                .model
-                .complete(
+            // Get a streaming response from the model
+            let stream_result = tokio::select! {
+                biased;
+                result = self.model.stream(
                     messages,
                     &self.config.generation_params,
                     native_tools.as_deref(),
-                )
-                .await
-            {
-                Ok(response) => return Ok(response),
+                ) => result,
+                _ = shutdown_rx.recv() => {
+                    // Interrupt signal received - abort the request
+                    self.emit_log(
+                        LogLevel::Warn,
+                        "Model generation interrupted by user".to_string(),
+                    )
+                    .await;
+                    self.emit_interrupted(false).await;
+                    return Err(ReactError::Interrupted);
+                }
+            };
+
+            let mut stream = match stream_result {
+                Ok(s) => s,
                 Err(error) => {
                     let retryable = retry_policy.classify(&error);
                     if retryable == RetryDecision::Retry && attempt < retry_policy.max_retries {
@@ -726,9 +757,94 @@ impl<M: Model> ReactLoop<M> {
                         attempt += 1;
                         continue;
                     }
-                    return Err(error);
+                    return Err(ReactError::Model(error));
+                }
+            };
+
+            // Consume the stream, emitting Token events and building the response
+            let mut content = String::new();
+            let mut tool_calls: Option<Vec<ToolCall>> = None;
+            let mut thinking: Option<String> = None;
+            let mut usage: Option<crate::model::Usage> = None;
+            let mut finished = false;
+
+            while !finished {
+                let chunk_result = tokio::select! {
+                    biased;
+                    chunk = stream.next() => chunk,
+                    _ = shutdown_rx.recv() => {
+                        // Interrupt signal received during streaming
+                        self.emit_log(
+                            LogLevel::Warn,
+                            "Model generation interrupted by user".to_string(),
+                        )
+                        .await;
+                        self.emit_interrupted(false).await;
+                        return Err(ReactError::Interrupted);
+                    }
+                };
+
+                match chunk_result {
+                    Some(Ok(chunk)) => {
+                        // Emit token delta event for TUI streaming render
+                        if !chunk.delta.is_empty() {
+                            let token_event = crate::events::Event::token(
+                                chunk.delta.clone(),
+                                current_timestamp(),
+                            );
+                            let _ = self.event_tx.send(token_event.clone());
+                            if let Some(session) = &mut self.session {
+                                let _ = session.log_event(token_event);
+                            }
+                            content.push_str(&chunk.delta);
+                        }
+
+                        if let Some(tc) = chunk.tool_calls {
+                            tool_calls = Some(tc);
+                        }
+                        if let Some(th) = chunk.thinking {
+                            thinking = Some(th);
+                        }
+                        if chunk.finished {
+                            finished = true;
+                            // Usage is not available in streaming chunks; we'd need a final response
+                            // For now, estimate from content
+                            usage = Some(crate::model::Usage {
+                                prompt_tokens: 0, // Would need to be computed
+                                completion_tokens: crate::context::tokens::TokenCounter
+                                    .count(&content),
+                                total_tokens: crate::context::tokens::TokenCounter.count(&content),
+                            });
+                        }
+                    }
+                    Some(Err(e)) => return Err(ReactError::Model(e)),
+                    None => {
+                        // Stream ended without finished=true
+                        finished = true;
+                        usage = Some(crate::model::Usage {
+                            prompt_tokens: 0,
+                            completion_tokens: crate::context::tokens::TokenCounter.count(&content),
+                            total_tokens: crate::context::tokens::TokenCounter.count(&content),
+                        });
+                    }
                 }
             }
+
+            return Ok(ModelResponse {
+                content,
+                tool_calls,
+                thinking,
+                usage,
+            });
+        }
+    }
+
+    /// Emit an interrupted event to the event stream.
+    async fn emit_interrupted(&mut self, user_initiated: bool) {
+        let event = crate::events::Event::interrupted(user_initiated);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
         }
     }
 
@@ -2019,5 +2135,155 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(found_warning, "expected per-turn warning event");
+    }
+
+    /// Test that run_turn can be interrupted via shutdown signal during model generation.
+    #[tokio::test]
+    async fn test_run_turn_interrupted_during_model_generation() {
+        // Create a mock model that streams slowly (small chunk size)
+        let mut model = MockModel::small("test-model");
+        model.set_streaming(true);
+        // Push a long response that will be streamed in chunks
+        model.push_response(MockModel::text_response(
+            "This is a very long response that will be streamed in multiple chunks so we have time to interrupt it. ".repeat(10),
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        let mut loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx);
+
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = loop_.create_turn_shutdown();
+
+        // Start the turn in a background task
+        let turn_handle =
+            tokio::spawn(async move { loop_.run_turn("Test prompt".into(), shutdown_rx).await });
+
+        // Send interrupt signal immediately (race with stream consumption)
+        shutdown_tx
+            .send(())
+            .await
+            .expect("failed to send interrupt");
+
+        // Wait for the turn to complete
+        let result = turn_handle.await.expect("turn task panicked");
+
+        // Should return Interrupted error
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::Interrupted => {}
+            e => panic!("expected Interrupted error, got: {e:?}"),
+        }
+
+        // Check that interrupted event was emitted
+        let mut found_interrupted = false;
+        for _ in 0..50 {
+            if let Ok(event) = event_rx.try_recv()
+                && matches!(event, crate::events::Event::Interrupted(_))
+            {
+                found_interrupted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(found_interrupted, "expected interrupted event");
+    }
+
+    /// Test that run_turn completes normally when not interrupted.
+    #[tokio::test]
+    async fn test_run_turn_completes_normally() {
+        let model = MockModel::small("test-model");
+        model.push_response(MockModel::text_response("Task complete"));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, _) = crate::events::event_channel();
+
+        let mut loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx);
+
+        // Create shutdown channel but don't send on it
+        let (_shutdown_tx, shutdown_rx) = loop_.create_turn_shutdown();
+
+        let result = loop_.run_turn("Test prompt".into(), shutdown_rx).await;
+
+        // Should complete successfully
+        assert!(result.is_ok());
+        match result.unwrap() {
+            LoopDecision::Complete(content) => assert!(content.contains("Task complete")),
+            d => panic!("expected Complete, got: {d:?}"),
+        }
+    }
+
+    /// Test that run (full loop) can be interrupted via shutdown signal.
+    #[tokio::test]
+    async fn test_run_interrupted_via_signal() {
+        // Create a mock model that streams slowly
+        let mut model = MockModel::small("test-model");
+        model.set_streaming(true);
+        model.push_response(MockModel::text_response(
+            "This is a very long response that will be streamed in multiple chunks. ".repeat(10),
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
+        let tools = ToolRegistry::new();
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        // Create loop with external shutdown receiver
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let mut loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx)
+            .with_shutdown(shutdown_rx);
+
+        // Start the run in a background task
+        let run_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
+
+        // Send interrupt signal immediately (simulating SIGINT)
+        shutdown_tx
+            .send(())
+            .await
+            .expect("failed to send interrupt");
+
+        // Wait for the run to complete
+        let result = run_handle.await.expect("run task panicked");
+
+        // Should return Interrupted error
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::Interrupted => {}
+            e => panic!("expected Interrupted error, got: {e:?}"),
+        }
+
+        // Check that interrupted event was emitted (signal-based = false)
+        let mut found_interrupted = false;
+        for _ in 0..50 {
+            if let Ok(event) = event_rx.try_recv()
+                && let crate::events::Event::Interrupted(interrupted) = event
+                && !interrupted.user_initiated
+            {
+                found_interrupted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            found_interrupted,
+            "expected interrupted event with user_initiated=false"
+        );
     }
 }

@@ -62,6 +62,8 @@ pub struct TerminalApp {
     pub pending_decision: Option<crate::harness::react::LoopDecision>,
     /// Whether a provider is configured (from config load or config save)
     pub provider_configured: bool,
+    /// Shutdown sender for the current turn (to interrupt model generation)
+    pub turn_shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
 impl TerminalApp {
@@ -163,6 +165,7 @@ impl TerminalApp {
             turn_in_progress: false,
             pending_decision: None,
             provider_configured: false,
+            turn_shutdown_tx: None,
         })
     }
 
@@ -513,7 +516,10 @@ impl TerminalApp {
                 if self.turn_in_progress {
                     // Ctrl+C during turn: cancel the turn
                     self.input_composer.set_error("Cancelled".to_string());
-                    // The harness will handle the interrupt via shutdown signal
+                    // Send interrupt signal if we have a shutdown sender
+                    if let Some(tx) = self.turn_shutdown_tx.take() {
+                        let _ = tx.send(()).await;
+                    }
                 } else {
                     // Ctrl+C at idle: exit
                     self.running = false;
@@ -534,6 +540,17 @@ impl TerminalApp {
                     self.running = false;
                 }
                 return Ok(true);
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) if self.turn_in_progress => {
+                // Esc during turn: interrupt model generation
+                self.input_composer.set_error("Turn cancelled".to_string());
+                if let Some(tx) = self.turn_shutdown_tx.take() {
+                    let _ = tx.send(()).await;
+                }
+                return Ok(true);
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                // Esc at idle: no-op (welcome screen handled above)
             }
             _ => {}
         }
