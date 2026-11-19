@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 not started, Milestone 15 not started.
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 not started.
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -525,10 +525,12 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 14 — Headless/RPC mode
 
+**Status:** complete — tagged v0.1.0-milestone-14
+
 **Scope:**
 - **Shared event emitter**: extract `src/headless.rs` with `EventEmitter` used by both TUI and headless mode (eliminate duplicate event logging in `main.rs`).
 - `--headless`: no terminal; JSON event stream to stdout identical to TUI events.
-- `--rpc`: JSON-RPC over stdio (feature-gated `jsonrpsee` server); optional HTTP transport behind `rpc` feature; add `jsonrpsee` to Cargo.toml `rpc` feature.
+- `--rpc`: JSON-RPC over TCP (feature-gated `jsonrpsee` server); add `jsonrpsee` to Cargo.toml `rpc` feature.
 - ReAct loop driven identically in all three modes; mode is a renderer/transport choice only.
 - RPC accepts `approve`/`deny` commands resolving pending approvals.
 - Slash command support via JSON events: `/help`, `/todos`, `/logs`, `/undo`, `/redo` emitted as structured events for script consumption.
@@ -548,7 +550,13 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 **Testing requirements:** Event-parity test across modes; RPC request/response round-trip tests; headless.rs unit tests.
 
-**Definition of Done:** CI green; parity test covers every event in DESIGN.md §7; milestone tagged.
+**Definition of Done:** CI green; parity test covers every event in DESIGN.md §7; milestone tagged. ✓
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (311 unit tests)
+- `cargo build --release` produces a single binary
+- `cargo build --release --features rpc` produces a single binary with RPC support
+- Tagged v0.1.0-milestone-14
 
 ---
 
