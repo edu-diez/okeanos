@@ -18,7 +18,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+toml = { version = "0.8", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 async-trait = "0.1"
@@ -45,8 +45,9 @@ jsonrpsee = { version = "0.24", optional = true, features = ["ws-client", "http-
 tempfile = "3.15"
 
 [features]
-default = ["tui"]
+default = ["tui", "config-file"]
 tui = ["ratatui", "crossterm"]
+config-file = ["toml"]
 rpc = ["jsonrpsee"]
 mcp = []
 mock-provider = []

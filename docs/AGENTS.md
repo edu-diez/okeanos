@@ -34,6 +34,7 @@ Concise rules for AI-assisted work on this repo. Docs-only project at this phase
 - User-facing strings: externalized, reviewed for copy; copy changes are mechanical only — do not alter visuals.
 - When a milestone completes, update MILESTONES.md Definition of Done and tag the release.
 - Keep docs concise: prefer one page per phase (already done). Do not duplicate spec content across files.
+- **Versioning**: see MILESTONES.md "Versioning Strategy" — pre-MVP uses `v0.1.0-milestone-N` tags; MVP release = `0.1.0`/`v0.1.0`; post-MVP minor bump per feature milestone (`0.2.0`, `0.3.0`…); stay in `0.x` until stability commitment.
 
 ## Testing requirements
 

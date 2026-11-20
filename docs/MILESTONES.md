@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -642,6 +642,8 @@ Four items marked "completed in M12.5" but not actually implemented — these ar
 
 ## Milestone 17 — Config layer cleanup
 
+**Status:** complete — tagged v0.1.0-milestone-17
+
 **Scope:**
 - Move `toml` crate to CLI-only dependency (optional feature or separate crate).
 - Split config loading from validation.
@@ -652,13 +654,22 @@ Four items marked "completed in M12.5" but not actually implemented — these ar
 
 **Acceptance criteria:**
 - `toml` not in harness `lib` dependencies (only in `cli`/`config` layer)
-- `Config::load()` returns raw config; `Config::validate()` separate call
+- `Config::load_raw()` returns raw config; `Config::validate()` separate call
 - CI runs `okeanos config validate` as a gate
 - No secrets in validation logs/output
 
 **Testing requirements:** Unit tests for validation separation, secret redaction in validation output. Verify `cargo tree` shows `toml` only in CLI path.
 
-**Definition of Done:** CI green; dependency layering compliant with ARCHITECTURE.md; milestone tagged.
+**Definition of Done:** CI green; dependency layering compliant with ARCHITECTURE.md; milestone tagged. ✅
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (313 unit tests)
+- `cargo build --release` produces a single binary
+- `cargo build --lib --no-default-features` compiles without `toml` in dependency tree
+- `Config::load_raw()` loads config without validation; `Config::validate()` validates separately
+- `okeanos config validate` works as CI gate
+- Secrets redacted in validation output (`***REDACTED***`)
+- Tagged v0.1.0-milestone-17
 
 ---
 
@@ -765,7 +776,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | ✅ Apple Silicon support | 1–2 | M0 |
 | 16 | ✅ MVP completion (actual gaps) | 2–3 | M12, M12.5, M13 |
-| 17 | Config layer cleanup | 1 | M1 |
+| 17 | ✅ Config layer cleanup | 1 | M1 |
 
 **Post-MVP (independent, can parallelize):**
 | Milestone | Deliverable | Sessions (est.) | Depends on |
@@ -790,3 +801,55 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 **M17 (Config cleanup)** is architectural hygiene; it can happen anytime after M16 or in parallel with post-MVP work.
 
 **Post-MVP milestones are small by design** — 1–3 sessions each, single testable deliverable. No "big bang" milestones.
+
+---
+
+## Versioning Strategy
+
+### Current State (Pre-MVP)
+- **`Cargo.toml` version**: `0.1.0` (pre-1.0, pre-release)
+- **Milestone tags**: `v0.1.0-milestone-N` — lightweight git tags for each completed milestone
+- **No crates.io publishes** until MVP release
+
+### Post-MVP: Semantic Versioning (Cargo Convention)
+Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay in `0.x` until API/CLI/config are genuinely stable.
+
+| Phase | Cargo Version | Git Tag | Trigger |
+|-------|---------------|---------|---------|
+| **MVP Release** | `0.1.0` | `v0.1.0` | After M17 complete, CI green, ready for external use |
+| **Post-MVP feature milestones** | `0.2.0`, `0.3.0`, `0.4.0`… | `v0.2.0`, `v0.3.0`, `v0.4.0`… | Each independent milestone (M18, M19, M20…) |
+| **Breaking changes** (CLI flags, config schema, public Rust API) | Minor bump (`0.x.0`) | `v0.x.0` | Any user-facing breaking change |
+| **Bug fixes only** | Patch bump (`0.x.y`) | `v0.x.y` | Non-breaking fixes |
+| **Stability commitment** | `1.0.0` | `v1.0.0` | When willing to guarantee semver stability |
+
+### Milestone → Version Mapping (Post-MVP)
+| Milestone | Version | Notes |
+|-----------|---------|-------|
+| M18 Context compaction | `0.2.0` | First post-MVP feature |
+| M19 Additional providers | `0.3.0` | Can be parallel with M18 → combine if shipped together |
+| M20 WebSocket RPC | `0.4.0` | |
+| M21 MCP client | `0.5.0` | |
+| M22 Session log rotation | `0.6.0` | |
+| M23 Tool result caching | `0.7.0` | |
+| M24 Expensive call confirmation | `0.8.0` | |
+| M25 Tree-sitter scanning | `0.9.0` | |
+| M26 Markdown rendering | `0.10.0` | |
+| M27 Multi-agent delegation | `0.11.0` | |
+| … | `0.x.0` | One minor per independent feature milestone |
+
+**If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
+
+### Release Process
+1. Complete milestone → all tests pass → CI green
+2. Update `Cargo.toml` version (minor bump for features, patch for fixes)
+3. Update `CHANGELOG.md` (if one exists) or rely on milestone tags
+4. `git tag vX.Y.Z`
+5. Push tag → CI builds release artifacts (musl binary, macOS binaries)
+6. Optional: `cargo publish` to crates.io when ready for public consumption
+
+### Rationale
+- **`0.x` series** = explicit "not yet stable" signal to users (Cargo convention)
+- **Minor per milestone** = each post-MVP milestone adds meaningful user-facing functionality
+- **No patch versions pre-1.0** unless users depend on specific behavior
+- **Tags match versions** = `git tag v0.2.0` for `0.2.0` release
+- **Milestone tags preserved** = `v0.1.0-milestone-N` remain as internal checkpoints

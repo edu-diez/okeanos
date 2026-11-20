@@ -5,18 +5,168 @@
 //! from the CWD to the git root. Project-local values override global ones.
 //! Secret references (`{env:VAR}`, `{file:path}`) are substituted at load time;
 //! a missing or unreadable secret fails the load closed.
+//!
+//! This module is feature-gated behind `config-file` (enabled by default).
+//! When the feature is disabled, only programmatic config construction is available.
 
 mod secret;
 
-use serde::Deserialize;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "config-file")]
+pub mod file_load {
+    use super::*;
+    use std::fs;
+
+    /// Deep-merge two TOML values. Tables are merged recursively; for any other
+    /// type, `overlay` wins.
+    fn deep_merge(base: toml::Value, overlay: toml::Value) -> toml::Value {
+        match (base, overlay) {
+            (toml::Value::Table(mut base_map), toml::Value::Table(overlay_map)) => {
+                for (k, v) in overlay_map {
+                    if let Some(existing) = base_map.get_mut(&k) {
+                        let existing_clone = existing.clone();
+                        *existing = deep_merge(existing_clone, v);
+                    } else {
+                        base_map.insert(k, v);
+                    }
+                }
+                toml::Value::Table(base_map)
+            }
+            (_, overlay) => overlay,
+        }
+    }
+
+    fn read_file(path: &Path) -> Result<String, ConfigError> {
+        fs::read_to_string(path).map_err(|e| ConfigError::IoRead {
+            path: path.display().to_string(),
+            source: e,
+        })
+    }
+
+    fn parse_toml(path: &Path, text: &str) -> Result<toml::Value, ConfigError> {
+        toml::from_str(text).map_err(|e| ConfigError::InvalidToml {
+            path: path.display().to_string(),
+            source: e,
+        })
+    }
+
+    /// Walk `value` and substitute secret references in every string, tracking the
+    /// dotted key path for error messages.
+    fn substitute_secrets(value: &mut toml::Value, key_path: &str) -> Result<(), ConfigError> {
+        match value {
+            toml::Value::String(s) => {
+                *s = secret::substitute(s, key_path)?;
+            }
+            toml::Value::Array(items) => {
+                for (idx, item) in items.iter_mut().enumerate() {
+                    let kp = if key_path.is_empty() {
+                        format!("[{idx}]")
+                    } else {
+                        format!("{key_path}[{idx}]")
+                    };
+                    substitute_secrets(item, &kp)?;
+                }
+            }
+            toml::Value::Table(map) => {
+                for (k, val) in map.iter_mut() {
+                    let kp = if key_path.is_empty() {
+                        k.to_string()
+                    } else {
+                        format!("{key_path}.{k}")
+                    };
+                    substitute_secrets(val, &kp)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn load_from_raw(
+        global: Option<&Path>,
+        project: Option<&Path>,
+    ) -> Result<Config, ConfigError> {
+        let mut merged = toml::Value::Table(Default::default());
+
+        if let Some(path) = global {
+            let text = read_file(path)?;
+            let value = parse_toml(path, &text)?;
+            merged = deep_merge(merged, value);
+        }
+
+        if let Some(path) = project {
+            let text = read_file(path)?;
+            let value = parse_toml(path, &text)?;
+            merged = deep_merge(merged, value);
+        }
+
+        substitute_secrets(&mut merged, "")?;
+
+        let toml_string = toml::to_string(&merged).map_err(|e| ConfigError::Validation {
+            message: format!("failed to serialize merged configuration: {e}"),
+        })?;
+        let config: Config = toml::from_str(&toml_string).map_err(|e| ConfigError::Validation {
+            message: format!("failed to deserialize configuration: {e}"),
+        })?;
+
+        Ok(config)
+    }
+
+    /// Discover the XDG global config path.
+    pub fn discover_global_config() -> Option<PathBuf> {
+        let config_home = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| format!("{h}/.config"))
+                    .unwrap_or_else(|_| ".config".to_string())
+            });
+        let path = Path::new(&config_home).join("okeanos").join("config.toml");
+        if path.is_file() { Some(path) } else { None }
+    }
+
+    /// Discover the project-local config by walking up from `start_dir` (or CWD) to the git root.
+    ///
+    /// Returns the first `okeanos.toml` found (closest to `start_dir`). Walking stops at
+    /// the directory containing a `.git` entry (the git root) or at the filesystem
+    /// root.
+    pub fn discover_project_config(start_dir: Option<&Path>) -> Option<PathBuf> {
+        let mut dir = start_dir
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())?;
+        loop {
+            let candidate = dir.join("okeanos.toml");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if dir.join(".git").exists() {
+                break;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        None
+    }
+}
+
+// Re-export discovery functions for use in main.rs when config-file feature is enabled
+#[cfg(feature = "config-file")]
+pub use file_load::{discover_global_config, discover_project_config};
+
+use crate::model::{ModelCapabilities, ModelTier};
+use crate::tool::builtin::EditFormat;
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "config-file")]
+use std::path::Path;
+use std::path::PathBuf;
 use thiserror::Error;
 
-/// Top-level configuration, populated from layered TOML files.
+/// Top-level configuration, populated from layered TOML files or programmatically.
 ///
 /// All fields are optional so that partial configs are valid; missing fields
 /// are filled in by subsystem defaults later in the pipeline.
-#[derive(Clone, Deserialize, Default)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub model: Option<ModelSection>,
@@ -68,7 +218,7 @@ impl std::fmt::Debug for RedactedProviderSection<'_> {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ModelSection {
     pub name: Option<String>,
     pub tier: Option<String>,
@@ -86,7 +236,7 @@ pub struct ModelSection {
 /// Explicit model capabilities declaration for local/self-hosted models.
 /// Required for models not in the known providers table.
 /// Fail closed if required capabilities are missing for self-hosted models.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ModelCapabilitiesSection {
     /// Model supports native JSON function calling.
     pub tool_calling: Option<bool>,
@@ -107,14 +257,15 @@ pub struct ModelCapabilitiesSection {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProviderSection {
     pub kind: Option<String>,
     pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ContextSection {
     pub cap: Option<usize>,
     pub max_iterations: Option<usize>,
@@ -122,23 +273,23 @@ pub struct ContextSection {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PermissionsSection {
     pub allow_list: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CostSection {
     pub session_cap_usd: Option<f64>,
     pub per_turn_warning_usd: Option<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct UiSection {
     pub theme: Option<String>, // "dark" or "light"
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SnapshotsSection {
     /// Enable git snapshots (default: false - opt-in)
     pub enabled: Option<bool>,
@@ -147,11 +298,13 @@ pub struct SnapshotsSection {
 /// Errors raised while loading or validating configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[cfg(feature = "config-file")]
     #[error("invalid TOML in {path}: {source}")]
     InvalidToml {
         path: String,
         source: toml::de::Error,
     },
+    #[cfg(feature = "config-file")]
     #[error("cannot read config file {path}: {source}")]
     IoRead {
         path: String,
@@ -177,45 +330,40 @@ pub enum ConfigError {
 impl Config {
     /// Load the global (XDG) config, overlay the project-local config, substitute
     /// secrets, and validate.
+    ///
+    /// This is a convenience method that calls `load_raw()` then `validate()`.
+    #[cfg(feature = "config-file")]
     pub fn load(root: Option<&Path>) -> Result<Self, ConfigError> {
-        let global = discover_global_config();
-        let project = discover_project_config(root);
-        Self::load_from(global.as_deref(), project.as_deref())
-    }
-
-    /// Load from explicit paths (primarily for tests).
-    pub fn load_from(global: Option<&Path>, project: Option<&Path>) -> Result<Self, ConfigError> {
-        let mut merged = toml::Value::Table(Default::default());
-
-        if let Some(path) = global {
-            let text = read_file(path)?;
-            let value = parse_toml(path, &text)?;
-            merged = deep_merge(merged, value);
-        }
-
-        if let Some(path) = project {
-            let text = read_file(path)?;
-            let value = parse_toml(path, &text)?;
-            merged = deep_merge(merged, value);
-        }
-
-        substitute_secrets(&mut merged, "")?;
-
-        let toml_string = toml::to_string(&merged).map_err(|e| ConfigError::Validation {
-            message: format!("failed to serialize merged configuration: {e}"),
-        })?;
-        let config: Config = toml::from_str(&toml_string).map_err(|e| ConfigError::Validation {
-            message: format!("failed to deserialize configuration: {e}"),
-        })?;
-
-        // Validate after deserialization
+        let config = Self::load_raw(root)?;
         config.validate()?;
-
         Ok(config)
     }
 
+    /// Load configuration from files without validation.
+    ///
+    /// Use `validate()` separately to enable CI gating without loading files.
+    #[cfg(feature = "config-file")]
+    pub fn load_raw(root: Option<&Path>) -> Result<Self, ConfigError> {
+        let global = discover_global_config();
+        let project = discover_project_config(root);
+        Self::load_from_raw(global.as_deref(), project.as_deref())
+    }
+
+    /// Load from explicit paths without validation (primarily for tests).
+    #[cfg(feature = "config-file")]
+    pub fn load_from_raw(
+        global: Option<&Path>,
+        project: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        file_load::load_from_raw(global, project)
+    }
+
     /// Validate configuration values after deserialization.
-    fn validate(&self) -> Result<(), ConfigError> {
+    ///
+    /// This is a public method so CI can gate on `okeanos config validate`
+    /// without needing to load files (when using programmatic config).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Validate context section
         if let Some(ctx) = &self.context {
             if let Some(cap) = ctx.cap
                 && cap == 0
@@ -240,6 +388,7 @@ impl Config {
             }
         }
 
+        // Validate cost section
         if let Some(cost) = &self.cost {
             if let Some(session_cap) = cost.session_cap_usd
                 && session_cap < 0.0
@@ -257,6 +406,7 @@ impl Config {
             }
         }
 
+        // Validate model section
         if let Some(model) = &self.model {
             // If model name is explicitly set and it's not a known model, require explicit capabilities
             let is_known_model = model.name.as_ref().is_some_and(|n| {
@@ -285,17 +435,20 @@ impl Config {
 
                 if caps.tool_calling.is_none() {
                     return Err(ConfigError::Validation {
-                        message: "model.capabilities.tool_calling must be explicitly set for local/self-hosted models".to_string(),
+                        message: "model.capabilities.tool_calling must be explicitly set for local/self-hosted models"
+                            .to_string(),
                     });
                 }
                 if caps.structured_output.is_none() {
                     return Err(ConfigError::Validation {
-                        message: "model.capabilities.structured_output must be explicitly set for local/self-hosted models".to_string(),
+                        message: "model.capabilities.structured_output must be explicitly set for local/self-hosted models"
+                            .to_string(),
                     });
                 }
                 if caps.thinking.is_none() {
                     return Err(ConfigError::Validation {
-                        message: "model.capabilities.thinking must be explicitly set for local/self-hosted models".to_string(),
+                        message: "model.capabilities.thinking must be explicitly set for local/self-hosted models"
+                            .to_string(),
                     });
                 }
                 // Check max_context from capabilities section or model section
@@ -358,6 +511,7 @@ impl Config {
             }
         }
 
+        // Validate provider section
         if let Some(provider) = &self.provider
             && let Some(kind) = &provider.kind
             && kind != "openai-compatible"
@@ -373,10 +527,7 @@ impl Config {
     /// Convert config sections to ModelCapabilities, with fallback to known model defaults.
     /// If `api_key` is provided and no explicit capabilities are set, attempts to discover
     /// model metadata from OpenRouter (async version recommended for discovery).
-    pub fn to_model_capabilities(&self, _api_key: Option<&str>) -> crate::model::ModelCapabilities {
-        use crate::model::{ModelCapabilities, ModelTier};
-        use crate::tool::builtin::EditFormat;
-
+    pub fn to_model_capabilities(&self, _api_key: Option<&str>) -> ModelCapabilities {
         let mut caps = ModelCapabilities::default();
 
         // Start with tier-based defaults
@@ -459,13 +610,7 @@ impl Config {
     }
 
     /// Async version that uses OpenRouter discovery when API key is available.
-    pub async fn to_model_capabilities_async(
-        &self,
-        api_key: Option<&str>,
-    ) -> crate::model::ModelCapabilities {
-        use crate::model::{ModelCapabilities, ModelTier};
-        use crate::tool::builtin::EditFormat;
-
+    pub async fn to_model_capabilities_async(&self, api_key: Option<&str>) -> ModelCapabilities {
         let mut caps = ModelCapabilities::default();
 
         let tier = self
@@ -537,109 +682,6 @@ impl Config {
 
         caps
     }
-}
-
-/// Discover the XDG global config path.
-fn discover_global_config() -> Option<PathBuf> {
-    let config_home = std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(|h| format!("{h}/.config"))
-                .unwrap_or_else(|_| ".config".to_string())
-        });
-    let path = Path::new(&config_home).join("okeanos").join("config.toml");
-    if path.is_file() { Some(path) } else { None }
-}
-
-/// Discover the project-local config by walking up from `start_dir` (or CWD) to the git root.
-///
-/// Returns the first `okeanos.toml` found (closest to `start_dir`). Walking stops at
-/// the directory containing a `.git` entry (the git root) or at the filesystem
-/// root.
-fn discover_project_config(start_dir: Option<&Path>) -> Option<PathBuf> {
-    let mut dir = start_dir
-        .map(|p| p.to_path_buf())
-        .or_else(|| std::env::current_dir().ok())?;
-    loop {
-        let candidate = dir.join("okeanos.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if dir.join(".git").exists() {
-            break;
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
-}
-
-fn read_file(path: &Path) -> Result<String, ConfigError> {
-    std::fs::read_to_string(path).map_err(|e| ConfigError::IoRead {
-        path: path.display().to_string(),
-        source: e,
-    })
-}
-
-fn parse_toml(path: &Path, text: &str) -> Result<toml::Value, ConfigError> {
-    toml::from_str(text).map_err(|e| ConfigError::InvalidToml {
-        path: path.display().to_string(),
-        source: e,
-    })
-}
-
-/// Deep-merge two TOML values. Tables are merged recursively; for any other
-/// type, `overlay` wins.
-fn deep_merge(base: toml::Value, overlay: toml::Value) -> toml::Value {
-    match (base, overlay) {
-        (toml::Value::Table(mut base_map), toml::Value::Table(overlay_map)) => {
-            for (k, v) in overlay_map {
-                if let Some(existing) = base_map.get_mut(&k) {
-                    let existing_clone = existing.clone();
-                    *existing = deep_merge(existing_clone, v);
-                } else {
-                    base_map.insert(k, v);
-                }
-            }
-            toml::Value::Table(base_map)
-        }
-        (_, overlay) => overlay,
-    }
-}
-
-/// Walk `value` and substitute secret references in every string, tracking the
-/// dotted key path for error messages.
-fn substitute_secrets(value: &mut toml::Value, key_path: &str) -> Result<(), ConfigError> {
-    match value {
-        toml::Value::String(s) => {
-            *s = secret::substitute(s, key_path)?;
-        }
-        toml::Value::Array(items) => {
-            for (idx, item) in items.iter_mut().enumerate() {
-                let kp = if key_path.is_empty() {
-                    format!("[{idx}]")
-                } else {
-                    format!("{key_path}[{idx}]")
-                };
-                substitute_secrets(item, &kp)?;
-            }
-        }
-        toml::Value::Table(map) => {
-            for (k, val) in map.iter_mut() {
-                let kp = if key_path.is_empty() {
-                    k.to_string()
-                } else {
-                    format!("{key_path}.{k}")
-                };
-                substitute_secrets(val, &kp)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -770,32 +812,36 @@ mod tests {
         assert_eq!(result.unwrap(), "https://example.com:443");
     }
 
-    #[test]
-    fn test_load_empty_config_valid() {
-        let config = Config::load_from(None, None).expect("empty config should load");
-        assert!(config.model.is_none());
-        assert!(config.provider.is_none());
-    }
+    #[cfg(feature = "config-file")]
+    mod file_tests {
+        use super::*;
 
-    #[test]
-    fn test_load_invalid_toml_rejected() {
-        let dir = tmp_dir();
-        let bad_path = dir.join("bad.toml");
-        write_file(&bad_path, "this is not = valid toml [[[");
-        let result = Config::load_from(None, Some(&bad_path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("invalid TOML"));
-    }
+        #[test]
+        fn test_load_empty_config_valid() {
+            let config = Config::load_from_raw(None, None).expect("empty config should load");
+            assert!(config.model.is_none());
+            assert!(config.provider.is_none());
+        }
 
-    #[test]
-    fn test_load_project_overrides_global() {
-        let dir = tmp_dir();
-        let global_path = dir.join("global.toml");
-        let project_path = dir.join("okeanos.toml");
-        write_file(
-            &global_path,
-            r#"
+        #[test]
+        fn test_load_invalid_toml_rejected() {
+            let dir = tmp_dir();
+            let bad_path = dir.join("bad.toml");
+            write_file(&bad_path, "this is not = valid toml [[[");
+            let result = Config::load_from_raw(None, Some(&bad_path));
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("invalid TOML"));
+        }
+
+        #[test]
+        fn test_load_project_overrides_global() {
+            let dir = tmp_dir();
+            let global_path = dir.join("global.toml");
+            let project_path = dir.join("okeanos.toml");
+            write_file(
+                &global_path,
+                r#"
 [provider]
 kind = "openai-compatible"
 base_url = "https://global.example.com"
@@ -805,421 +851,438 @@ api_key = "{env:OKEANOS_GLOBAL_KEY}"
 cap = 4096
 max_iterations = 10
 "#,
-        );
-        write_file(
-            &project_path,
-            r#"
+            );
+            write_file(
+                &project_path,
+                r#"
 [provider]
 base_url = "https://project.example.com"
 
 [context]
 cap = 8192
 "#,
-        );
-        unsafe {
-            std::env::set_var("OKEANOS_GLOBAL_KEY", "gk");
-        }
-        let config = Config::load_from(Some(&global_path), Some(&project_path))
-            .expect("layered config should load");
-        unsafe {
-            std::env::remove_var("OKEANOS_GLOBAL_KEY");
+            );
+            unsafe {
+                std::env::set_var("OKEANOS_GLOBAL_KEY", "gk");
+            }
+            let config = Config::load_from_raw(Some(&global_path), Some(&project_path))
+                .expect("layered config should load");
+            unsafe {
+                std::env::remove_var("OKEANOS_GLOBAL_KEY");
+            }
+
+            // project overrides global for base_url
+            assert_eq!(
+                config.provider.as_ref().and_then(|p| p.base_url.as_deref()),
+                Some("https://project.example.com")
+            );
+            // global value preserved where project doesn't override
+            assert_eq!(
+                config.provider.as_ref().and_then(|p| p.kind.as_deref()),
+                Some("openai-compatible")
+            );
+            // env var was set, so the secret reference is substituted to its value
+            assert_eq!(
+                config.provider.as_ref().and_then(|p| p.api_key.as_deref()),
+                Some("gk")
+            );
+            // project overrides cap
+            assert_eq!(config.context.as_ref().and_then(|c| c.cap), Some(8192));
+            // global max_iterations preserved
+            assert_eq!(
+                config.context.as_ref().and_then(|c| c.max_iterations),
+                Some(10)
+            );
         }
 
-        // project overrides global for base_url
-        assert_eq!(
-            config.provider.as_ref().and_then(|p| p.base_url.as_deref()),
-            Some("https://project.example.com")
-        );
-        // global value preserved where project doesn't override
-        assert_eq!(
-            config.provider.as_ref().and_then(|p| p.kind.as_deref()),
-            Some("openai-compatible")
-        );
-        // env var was set, so the secret reference is substituted to its value
-        assert_eq!(
-            config.provider.as_ref().and_then(|p| p.api_key.as_deref()),
-            Some("gk")
-        );
-        // project overrides cap
-        assert_eq!(config.context.as_ref().and_then(|c| c.cap), Some(8192));
-        // global max_iterations preserved
-        assert_eq!(
-            config.context.as_ref().and_then(|c| c.max_iterations),
-            Some(10)
-        );
-    }
-
-    #[test]
-    fn test_load_missing_secret_fails_closed() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_load_missing_secret_fails_closed() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [provider]
 api_key = "{env:OKEANOS_MISSING_SECRET_12345}"
 "#,
-        );
-        unsafe {
-            std::env::remove_var("OKEANOS_MISSING_SECRET_12345");
+            );
+            unsafe {
+                std::env::remove_var("OKEANOS_MISSING_SECRET_12345");
+            }
+            let result = Config::load_from_raw(None, Some(&path));
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("missing required secret 'OKEANOS_MISSING_SECRET_12345'"));
         }
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("missing required secret 'OKEANOS_MISSING_SECRET_12345'"));
-    }
 
-    #[test]
-    fn test_load_file_secret() {
-        let dir = tmp_dir();
-        let secret_path = dir.join("key.txt");
-        write_file(&secret_path, "sk-file-secret\n");
-        let config_path = dir.join("config.toml");
-        write_file(
-            &config_path,
-            &format!(
-                r#"
+        #[test]
+        fn test_load_file_secret() {
+            let dir = tmp_dir();
+            let secret_path = dir.join("key.txt");
+            write_file(&secret_path, "sk-file-secret\n");
+            let config_path = dir.join("config.toml");
+            write_file(
+                &config_path,
+                &format!(
+                    r#"
 [provider]
 api_key = "{{file:{}}}"
 "#,
-                secret_path.display()
-            ),
-        );
-        let config = Config::load_from(None, Some(&config_path)).expect("file secret should load");
-        assert_eq!(
-            config.provider.as_ref().and_then(|p| p.api_key.as_deref()),
-            Some("sk-file-secret")
-        );
-    }
-
-    #[test]
-    fn test_discover_global_config_uses_xdg() {
-        let dir = tmp_dir();
-        let config_dir = dir.join(".config");
-        std::fs::create_dir_all(config_dir.join("okeanos")).unwrap();
-        write_file(
-            &config_dir.join("okeanos").join("config.toml"),
-            "[provider]\nkind = \"xdg\"\n",
-        );
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", config_dir.to_str().unwrap());
+                    secret_path.display()
+                ),
+            );
+            let config =
+                Config::load_from_raw(None, Some(&config_path)).expect("file secret should load");
+            assert_eq!(
+                config.provider.as_ref().and_then(|p| p.api_key.as_deref()),
+                Some("sk-file-secret")
+            );
         }
-        let found = discover_global_config();
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
+
+        #[test]
+        fn test_discover_global_config_uses_xdg() {
+            let dir = tmp_dir();
+            let config_dir = dir.join(".config");
+            std::fs::create_dir_all(config_dir.join("okeanos")).unwrap();
+            write_file(
+                &config_dir.join("okeanos").join("config.toml"),
+                "[provider]\nkind = \"xdg\"\n",
+            );
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", config_dir.to_str().unwrap());
+            }
+            let found = discover_global_config();
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+            assert!(found.is_some());
+            assert!(found.unwrap().ends_with(".config/okeanos/config.toml"));
         }
-        assert!(found.is_some());
-        assert!(found.unwrap().ends_with(".config/okeanos/config.toml"));
-    }
 
-    #[test]
-    fn test_discover_project_config_from_root() {
-        let dir = tmp_dir();
-        let project_root = dir.join("project");
-        let subdir = project_root.join("subdir");
-        std::fs::create_dir_all(&subdir).unwrap();
-        write_file(
-            &project_root.join("okeanos.toml"),
-            "[provider]\nkind = \"test\"\n",
-        );
-        write_file(&project_root.join(".git"), ""); // marker file
+        #[test]
+        fn test_discover_project_config_from_root() {
+            let dir = tmp_dir();
+            let project_root = dir.join("project");
+            let subdir = project_root.join("subdir");
+            std::fs::create_dir_all(&subdir).unwrap();
+            write_file(
+                &project_root.join("okeanos.toml"),
+                "[provider]\nkind = \"test\"\n",
+            );
+            write_file(&project_root.join(".git"), ""); // marker file
 
-        let found = discover_project_config(Some(&subdir));
-        assert!(found.is_some());
-        assert_eq!(found.unwrap(), project_root.join("okeanos.toml"));
-    }
+            let found = discover_project_config(Some(&subdir));
+            assert!(found.is_some());
+            assert_eq!(found.unwrap(), project_root.join("okeanos.toml"));
+        }
 
-    #[test]
-    fn test_validation_context_cap_zero_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_context_cap_zero_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [context]
 cap = 0
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("context.cap must be > 0"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("context.cap must be > 0"));
+        }
 
-    #[test]
-    fn test_validation_context_max_iterations_zero_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_context_max_iterations_zero_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [context]
 max_iterations = 0
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("context.max_iterations must be > 0"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("context.max_iterations must be > 0")
+            );
+        }
 
-    #[test]
-    fn test_validation_context_max_elapsed_sec_zero_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_context_max_elapsed_sec_zero_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [context]
 max_elapsed_sec = 0
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("context.max_elapsed_sec must be > 0"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("context.max_elapsed_sec must be > 0")
+            );
+        }
 
-    #[test]
-    fn test_validation_cost_session_cap_negative_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_cost_session_cap_negative_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [cost]
 session_cap_usd = -1.0
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("cost.session_cap_usd must be >= 0"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cost.session_cap_usd must be >= 0")
+            );
+        }
 
-    #[test]
-    fn test_validation_cost_per_turn_warning_negative_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_cost_per_turn_warning_negative_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [cost]
 per_turn_warning_usd = -0.5
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("cost.per_turn_warning_usd must be >= 0"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cost.per_turn_warning_usd must be >= 0")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_tier_invalid_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_tier_invalid_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 tier = "invalid"
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("model.tier must be 'small' or 'frontier'"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("model.tier must be 'small' or 'frontier'")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_tier_small_ok() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_tier_small_ok() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 tier = "small"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("valid tier should load");
-        assert_eq!(
-            config.model.as_ref().and_then(|m| m.tier.as_deref()),
-            Some("small")
-        );
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("valid tier should load");
+            assert_eq!(
+                config.model.as_ref().and_then(|m| m.tier.as_deref()),
+                Some("small")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_tier_frontier_ok() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_tier_frontier_ok() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 tier = "frontier"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("valid tier should load");
-        assert_eq!(
-            config.model.as_ref().and_then(|m| m.tier.as_deref()),
-            Some("frontier")
-        );
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("valid tier should load");
+            assert_eq!(
+                config.model.as_ref().and_then(|m| m.tier.as_deref()),
+                Some("frontier")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_edit_format_invalid_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_edit_format_invalid_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 edit_format = "invalid"
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("model.edit_format must be 'diff', 'whole_file', or 'str_replace'"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("model.edit_format must be 'diff', 'whole_file', or 'str_replace'")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_edit_format_diff_ok() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_edit_format_diff_ok() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 edit_format = "diff"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("valid edit_format should load");
-        assert_eq!(
-            config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
-            Some("diff")
-        );
-    }
+            );
+            let config =
+                Config::load_from_raw(None, Some(&path)).expect("valid edit_format should load");
+            assert_eq!(
+                config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
+                Some("diff")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_edit_format_whole_file_ok() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_edit_format_whole_file_ok() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 edit_format = "whole_file"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("valid edit_format should load");
-        assert_eq!(
-            config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
-            Some("whole_file")
-        );
-    }
+            );
+            let config =
+                Config::load_from_raw(None, Some(&path)).expect("valid edit_format should load");
+            assert_eq!(
+                config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
+                Some("whole_file")
+            );
+        }
 
-    #[test]
-    fn test_validation_model_edit_format_str_replace_ok() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_model_edit_format_str_replace_ok() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 edit_format = "str_replace"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("valid edit_format should load");
-        assert_eq!(
-            config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
-            Some("str_replace")
-        );
-    }
+            );
+            let config =
+                Config::load_from_raw(None, Some(&path)).expect("valid edit_format should load");
+            assert_eq!(
+                config.model.as_ref().and_then(|m| m.edit_format.as_deref()),
+                Some("str_replace")
+            );
+        }
 
-    #[test]
-    fn test_validation_provider_kind_invalid_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_provider_kind_invalid_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [provider]
 kind = "invalid"
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("provider.kind must be 'openai-compatible'"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("provider.kind must be 'openai-compatible'")
+            );
+        }
 
-    #[test]
-    fn test_validation_provider_kind_openai_compatible_ok() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_validation_provider_kind_openai_compatible_ok() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [provider]
 kind = "openai-compatible"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("valid kind should load");
-        assert_eq!(
-            config.provider.as_ref().and_then(|p| p.kind.as_deref()),
-            Some("openai-compatible")
-        );
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("valid kind should load");
+            assert_eq!(
+                config.provider.as_ref().and_then(|p| p.kind.as_deref()),
+                Some("openai-compatible")
+            );
+        }
 
-    #[test]
-    fn test_skills_dir_in_model_section() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_skills_dir_in_model_section() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 skills_dir = ".okeanos/skills"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("skills_dir should load");
-        assert_eq!(
-            config
-                .model
-                .as_ref()
-                .and_then(|m| m.skills_dir.as_deref().map(|p| p.to_str().unwrap())),
-            Some(".okeanos/skills")
-        );
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("skills_dir should load");
+            assert_eq!(
+                config
+                    .model
+                    .as_ref()
+                    .and_then(|m| m.skills_dir.as_deref().map(|p| p.to_str().unwrap())),
+                Some(".okeanos/skills")
+            );
+        }
 
-    #[test]
-    fn test_model_capabilities_section_known_model() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_model_capabilities_section_known_model() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 name = "gpt-4o"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("known model should load");
-        let caps = config.to_model_capabilities(None);
-        assert!(caps.tool_calling);
-        assert!(caps.structured_output);
-        assert_eq!(caps.max_context, 200000); // Frontier default from classifier
-        assert_eq!(caps.tier, crate::model::ModelTier::Frontier);
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("known model should load");
+            let caps = config.to_model_capabilities(None);
+            assert!(caps.tool_calling);
+            assert!(caps.structured_output);
+            assert_eq!(caps.max_context, 200000); // Frontier default from classifier
+            assert_eq!(caps.tier, crate::model::ModelTier::Frontier);
+        }
 
-    #[test]
-    fn test_model_capabilities_section_explicit_override() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_model_capabilities_section_explicit_override() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 name = "my-local-model"
 tier = "small"
@@ -1232,43 +1295,45 @@ thinking = false
 temperature_supported = true
 tier = "small"
 "#,
-        );
-        let config =
-            Config::load_from(None, Some(&path)).expect("explicit capabilities should load");
-        let caps = config.to_model_capabilities(None);
-        assert!(!caps.tool_calling);
-        assert!(!caps.structured_output);
-        assert!(!caps.thinking);
-        assert_eq!(caps.max_context, 8192);
-        assert_eq!(caps.max_output, 2048);
-        assert_eq!(caps.tier, crate::model::ModelTier::Small);
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path))
+                .expect("explicit capabilities should load");
+            let caps = config.to_model_capabilities(None);
+            assert!(!caps.tool_calling);
+            assert!(!caps.structured_output);
+            assert!(!caps.thinking);
+            assert_eq!(caps.max_context, 8192);
+            assert_eq!(caps.max_output, 2048);
+            assert_eq!(caps.tier, crate::model::ModelTier::Small);
+        }
 
-    #[test]
-    fn test_model_capabilities_section_local_model_requires_explicit() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_model_capabilities_section_local_model_requires_explicit() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 name = "my-local-model"
 tier = "small"
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("model.capabilities must be explicitly set"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("model.capabilities must be explicitly set")
+            );
+        }
 
-    #[test]
-    fn test_model_capabilities_section_local_model_partial_explicit_fails() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_model_capabilities_section_local_model_partial_explicit_fails() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 name = "my-local-model"
 tier = "small"
@@ -1276,39 +1341,42 @@ tier = "small"
 tool_calling = false
 # missing other required fields
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("model.capabilities.structured_output must be explicitly set"));
-    }
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("model.capabilities.structured_output must be explicitly set")
+            );
+        }
 
-    #[test]
-    fn test_model_capabilities_section_tier_override() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_model_capabilities_section_tier_override() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 name = "gpt-4o"
 [model.capabilities]
 tier = "small"
 "#,
-        );
-        let config = Config::load_from(None, Some(&path)).expect("tier override should load");
-        let caps = config.to_model_capabilities(None);
-        // Explicit tier in capabilities should override known model tier
-        assert_eq!(caps.tier, crate::model::ModelTier::Small);
-    }
+            );
+            let config =
+                Config::load_from_raw(None, Some(&path)).expect("tier override should load");
+            let caps = config.to_model_capabilities(None);
+            // Explicit tier in capabilities should override known model tier
+            assert_eq!(caps.tier, crate::model::ModelTier::Small);
+        }
 
-    #[test]
-    fn test_model_capabilities_invalid_tier_in_capabilities() {
-        let dir = tmp_dir();
-        let path = dir.join("config.toml");
-        write_file(
-            &path,
-            r#"
+        #[test]
+        fn test_model_capabilities_invalid_tier_in_capabilities() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
 [model]
 name = "my-local-model"
 [model.capabilities]
@@ -1320,10 +1388,47 @@ max_output = 2048
 temperature_supported = true
 tier = "invalid"
 "#,
-        );
-        let result = Config::load_from(None, Some(&path));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("model.capabilities.tier must be 'small' or 'frontier'"));
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("model.capabilities.tier must be 'small' or 'frontier'")
+            );
+        }
+
+        #[test]
+        fn test_load_raw_then_validate() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
+[context]
+cap = 8192
+max_iterations = 50
+"#,
+            );
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            config.validate().expect("validate should succeed");
+        }
+
+        #[test]
+        fn test_load_raw_without_validate_can_fail() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
+[context]
+cap = 0
+"#,
+            );
+            // load_raw should succeed (no validation)
+            let config = Config::load_from_raw(None, Some(&path)).expect("load_raw should succeed");
+            // validate should fail
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("context.cap must be > 0"));
+        }
     }
 }

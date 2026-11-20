@@ -130,7 +130,10 @@ impl Model for ActiveModel {
 }
 
 async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
+    let config = Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+    config
+        .validate()
+        .context("configuration validation failed")?;
     tracing::info!("configuration loaded");
 
     match cli.mode() {
@@ -289,8 +292,12 @@ allow_list = ["todo", "read", "grep"]
 
 /// Validate the configuration file.
 async fn cmd_config_validate(cli: &Cli) -> anyhow::Result<()> {
-    let config = Config::load(cli.root.as_deref()).context("failed to load configuration")?;
+    let config = Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+    config
+        .validate()
+        .context("configuration validation failed")?;
     println!("Configuration is valid!");
+    // Print config with secrets redacted (Debug impl already redacts api_key)
     println!("{config:#?}");
     Ok(())
 }
@@ -302,23 +309,28 @@ async fn cmd_doctor(cli: &Cli) -> anyhow::Result<()> {
     println!();
 
     // Check config
-    let config_result = Config::load(cli.root.as_deref());
+    let config_result = Config::load_raw(cli.root.as_deref());
     match &config_result {
         Ok(config) => {
-            println!("✓ Config: OK (loaded from global + project layers)");
-            if let Some(model) = &config.model {
-                println!("  └─ Model: {}", model.name.as_deref().unwrap_or("<unset>"));
-            }
-            if let Some(provider) = &config.provider {
-                println!(
-                    "  └─ Provider: {} ({})",
-                    provider.kind.as_deref().unwrap_or("<unset>"),
-                    provider.base_url.as_deref().unwrap_or("<unset>")
-                );
-                if provider.api_key.is_some() {
-                    println!("  └─ API Key: ***SET***");
-                } else {
-                    println!("  └─ API Key: NOT SET (will fail for real providers)");
+            // Validate after loading
+            if let Err(e) = config.validate() {
+                println!("✗ Config: FAILED validation - {e}");
+            } else {
+                println!("✓ Config: OK (loaded from global + project layers)");
+                if let Some(model) = &config.model {
+                    println!("  └─ Model: {}", model.name.as_deref().unwrap_or("<unset>"));
+                }
+                if let Some(provider) = &config.provider {
+                    println!(
+                        "  └─ Provider: {} ({})",
+                        provider.kind.as_deref().unwrap_or("<unset>"),
+                        provider.base_url.as_deref().unwrap_or("<unset>")
+                    );
+                    if provider.api_key.is_some() {
+                        println!("  └─ API Key: ***SET***");
+                    } else {
+                        println!("  └─ API Key: NOT SET (will fail for real providers)");
+                    }
                 }
             }
         }
