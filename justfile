@@ -24,6 +24,14 @@ build:
 build-musl:
 	cargo build --release --target x86_64-unknown-linux-musl
 
+# Build release for macOS Apple Silicon (native on macOS, or via osxcross on Linux)
+build-macos-arm64:
+	cargo build --release --target aarch64-apple-darwin
+
+# Build release for macOS Intel (native on macOS, or via osxcross on Linux)
+build-macos-x64:
+	cargo build --release --target x86_64-apple-darwin
+
 # Run all CI checks locally
 check: fmt clippy test
 

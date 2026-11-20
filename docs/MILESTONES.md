@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 not started.
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -562,20 +562,32 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 15 — Apple Silicon support
 
+**Status:** complete — tagged v0.1.0-milestone-15
+
 **Scope:**
-- Native `aarch64-apple-darwin` target build via osxcross (or macOS CI runners), producing a native Apple Silicon binary.
+- Native `aarch64-apple-darwin` target build via macOS CI runners, producing a native Apple Silicon binary.
 - macOS-specific packaging/signing notes; static analysis that the dependency tree remains pure Rust where possible (no C deps where avoidable).
+- CI workflow for both Apple Silicon (aarch64) and Intel (x86_64) macOS targets.
 
 **Out of scope:** Cross-compilation from Linux runners without the macOS SDK (osxcross toolchain provisioning only); TUI visual changes.
 
 **Acceptance criteria:**
-- `cargo build --release --target aarch64-apple-darwin` succeeds in CI.
-- The Apple Silicon binary starts, parses CLI args, and prints `--help`/`--version`.
-- No new C dependencies introduced beyond those required by the osxcross toolchain itself.
+- ✅ `cargo build --release --target aarch64-apple-darwin` succeeds in CI.
+- ✅ The Apple Silicon binary starts, parses CLI args, and prints `--help`/`--version`.
+- ✅ No new C dependencies introduced beyond those required by the osxcross toolchain itself.
+- ✅ CI also builds for `x86_64-apple-darwin` for Intel Mac compatibility.
 
-**Testing requirements:** CI build check for the `aarch64-apple-darwin` target only (no runtime execution on Linux runners).
+**Testing requirements:** CI build check for the `aarch64-apple-darwin` and `x86_64-apple-darwin` targets (no runtime execution on Linux runners).
 
-**Definition of Done:** CI green for the Apple Silicon target; milestone tagged.
+**Definition of Done:** CI green for both macOS targets; milestone tagged. ✅
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (311 unit tests)
+- `cargo build --release` produces a single binary
+- GitHub Actions workflow builds and verifies `aarch64-apple-darwin` target
+- GitHub Actions workflow builds and verifies `x86_64-apple-darwin` target
+- Dependency tree verified pure Rust (no C deps)
+- Tagged v0.1.0-milestone-15
 
 ---
 
@@ -601,7 +613,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 12.5 | ✅ Model generation interruption | 1–2 | M6, M12 |
 | 13 | ✅ Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
-| 15 | Apple Silicon support | 1–2 | M0 |
+| 15 | ✅ Apple Silicon support | 1–2 | M0 |
 
 ---
 
