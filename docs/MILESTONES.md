@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 not started.
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -10,7 +10,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 0 — Scaffolding & CLI
 
-**Status:** complete — tagged v0.1.0-milestone-0  
+**Status:** complete — tagged v0.1.0-milestone-0
 
 **Scope:**
 - Rust workspace, `Cargo.toml` with Phase 2 stack (tokio `current_thread`, reqwest+rustls, clap derive, thiserror/anyhow, serde_json, tracing JSON).
@@ -162,7 +162,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 4 — Tool system + text-based tool calling
 
-**Status:** complete — tagged v0.1.0-milestone-4  
+**Status:** complete — tagged v0.1.0-milestone-4
 
 **Scope:**
 - `Tool` trait (JSON-schema input/output) + `ToolRegistry`.
@@ -221,7 +221,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 6 — Built-in tools + interruptible execution
 
-**Status:** complete — tagged v0.1.0-milestone-6  
+**Status:** complete — tagged v0.1.0-milestone-6
 
 **Scope:**
 - Built-in tools: `read`, `write`, `delete`, `run` (local process at permission boundary), `grep`.
@@ -254,7 +254,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 7 — Rate limits & fallback strategies
 
-**Status:** complete — tagged v0.1.0-milestone-7  
+**Status:** complete — tagged v0.1.0-milestone-7
 
 **Scope:**
 - Error-in-context with bounded retries (2–3) + exponential backoff on provider 429/503.
@@ -591,6 +591,147 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ---
 
+## Milestone 16 — MVP completion (actual gaps)
+
+**Scope:**
+Four items marked "completed in M12.5" but not actually implemented — these are MVP requirements from PRODUCT_SPEC.md.
+
+### 16.1 Thinking channel event (FR-30)
+- Add `Thinking` variant to `Event` enum (DESIGN.md §7)
+- Emit `Thinking` events from model streaming chunks
+- Replay thinking into context only for large-context frontier models (tier-gated)
+- Small models: thinking captured but not replayed
+
+### 16.2 Tiered tool set (FR-25)
+- `ToolRegistry` filters tools by model tier
+- Small models: minimal set (read, edit, run)
+- Mid/Frontier models: full set (read, write, delete, run, grep, todo)
+- Update system prompts per tier to document available tools
+
+### 16.3 Selective context inclusion (FR-26)
+- Implement ripgrep-based symbol scanning in `src/context/selective.rs`
+- Extract search terms from user prompt + recent conversation
+- Filter included files by relevance; cap total tokens per tier
+- Pure Rust only — no tree-sitter/C deps
+
+### 16.4 `/approve`, `/deny` in command palette (DESIGN §5)
+- Add `/approve` and `/deny` slash commands to palette
+- Resolve latest pending `ApprovalRequest` without modal
+- Emit corresponding `Approval` event for headless/RPC parity
+
+**Out of scope:** Full settings palette, theme selection, key binding customization.
+
+**Acceptance criteria:**
+- `Event::Thinking` variant exists and is emitted during streaming
+- Small model tier gets only {read, edit, run}; frontier gets all 6 tools
+- `selective.rs` returns relevant file subset; token count respects tier cap
+- Command palette shows `/approve` `/deny`; they resolve pending approval
+- Headless mode: `/approve` `/deny` emit JSON `Approval` events
+
+**Testing requirements:** Unit tests for Thinking event emission, tiered tool registry, selective context filtering, command palette approval commands. No network (mock provider).
+
+**Definition of Done:** CI green; all four MVP gaps closed; milestone tagged.
+
+---
+
+## Milestone 17 — Config layer cleanup
+
+**Scope:**
+- Move `toml` crate to CLI-only dependency (optional feature or separate crate).
+- Split config loading from validation.
+- Add `Config::validate()` for CI gating.
+- Ensure secrets never logged during validation.
+
+**Out of scope:** Runtime config changes, hot-reload.
+
+**Acceptance criteria:**
+- `toml` not in harness `lib` dependencies (only in `cli`/`config` layer)
+- `Config::load()` returns raw config; `Config::validate()` separate call
+- CI runs `okeanos config validate` as a gate
+- No secrets in validation logs/output
+
+**Testing requirements:** Unit tests for validation separation, secret redaction in validation output. Verify `cargo tree` shows `toml` only in CLI path.
+
+**Definition of Done:** CI green; dependency layering compliant with ARCHITECTURE.md; milestone tagged.
+
+---
+
+## Post-MVP Milestones (Phase 6+)
+
+These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, independent milestone.
+
+### Milestone 18 — Context compaction / summarization
+**Scope:** Implement context compaction to work around hard cap for long sessions.
+- Summarization strategy: LLM-based summary of older turns
+- Configurable trigger (e.g., at 75% context cap)
+- Preserve recent N turns + system prompt + skills + todos
+- **Out of scope:** Compaction-aware tool calls, multi-agent summary delegation.
+
+### Milestone 19 — Anthropic / Claude provider
+**Scope:** Add Anthropic provider behind feature flag.
+- Implement `Model` trait for Anthropic Messages API
+- Map `ModelCapabilities` (tool_calling, thinking, etc.)
+- Config-driven selection: `provider.kind = "anthropic"`
+- **Out of scope:** Other providers (Azure, Vertex, etc. — separate milestones).
+
+### Milestone 20 — WebSocket RPC transport
+**Scope:** Add WebSocket transport for JSON-RPC (feature-gated).
+- `jsonrpsee` WebSocket server/client
+- `--rpc-ws` flag for WebSocket mode
+- Same event stream as stdio/TCP RPC
+- **Out of scope:** Auth/TLS for WebSocket (deferred).
+
+### Milestone 21 — MCP client (lazy)
+**Scope:** Lazy MCP server handling behind `mcp` feature flag.
+- MCP client trait + stdio transport
+- Tool discovery from MCP servers at runtime
+- Register discovered tools in `ToolRegistry`
+- **Out of scope:** MCP server implementation, SSE transport.
+
+### Milestone 22 — Session log rotation / compression
+**Scope:** Rotate and compress JSONL session logs.
+- Configurable max file size / age before rotation
+- gzip compression for rotated segments
+- `--resume` works across rotated segments
+- **Out of scope:** Remote log shipping, structured query API.
+
+### Milestone 23 — Tool result caching (TTL)
+**Scope:** Optional caching for idempotent tool calls.
+- TTL-based cache for `read`, `grep` results
+- Configurable per-tool TTL; disabled by default
+- Invalidate on any `write`/`delete`/`run` in same path
+- **Out of scope:** Distributed cache, cache warming.
+
+### Milestone 24 — Per-turn expensive call confirmation
+**Scope:** User confirmation before tool calls exceeding cost threshold.
+- Configurable per-turn cost warning threshold (USD)
+- TUI modal + headless `ApprovalRequest` event
+- Skip confirmation for `allow-always` grants
+- **Out of scope:** Budget forecasting, predictive cost estimates.
+
+### Milestone 25 — Tree-sitter symbol scanning (optional)
+**Scope:** C-based symbol scanner for richer context selection (opt-in).
+- Feature-gated `tree-sitter` dependency
+- Language-specific symbol extraction
+- Fallback to ripgrep when unavailable
+- **Out of scope:** Full AST-based refactoring, cross-file analysis.
+
+### Milestone 26 — Rich text / markdown rendering in TUI
+**Scope:** Render markdown in conversation pane.
+- Feature-gated `pulldown-cmark` + `ratatui` markdown widget
+- Code blocks with syntax highlighting
+- Configurable: plain / markdown / auto
+- **Out of scope:** Image rendering, interactive widgets.
+
+### Milestone 27 — Multi-agent crew / delegation
+**Scope:** Delegate subtasks to sub-agents via `todo` tool extension.
+- Sub-agent spawn with isolated context + tool subset
+- Parent aggregates results; approval bubbles up
+- Configurable delegation depth / token budget
+- **Out of scope:** Autonomous agent swarms, cross-project delegation.
+
+---
+
 ## Milestone summary table
 
 | Milestone | Deliverable | Sessions (est.) | Builds on |
@@ -605,7 +746,7 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 6 | Built-in tools + interruptible execution | 2 | M4, M5 |
 | 7 | Rate limits & fallback strategies | 1 | M6 |
 | 8 | Session log & resume | 1 | M2 |
-| 9 | **OpenRouter / OpenAI-compatible provider** | 2 | M3, M4 |
+| 9 | OpenRouter / OpenAI-compatible provider | 2 | M3, M4 |
 | 10 | ✅ Cost budget | 1 | M2, M3, M9 |
 | 11 | ✅ Edit format | 1 | M6, M9 |
 | 12 | ✅ TUI shell | 2–3 | M2, M4, M5, M9, M11 |
@@ -614,68 +755,29 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 | 13 | ✅ Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | ✅ Apple Silicon support | 1–2 | M0 |
+| 16 | **MVP completion (actual gaps)** | 2–3 | M12, M12.5, M13 |
+| 17 | Config layer cleanup | 1 | M1 |
+
+**Post-MVP (independent, can parallelize):**
+| Milestone | Deliverable | Sessions (est.) | Depends on |
+|-----------|-------------|-----------------|------------|
+| 18 | Context compaction | 2 | M16 |
+| 19 | Anthropic provider | 1–2 | M16 |
+| 20 | WebSocket RPC | 1 | M14 |
+| 21 | MCP client | 2–3 | M16 |
+| 22 | Session log rotation | 1 | M13 |
+| 23 | Tool result caching | 1–2 | M16 |
+| 24 | Expensive call confirmation | 1 | M10, M16 |
+| 25 | Tree-sitter scanning (opt-in) | 2 | M16 |
+| 26 | Markdown rendering | 1–2 | M12 |
+| 27 | Multi-agent delegation | 3+ | M16, M13 |
 
 ---
 
-## Technical Debt / Architecture Fixes (post-MVP or parallel)
+## Notes on milestone structure
 
-These issues were identified during M12 design review and gap analysis; most are now scheduled in M12.5–M14. Remaining post-MVP items:
+**MVP ends at M16.** Everything M18+ is genuinely post-MVP and can be tackled in any order — they are independent lanes. The table above lists dependencies but most can run in parallel once M16 is done.
 
-| Issue | Description | Suggested Milestone |
-|-------|-------------|---------------------|
-| **Config layer violation** | `toml` crate in workspace deps (should be CLI-only per ARCHITECTURE.md §Dependency rules). Config validation logic mixed with loading. | M16: Config layer cleanup |
-| **Config validation at wrong layer** | `Config::load()` does validation; should be separate `validate()` call for CI gating. | M16: Config layer cleanup |
+**M17 (Config cleanup)** is architectural hygiene; it can happen anytime after M16 or in parallel with post-MVP work.
 
-Items now scheduled in active milestones (removed from this list):
-- `--rpc` flag / `src/headless.rs` / `jsonrpsee` → **M14** (already in scope).
-- Snapshot store uses `git` CLI instead of `gix` → **M13** (added to scope).
-- Session log module not split into `log.rs`/`header.rs`/`resume.rs` → **M13** (added to scope).
-- No graceful shutdown flush in TUI on SIGINT → **M13** (added to scope).
-- Git initialization not opt-in/deferred (creates `.git` on launch) → **M13** (added to scope).
-- No in-TUI provider/config configuration → **M12.1** (new milestone below).
-- No visible input composer in main TUI screen → **M12.1** (new milestone below).
-
-Items completed in M12.5:
-- Model generation not interruptible (wire `shutdown_tx`, streaming + `select!` cancel, `Esc` binding, `interrupted` event).
-- No `interrupted` event in `Event` enum (DESIGN.md §7) — now added.
-- **No thinking channel event** (FR-30): `ModelStreamChunk.thinking` and `ModelResponse.thinking` exist but `Event` has no `Thinking` variant; not replayed into context for small models.
-- **Tiered tool set not implemented** (FR-25): all 6 tools registered for every tier; small models should get minimal set (read, edit, run).
-- **Selective context inclusion not implemented** (FR-26): no ripgrep-based symbol scan / file selection; all context is included.
-- **`/approve`, `/deny` missing from command palette** (DESIGN §5): palette lists `/help`, `/todos`, `/logs`, `/undo`, `/redo` but not approval decisions.
-- **No in-TUI provider configuration**: launching `./okeanos` with no config requires external `okeanos init` + TOML editing before the TUI is usable; no in-TUI setup flow.
-- **No visible input composer in main screen**: the idle TUI shows empty panes with no focusable place to type a prompt; nothing to click or write in until the welcome screen is dismissed.
-
-**M12.1 — TUI Configuration & Input UX** (complete — tagged v0.1.0-milestone-12.1)
-
-**Scope:**
-- **Visible input composer always rendered**: main layout includes input composer at bottom (above status bar) at all times; welcome screen renders as centered modal overlay, not full-screen replacement. Composer focused on startup with config-aware placeholder.
-- **In-TUI provider configuration**: first-run flow as a stepper modal (provider kind → base URL → API key → model → confirm) writing `okeanos.toml` at git root/CWD. Supports `{env:VAR}` / `{file:path}` secret substitution. Welcome screen offers **[Enter] Configure provider** action.
-- **Config events**: add `config_modal`, `config_saved` to event stream (DESIGN.md §7); `status` event gains `provider_configured` field.
-- **Key binding updates**: welcome screen no longer dismisses on arbitrary keys; uses `Esc` to dismiss, `Enter` to open config. Composer key hints unchanged.
-
-**Out of scope:** Full settings palette, theme selection, key binding customization.
-
-**Acceptance criteria:**
-- Launching `./okeanos` with no config opens TUI with **visible, focused input composer** at bottom showing placeholder "Describe what you want to do…" and key hints.
-- Welcome screen appears as **centered modal overlay** (not full screen) with "Configure provider" (Enter) and "Dismiss" (Esc) actions.
-- Pressing **Enter** on welcome screen opens config stepper modal; user can complete provider setup entirely within TUI.
-- On config save: `okeanos.toml` written at git root/CWD, welcome modal updates to "Provider: Configured ✓", composer placeholder changes to "Type your prompt…", user can immediately submit a prompt.
-- No terminal commands required beyond `./okeanos` to reach a working interactive state.
-- Headless mode emits `config_saved` event on completion for script consumption.
-
-**Testing requirements:** Unit tests for config stepper modal (validation, secret syntax, file write), welcome overlay key handling (Esc/Enter), input composer visibility when welcome overlay active. Integration test: cold start → config → prompt → turn. No network (mock provider).
-
-**Definition of Done:** CI green; TUI usable without external config commands; milestone tagged. ✓
-- `cargo fmt --check` passes
-- `cargo clippy -- -D warnings` passes
-- `cargo test` passes (315 unit tests)
-- `cargo build --release` produces a single binary
-- Tagged v0.1.0-milestone-12.1
-
----
-
-**M16 — Config layer cleanup** (suggested)
-- Move `toml` to CLI-only dependency (optional feature or separate crate).
-- Split config loading from validation.
-- Add `Config::validate()` for CI gating.
-- Ensure secrets never logged during validation.
+**Post-MVP milestones are small by design** — 1–3 sessions each, single testable deliverable. No "big bang" milestones.
