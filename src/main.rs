@@ -1776,10 +1776,10 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
         // Forward ApprovalRequest events to a dedicated channel
         tokio::spawn(async move {
             while let Ok(event) = event_rx.recv().await {
-                if let Event::ApprovalRequest(req) = event {
-                    if approval_req_tx.send(req).await.is_err() {
-                        break;
-                    }
+                if let Event::ApprovalRequest(req) = event
+                    && approval_req_tx.send(req).await.is_err()
+                {
+                    break;
                 }
             }
         });
