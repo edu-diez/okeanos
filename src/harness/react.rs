@@ -37,6 +37,8 @@ pub enum ReactError {
     ContextCap(#[from] crate::context::cap::ContextCapError),
     #[error("cost budget: {0}")]
     CostBudget(#[from] CostBudgetError),
+    #[error("selective context error: {0}")]
+    SelectiveContext(#[from] crate::context::selective::SelectiveContextError),
     #[error("max iterations ({max_iter}) reached")]
     MaxIterations { max_iter: usize },
     #[error("max elapsed time ({max_elapsed_sec}s) reached")]
@@ -132,6 +134,8 @@ pub struct ReactLoop<M: Model> {
     snapshot_store: Option<SnapshotStore>,
     /// Event index counter for snapshot metadata.
     event_index: usize,
+    /// Project root for selective context inclusion.
+    project_root: Option<std::path::PathBuf>,
 }
 
 impl<M: Model> ReactLoop<M> {
@@ -159,7 +163,14 @@ impl<M: Model> ReactLoop<M> {
             cost_tracker: None,
             snapshot_store: None,
             event_index: 0,
+            project_root: None,
         }
+    }
+
+    /// Set the project root for selective context inclusion.
+    pub fn with_project_root(mut self, project_root: std::path::PathBuf) -> Self {
+        self.project_root = Some(project_root);
+        self
     }
 
     /// Get the event sender for emitting events.
@@ -219,6 +230,83 @@ impl<M: Model> ReactLoop<M> {
         self
     }
 
+    /// Run selective context inclusion to find relevant files for the current task.
+    ///
+    /// This uses the conversation's selective context configuration (based on model tier)
+    /// to scan the project for files matching symbols/terms from the user prompt and
+    /// recent conversation history. The included files are added to the conversation context.
+    async fn run_selective_context(&mut self, prompt: &str) -> Result<(), ReactError> {
+        let Some(project_root) = &self.project_root else {
+            return Ok(()); // No project root configured, skip selective context
+        };
+
+        // Build search terms from prompt + recent conversation
+        let search_terms = self.build_search_terms(prompt);
+        if search_terms.is_empty() {
+            return Ok(());
+        }
+
+        // Get selective context config from conversation
+        let selective_config = self.conversation.selective_config().clone();
+        let token_counter = crate::context::tokens::TokenCounter;
+
+        // Find relevant files
+        let included_files = crate::context::selective::find_relevant_files(
+            project_root,
+            &search_terms,
+            &selective_config,
+            &token_counter,
+        )?;
+
+        if !included_files.is_empty() {
+            self.conversation.set_included_files(included_files);
+            // Emit log about files included
+            let count = self.conversation.included_files().len();
+            let total_tokens: usize = self
+                .conversation
+                .included_files()
+                .iter()
+                .map(|f| f.tokens)
+                .sum();
+            self.emit_log(
+                crate::events::LogLevel::Debug,
+                format!(
+                    "Selective context: included {} files ({} tokens)",
+                    count, total_tokens
+                ),
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Build search terms from the current prompt and recent conversation history.
+    fn build_search_terms(&self, prompt: &str) -> String {
+        // Start with terms from the current prompt
+        let mut terms = crate::context::selective::extract_search_terms(prompt);
+
+        // Add terms from recent user messages (last 3)
+        let recent_user_messages: Vec<_> = self
+            .conversation
+            .messages()
+            .iter()
+            .rev()
+            .filter(|m| m.role == crate::events::MessageRole::User)
+            .take(3)
+            .collect();
+
+        for msg in recent_user_messages {
+            let msg_terms = crate::context::selective::extract_search_terms(&msg.content);
+            terms.extend(msg_terms);
+        }
+
+        // Deduplicate
+        terms.sort();
+        terms.dedup();
+        terms.join("|")
+    }
+
     /// Undo to the previous snapshot.
     pub fn undo(&mut self) -> Result<SnapshotEntry, SnapshotError> {
         let Some(store) = &mut self.snapshot_store else {
@@ -255,8 +343,11 @@ impl<M: Model> ReactLoop<M> {
     pub async fn run(mut self, initial_prompt: String) -> Result<String, ReactError> {
         // Add initial user message
         self.conversation
-            .add_user_message(initial_prompt)
+            .add_user_message(initial_prompt.clone())
             .context("failed to add initial prompt")?;
+
+        // Run selective context inclusion for the initial prompt
+        self.run_selective_context(&initial_prompt).await?;
 
         // Emit initial status
         self.emit_status().await;
@@ -372,8 +463,11 @@ impl<M: Model> ReactLoop<M> {
     ) -> Result<LoopDecision, ReactError> {
         // Add user message to conversation
         self.conversation
-            .add_user_message(prompt)
+            .add_user_message(prompt.clone())
             .context("failed to add user prompt")?;
+
+        // Run selective context inclusion to find relevant files
+        self.run_selective_context(&prompt).await?;
 
         // Emit status update
         self.emit_status().await;
@@ -448,7 +542,11 @@ impl<M: Model> ReactLoop<M> {
 
         // Add assistant message to conversation
         self.conversation
-            .add_assistant_message(response.content.clone(), response.tool_calls.clone())
+            .add_assistant_message(
+                response.content.clone(),
+                response.tool_calls.clone(),
+                response.thinking.clone(),
+            )
             .context("failed to add assistant message")?;
 
         // Emit assistant message event
@@ -458,6 +556,7 @@ impl<M: Model> ReactLoop<M> {
             tool_calls: response.tool_calls.clone(),
             tool_call_id: None,
             ts: current_timestamp(),
+            thinking: response.thinking.clone(),
         })
         .await;
 
@@ -555,6 +654,7 @@ impl<M: Model> ReactLoop<M> {
                     .add_assistant_message(
                         simpler_response.content.clone(),
                         simpler_response.tool_calls.clone(),
+                        simpler_response.thinking.clone(),
                     )
                     .context("failed to add fallback assistant message")?;
                 self.emit_message(Message {
@@ -563,6 +663,7 @@ impl<M: Model> ReactLoop<M> {
                     tool_calls: simpler_response.tool_calls.clone(),
                     tool_call_id: None,
                     ts: current_timestamp(),
+                    thinking: simpler_response.thinking.clone(),
                 })
                 .await;
 
@@ -696,6 +797,7 @@ impl<M: Model> ReactLoop<M> {
             content: simpler_prompt.to_string(),
             tool_calls: None,
             tool_call_id: None,
+            thinking: None,
         });
 
         // Include recent history only (fewer turns for simpler prompt).
@@ -713,6 +815,8 @@ impl<M: Model> ReactLoop<M> {
                 content: msg.content.clone(),
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
+                // For simpler prompt (Small tier), don't include thinking
+                thinking: None,
             });
         }
 
@@ -835,7 +939,14 @@ impl<M: Model> ReactLoop<M> {
                             tool_calls = Some(tc);
                         }
                         if let Some(th) = chunk.thinking {
-                            thinking = Some(th);
+                            thinking = Some(th.clone());
+                            // Emit thinking event for TUI/headless parity
+                            let thinking_event =
+                                crate::events::Event::thinking(th, current_timestamp());
+                            let _ = self.event_tx.send(thinking_event.clone());
+                            if let Some(session) = &mut self.session {
+                                let _ = session.log_event(thinking_event);
+                            }
                         }
                         if chunk.finished {
                             finished = true;

@@ -173,6 +173,7 @@ impl Conversation {
             tool_calls: None,
             tool_call_id: None,
             ts: current_timestamp(),
+            thinking: None,
         };
         self.add_message(msg)
     }
@@ -182,6 +183,7 @@ impl Conversation {
         &mut self,
         content: String,
         tool_calls: Option<Vec<crate::events::ToolCall>>,
+        thinking: Option<String>,
     ) -> Result<(), ConversationError> {
         let msg = Message {
             role: crate::events::MessageRole::Assistant,
@@ -189,6 +191,7 @@ impl Conversation {
             tool_calls,
             tool_call_id: None,
             ts: current_timestamp(),
+            thinking,
         };
         self.add_message(msg)
     }
@@ -205,6 +208,7 @@ impl Conversation {
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
             ts: current_timestamp(),
+            thinking: None,
         };
         self.add_message(msg)
     }
@@ -307,6 +311,7 @@ impl Conversation {
             content: self.system_prompt.clone(),
             tool_calls: None,
             tool_call_id: None,
+            thinking: None,
         });
 
         // Add included files as context (after system prompt)
@@ -318,6 +323,7 @@ impl Conversation {
                     content: file_context,
                     tool_calls: None,
                     tool_call_id: None,
+                    thinking: None,
                 });
             }
         }
@@ -343,13 +349,13 @@ impl Conversation {
                 content: msg.content.clone(),
                 tool_calls: msg.tool_calls.clone(),
                 tool_call_id: msg.tool_call_id.clone(),
+                // Replay thinking only for frontier models (tier-gated)
+                thinking: if self.tier_config.replay_thinking {
+                    msg.thinking.clone()
+                } else {
+                    None
+                },
             };
-
-            // For small-context models, don't replay thinking channel
-            if !self.tier_config.replay_thinking {
-                // Thinking is stored separately in ModelMessage, not in content
-                // This is handled by the model provider when sending requests
-            }
 
             result.push(model_msg);
         }
@@ -491,7 +497,8 @@ mod tests {
     #[test]
     fn test_add_assistant_message() {
         let mut conv = Conversation::from_tier(ModelTier::Small, 4096);
-        conv.add_assistant_message("Hi there".into(), None).unwrap();
+        conv.add_assistant_message("Hi there".into(), None, None)
+            .unwrap();
         assert_eq!(conv.messages().len(), 1);
         assert_eq!(conv.messages()[0].role, MessageRole::Assistant);
     }
@@ -510,7 +517,7 @@ mod tests {
     fn test_to_model_messages() {
         let mut conv = Conversation::from_tier(ModelTier::Small, 4096);
         conv.add_user_message("Hello".into()).unwrap();
-        conv.add_assistant_message("Hi".into(), None).unwrap();
+        conv.add_assistant_message("Hi".into(), None, None).unwrap();
 
         let msgs = conv.to_model_messages();
         assert_eq!(msgs.len(), 3); // system + user + assistant
@@ -570,7 +577,7 @@ mod tests {
     fn test_clear_history() {
         let mut conv = Conversation::from_tier(ModelTier::Small, 4096);
         conv.add_user_message("Hello".into()).unwrap();
-        conv.add_assistant_message("Hi".into(), None).unwrap();
+        conv.add_assistant_message("Hi".into(), None, None).unwrap();
 
         let tokens_before = conv.estimated_tokens();
         conv.clear_history();

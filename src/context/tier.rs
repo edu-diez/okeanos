@@ -36,10 +36,9 @@ impl TierConfig {
     /// Small model tier configuration (4k-32k context, limited/no native function calling).
     fn small() -> Self {
         let mut allowed_tools = HashSet::new();
-        // Small models get minimal tool set: read, edit, run, todo
-        allowed_tools.insert("todo".to_string());
+        // Small models get minimal tool set: read, edit, run
         allowed_tools.insert("read".to_string());
-        allowed_tools.insert("write".to_string());
+        allowed_tools.insert("edit".to_string());
         allowed_tools.insert("run".to_string());
 
         Self {
@@ -65,10 +64,11 @@ impl TierConfig {
     /// Mid-tier model tier configuration (32k-128k context, native function calling).
     fn mid() -> Self {
         let mut allowed_tools = HashSet::new();
-        // Mid models get most tools except delete
+        // Mid models get full set: read, write, delete, run, grep, todo
         allowed_tools.insert("todo".to_string());
         allowed_tools.insert("read".to_string());
         allowed_tools.insert("write".to_string());
+        allowed_tools.insert("delete".to_string());
         allowed_tools.insert("run".to_string());
         allowed_tools.insert("grep".to_string());
 
@@ -95,7 +95,7 @@ impl TierConfig {
     /// Frontier model tier configuration (128k+ context, full capabilities).
     fn frontier() -> Self {
         let mut allowed_tools = HashSet::new();
-        // Frontier models get full tool set
+        // Frontier models get full set: read, write, delete, run, grep, todo
         allowed_tools.insert("todo".to_string());
         allowed_tools.insert("read".to_string());
         allowed_tools.insert("write".to_string());
@@ -155,9 +155,8 @@ pub mod tool_subsets {
 
     pub fn small() -> HashSet<String> {
         let mut set = HashSet::new();
-        set.insert("todo".to_string());
         set.insert("read".to_string());
-        set.insert("write".to_string());
+        set.insert("edit".to_string());
         set.insert("run".to_string());
         set
     }
@@ -167,6 +166,7 @@ pub mod tool_subsets {
         set.insert("todo".to_string());
         set.insert("read".to_string());
         set.insert("write".to_string());
+        set.insert("delete".to_string());
         set.insert("run".to_string());
         set.insert("grep".to_string());
         set
@@ -193,9 +193,10 @@ mod tests {
     fn test_tier_config_small() {
         let config = TierConfig::for_tier(ModelTier::Small);
         assert_eq!(config.tier, ModelTier::Small);
-        assert!(config.allows_tool("todo"));
+        assert!(!config.allows_tool("todo"));
         assert!(config.allows_tool("read"));
-        assert!(config.allows_tool("write"));
+        assert!(!config.allows_tool("write"));
+        assert!(config.allows_tool("edit"));
         assert!(config.allows_tool("run"));
         assert!(!config.allows_tool("delete"));
         assert!(!config.allows_tool("grep"));
@@ -212,9 +213,10 @@ mod tests {
         assert!(config.allows_tool("todo"));
         assert!(config.allows_tool("read"));
         assert!(config.allows_tool("write"));
+        assert!(!config.allows_tool("edit"));
+        assert!(config.allows_tool("delete"));
         assert!(config.allows_tool("run"));
         assert!(config.allows_tool("grep"));
-        assert!(!config.allows_tool("delete"));
         assert_eq!(config.generation_params.temperature, Some(0.5));
         assert_eq!(config.generation_params.max_tokens, Some(4096));
         assert_eq!(config.max_history_turns, 10);
@@ -228,6 +230,7 @@ mod tests {
         assert!(config.allows_tool("todo"));
         assert!(config.allows_tool("read"));
         assert!(config.allows_tool("write"));
+        assert!(!config.allows_tool("edit"));
         assert!(config.allows_tool("delete"));
         assert!(config.allows_tool("run"));
         assert!(config.allows_tool("grep"));
@@ -255,14 +258,28 @@ mod tests {
         let mid = tool_subsets::mid();
         let frontier = tool_subsets::frontier();
 
-        assert!(small.contains("todo"));
+        assert!(!small.contains("todo"));
+        assert!(small.contains("read"));
+        assert!(small.contains("edit"));
+        assert!(small.contains("run"));
         assert!(!small.contains("delete"));
         assert!(!small.contains("grep"));
+        assert!(!small.contains("write"));
 
+        assert!(mid.contains("todo"));
+        assert!(mid.contains("read"));
+        assert!(!mid.contains("edit"));
+        assert!(mid.contains("write"));
+        assert!(mid.contains("delete"));
+        assert!(mid.contains("run"));
         assert!(mid.contains("grep"));
-        assert!(!mid.contains("delete"));
 
+        assert!(frontier.contains("todo"));
+        assert!(frontier.contains("read"));
+        assert!(!frontier.contains("edit"));
+        assert!(frontier.contains("write"));
         assert!(frontier.contains("delete"));
+        assert!(frontier.contains("run"));
         assert!(frontier.contains("grep"));
     }
 }

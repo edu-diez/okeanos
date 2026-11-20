@@ -13,6 +13,9 @@ pub struct Message {
     pub tool_calls: Option<Vec<ToolCall>>,
     pub tool_call_id: Option<String>,
     pub ts: u64,
+    /// Optional thinking/reasoning content (for frontier models with thinking capability).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -157,6 +160,15 @@ pub struct Interrupted {
     pub user_initiated: bool,
 }
 
+/// A thinking/reasoning channel event from the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Thinking {
+    /// The thinking content (reasoning trace).
+    pub content: String,
+    /// Timestamp in milliseconds.
+    pub ts: u64,
+}
+
 /// Action taken on the configuration modal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -201,6 +213,7 @@ pub enum Event {
     ConfigModal(ConfigModalEvent),
     ConfigSaved(ConfigSaved),
     Interrupted(Interrupted),
+    Thinking(Thinking),
 }
 
 impl Event {
@@ -272,6 +285,10 @@ impl Event {
 
     pub fn interrupted(user_initiated: bool) -> Self {
         Event::Interrupted(Interrupted { user_initiated })
+    }
+
+    pub fn thinking(content: String, ts: u64) -> Self {
+        Event::Thinking(Thinking { content, ts })
     }
 }
 

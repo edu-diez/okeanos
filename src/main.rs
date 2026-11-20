@@ -647,7 +647,9 @@ async fn run_interactive_tui(
                 }
             }
             okeanos::events::MessageRole::Assistant => {
-                if let Err(e) = conversation.add_assistant_message(msg.content, msg.tool_calls) {
+                if let Err(e) =
+                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
+                {
                     eprintln!("[WARN] Failed to restore assistant message: {e}");
                 }
             }
@@ -662,16 +664,54 @@ async fn run_interactive_tui(
         }
     }
 
-    // Create tool registry with ALL built-in tools (using restored todo list)
+    // Create tool registry with tier-appropriate tools (using restored todo list)
     let todo_list = restored_todos;
     let mut tools = ToolRegistry::new();
-    tools.register(TodoTool::new(todo_list));
-    tools.register(ReadTool::new());
-    tools.register(WriteTool::new());
-    tools.register(EditTool::with_format(edit_format));
-    tools.register(DeleteTool::new());
-    tools.register(RunTool::new());
-    tools.register(GrepTool::new());
+
+    // Register tools based on model tier
+    let _allowed_tools = match model_tier {
+        okeanos::model::ModelTier::Small => {
+            // Small: read, edit, run
+            tools.register(ReadTool::new());
+            tools.register(EditTool::with_format(edit_format));
+            tools.register(RunTool::new());
+            vec!["read".to_string(), "edit".to_string(), "run".to_string()]
+        }
+        okeanos::model::ModelTier::Mid => {
+            // Mid: todo, read, write, delete, run, grep
+            tools.register(TodoTool::new(todo_list.clone()));
+            tools.register(ReadTool::new());
+            tools.register(WriteTool::new());
+            tools.register(DeleteTool::new());
+            tools.register(RunTool::new());
+            tools.register(GrepTool::new());
+            vec![
+                "todo".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+                "delete".to_string(),
+                "run".to_string(),
+                "grep".to_string(),
+            ]
+        }
+        okeanos::model::ModelTier::Frontier => {
+            // Frontier: todo, read, write, delete, run, grep
+            tools.register(TodoTool::new(todo_list.clone()));
+            tools.register(ReadTool::new());
+            tools.register(WriteTool::new());
+            tools.register(DeleteTool::new());
+            tools.register(RunTool::new());
+            tools.register(GrepTool::new());
+            vec![
+                "todo".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+                "delete".to_string(),
+                "run".to_string(),
+                "grep".to_string(),
+            ]
+        }
+    };
 
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
@@ -726,7 +766,8 @@ async fn run_interactive_tui(
     // log events to the session_manager in run_tui_and_loop.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
-        .with_approval_receiver(approval_rx);
+        .with_approval_receiver(approval_rx)
+        .with_project_root(project_root.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -745,6 +786,7 @@ async fn run_interactive_tui(
             tool_calls: None,
             tool_call_id: None,
             ts: current_timestamp(),
+            thinking: None,
         };
         let _ = loop_
             .event_tx()
@@ -912,6 +954,7 @@ async fn run_tui_and_loop(
                 tool_calls: None,
                 tool_call_id: None,
                 ts: current_timestamp(),
+                thinking: None,
             };
             let _ = loop_
                 .event_tx()
@@ -1203,7 +1246,9 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
                 }
             }
             okeanos::events::MessageRole::Assistant => {
-                if let Err(e) = conversation.add_assistant_message(msg.content, msg.tool_calls) {
+                if let Err(e) =
+                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
+                {
                     eprintln!("[WARN] Failed to restore assistant message: {e}");
                 }
             }
@@ -1220,16 +1265,54 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         }
     }
 
-    // Create tool registry with ALL built-in tools (using restored todo list)
+    // Create tool registry with tier-appropriate tools (using restored todo list)
     let todo_list = restored_todos;
     let mut tools = ToolRegistry::new();
-    tools.register(TodoTool::new(todo_list));
-    tools.register(ReadTool::new());
-    tools.register(WriteTool::new());
-    tools.register(EditTool::with_format(edit_format));
-    tools.register(DeleteTool::new());
-    tools.register(RunTool::new());
-    tools.register(GrepTool::new());
+
+    // Register tools based on model tier
+    let _allowed_tools = match model_tier {
+        okeanos::model::ModelTier::Small => {
+            // Small: read, edit, run
+            tools.register(ReadTool::new());
+            tools.register(EditTool::with_format(edit_format));
+            tools.register(RunTool::new());
+            vec!["read".to_string(), "edit".to_string(), "run".to_string()]
+        }
+        okeanos::model::ModelTier::Mid => {
+            // Mid: todo, read, write, delete, run, grep
+            tools.register(TodoTool::new(todo_list.clone()));
+            tools.register(ReadTool::new());
+            tools.register(WriteTool::new());
+            tools.register(DeleteTool::new());
+            tools.register(RunTool::new());
+            tools.register(GrepTool::new());
+            vec![
+                "todo".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+                "delete".to_string(),
+                "run".to_string(),
+                "grep".to_string(),
+            ]
+        }
+        okeanos::model::ModelTier::Frontier => {
+            // Frontier: todo, read, write, delete, run, grep
+            tools.register(TodoTool::new(todo_list.clone()));
+            tools.register(ReadTool::new());
+            tools.register(WriteTool::new());
+            tools.register(DeleteTool::new());
+            tools.register(RunTool::new());
+            tools.register(GrepTool::new());
+            vec![
+                "todo".to_string(),
+                "read".to_string(),
+                "write".to_string(),
+                "delete".to_string(),
+                "run".to_string(),
+                "grep".to_string(),
+            ]
+        }
+    };
 
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
@@ -1275,7 +1358,8 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     // for end_session() at the end. Instead, we manually log events.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
-        .with_approval_receiver(approval_rx);
+        .with_approval_receiver(approval_rx)
+        .with_project_root(project_root.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -1717,7 +1801,9 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
                 }
             }
             okeanos::events::MessageRole::Assistant => {
-                if let Err(e) = conversation.add_assistant_message(msg.content, msg.tool_calls) {
+                if let Err(e) =
+                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
+                {
                     eprintln!("[WARN] Failed to restore assistant message: {e}");
                 }
             }
@@ -1732,16 +1818,37 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
         }
     }
 
-    // Create tool registry with ALL built-in tools
+    // Create tool registry with tier-appropriate tools
     let todo_list = restored_todos;
     let mut tools = ToolRegistry::new();
-    tools.register(TodoTool::new(todo_list));
-    tools.register(ReadTool::new());
-    tools.register(WriteTool::new());
-    tools.register(EditTool::with_format(edit_format));
-    tools.register(DeleteTool::new());
-    tools.register(RunTool::new());
-    tools.register(GrepTool::new());
+
+    // Register tools based on model tier
+    match model_tier {
+        okeanos::model::ModelTier::Small => {
+            // Small: read, edit, run
+            tools.register(ReadTool::new());
+            tools.register(EditTool::with_format(edit_format));
+            tools.register(RunTool::new());
+        }
+        okeanos::model::ModelTier::Mid => {
+            // Mid: todo, read, write, delete, run, grep
+            tools.register(TodoTool::new(todo_list.clone()));
+            tools.register(ReadTool::new());
+            tools.register(WriteTool::new());
+            tools.register(DeleteTool::new());
+            tools.register(RunTool::new());
+            tools.register(GrepTool::new());
+        }
+        okeanos::model::ModelTier::Frontier => {
+            // Frontier: todo, read, write, delete, run, grep
+            tools.register(TodoTool::new(todo_list.clone()));
+            tools.register(ReadTool::new());
+            tools.register(WriteTool::new());
+            tools.register(DeleteTool::new());
+            tools.register(RunTool::new());
+            tools.register(GrepTool::new());
+        }
+    }
 
     // Build permission policy from config
     let allow_list = config
@@ -1837,7 +1944,8 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     let event_tx_for_loop = event_tx.clone();
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx_for_loop)
         .with_policy(policy)
-        .with_approval_receiver(approval_rx);
+        .with_approval_receiver(approval_rx)
+        .with_project_root(project_root.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);

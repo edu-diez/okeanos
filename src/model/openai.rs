@@ -987,6 +987,7 @@ mod tests {
             content: "Hello".to_string(),
             tool_calls: None,
             tool_call_id: None,
+            thinking: None,
         }];
         let params = GenerationParams {
             temperature: Some(0.7),
@@ -1019,6 +1020,7 @@ mod tests {
             content: "Hello".to_string(),
             tool_calls: None,
             tool_call_id: None,
+            thinking: None,
         }];
         let params = GenerationParams::default();
         let specs = vec![crate::tool::ToolSpec::new(

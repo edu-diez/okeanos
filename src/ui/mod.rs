@@ -493,6 +493,7 @@ impl TerminalApp {
             tool_calls: None,
             tool_call_id: None,
             ts: current_timestamp(),
+            thinking: None,
         };
         let _ = self.event_tx.send(crate::events::Event::Message(user_msg));
 

@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 not started.
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -593,44 +593,50 @@ Strategy: **small iterative milestones**. Each milestone is 1–2 sessions, intr
 
 ## Milestone 16 — MVP completion (actual gaps)
 
+**Status:** complete — tagged v0.1.0-milestone-16
+
 **Scope:**
 Four items marked "completed in M12.5" but not actually implemented — these are MVP requirements from PRODUCT_SPEC.md.
 
-### 16.1 Thinking channel event (FR-30)
-- Add `Thinking` variant to `Event` enum (DESIGN.md §7)
-- Emit `Thinking` events from model streaming chunks
-- Replay thinking into context only for large-context frontier models (tier-gated)
-- Small models: thinking captured but not replayed
+### 16.1 Thinking channel event (FR-30) ✅
+- Add `Thinking` variant to `Event` enum (DESIGN.md §7) ✅
+- Emit `Thinking` events from model streaming chunks ✅
+- Replay thinking into context only for large-context frontier models (tier-gated) ✅
+- Small models: thinking captured but not replayed ✅
 
-### 16.2 Tiered tool set (FR-25)
-- `ToolRegistry` filters tools by model tier
-- Small models: minimal set (read, edit, run)
-- Mid/Frontier models: full set (read, write, delete, run, grep, todo)
-- Update system prompts per tier to document available tools
+### 16.2 Tiered tool set (FR-25) ✅
+- `ToolRegistry` filters tools by model tier ✅
+- Small models: minimal set (read, edit, run) ✅
+- Mid/Frontier models: full set (read, write, delete, run, grep, todo) ✅
+- Update system prompts per tier to document available tools ✅
 
-### 16.3 Selective context inclusion (FR-26)
-- Implement ripgrep-based symbol scanning in `src/context/selective.rs`
-- Extract search terms from user prompt + recent conversation
-- Filter included files by relevance; cap total tokens per tier
-- Pure Rust only — no tree-sitter/C deps
+### 16.3 Selective context inclusion (FR-26) ✅
+- Implement ripgrep-based symbol scanning in `src/context/selective.rs` ✅ (pure Rust file walking + regex)
+- Extract search terms from user prompt + recent conversation ✅
+- Filter included files by relevance; cap total tokens per tier ✅
+- Pure Rust only — no tree-sitter/C deps ✅
 
-### 16.4 `/approve`, `/deny` in command palette (DESIGN §5)
-- Add `/approve` and `/deny` slash commands to palette
-- Resolve latest pending `ApprovalRequest` without modal
-- Emit corresponding `Approval` event for headless/RPC parity
+### 16.4 `/approve`, `/deny` in command palette (DESIGN §5) ✅
+- Add `/approve` and `/deny` slash commands to palette ✅
+- Resolve latest pending `ApprovalRequest` without modal ✅
+- Emit corresponding `Approval` event for headless/RPC parity ✅
 
 **Out of scope:** Full settings palette, theme selection, key binding customization.
 
-**Acceptance criteria:**
+**Acceptance criteria:** ✅ All verified
 - `Event::Thinking` variant exists and is emitted during streaming
 - Small model tier gets only {read, edit, run}; frontier gets all 6 tools
 - `selective.rs` returns relevant file subset; token count respects tier cap
 - Command palette shows `/approve` `/deny`; they resolve pending approval
-- Headless mode: `/approve` `/deny` emit JSON `Approval` events
+- Headless mode: `/approve` `/deny` emit JSON `Approval` events (via approval channel)
 
-**Testing requirements:** Unit tests for Thinking event emission, tiered tool registry, selective context filtering, command palette approval commands. No network (mock provider).
+**Testing requirements:** Unit tests for Thinking event emission, tiered tool registry, selective context filtering, command palette approval commands. No network (mock provider). ✅ All 311 tests pass.
 
-**Definition of Done:** CI green; all four MVP gaps closed; milestone tagged.
+**Definition of Done:** ✅ CI green; all four MVP gaps closed; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (311 unit tests)
+- `cargo build --release` produces a single binary
 
 ---
 
@@ -667,12 +673,15 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - Preserve recent N turns + system prompt + skills + todos
 - **Out of scope:** Compaction-aware tool calls, multi-agent summary delegation.
 
-### Milestone 19 — Anthropic / Claude provider
-**Scope:** Add Anthropic provider behind feature flag.
-- Implement `Model` trait for Anthropic Messages API
-- Map `ModelCapabilities` (tool_calling, thinking, etc.)
-- Config-driven selection: `provider.kind = "anthropic"`
-- **Out of scope:** Other providers (Azure, Vertex, etc. — separate milestones).
+### Milestone 19 — Additional model providers (Anthropic, OpenAI, Google)
+**Scope:** Add multiple model providers behind feature flags.
+- **Anthropic/Claude**: Implement `Model` trait for Anthropic Messages API
+- **OpenAI**: Implement `Model` trait for native OpenAI API (distinct from OpenRouter)
+- **Google/Gemini**: Implement `Model` trait for Google Generative AI API
+- Map `ModelCapabilities` (tool_calling, thinking, structured_output, etc.) for each
+- Config-driven selection: `provider.kind = "anthropic" | "openai" | "google"`
+- Provider-specific auth/config: base_url, api_key, model-specific parameters
+- **Out of scope:** Azure, Vertex, Bedrock, etc. — separate milestones.
 
 ### Milestone 20 — WebSocket RPC transport
 **Scope:** Add WebSocket transport for JSON-RPC (feature-gated).
@@ -755,14 +764,14 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 13 | ✅ Git snapshots + undo/redo | 2 | M6 |
 | 14 | Headless/RPC | 2 | M2, M8, M11, M12 |
 | 15 | ✅ Apple Silicon support | 1–2 | M0 |
-| 16 | **MVP completion (actual gaps)** | 2–3 | M12, M12.5, M13 |
+| 16 | ✅ MVP completion (actual gaps) | 2–3 | M12, M12.5, M13 |
 | 17 | Config layer cleanup | 1 | M1 |
 
 **Post-MVP (independent, can parallelize):**
 | Milestone | Deliverable | Sessions (est.) | Depends on |
 |-----------|-------------|-----------------|------------|
 | 18 | Context compaction | 2 | M16 |
-| 19 | Anthropic provider | 1–2 | M16 |
+| 19 | Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
 | 20 | WebSocket RPC | 1 | M14 |
 | 21 | MCP client | 2–3 | M16 |
 | 22 | Session log rotation | 1 | M13 |
