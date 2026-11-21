@@ -678,11 +678,40 @@ Four items marked "completed in M12.5" but not actually implemented — these ar
 These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, independent milestone.
 
 ### Milestone 18 — Context compaction / summarization
+
+**Status:** complete — tagged v0.2.0
+
 **Scope:** Implement context compaction to work around hard cap for long sessions.
 - Summarization strategy: LLM-based summary of older turns
 - Configurable trigger (e.g., at 75% context cap)
 - Preserve recent N turns + system prompt + skills + todos
 - **Out of scope:** Compaction-aware tool calls, multi-agent summary delegation.
+
+**Acceptance criteria:**
+- Automatic compaction triggers at configured threshold (default 75% of context cap)
+- Manual compaction via `/compact` slash command
+- Two strategies: Basic (deterministic, Cline-inspired) and Agentic (LLM-based, OpenCode/Codex-inspired)
+- Tier-aware default: Small models → Basic, Mid/Frontier → Agentic
+- Preserves recent N tokens (default 15k) + system prompt + skills + todos verbatim
+- Dropped-work summaries include tool call signatures, file read/modified lists with line ranges
+- Native compaction delegation interface (`Model::compact_native`) for OpenAI Responses, Anthropic
+- Compaction events emitted to event stream (TUI/headless/RPC parity)
+- Observer pattern for future M23/M27 integration
+- Configuration validation for all compaction settings
+
+**Testing requirements:** Unit tests for CompactionBudget, strategy resolution, file ops extraction, Basic and Agentic compaction logic. Integration tests for automatic compaction trigger in ReactLoop, manual `/compact` command via command palette, event emission.
+
+**Definition of Done:** CI green; automatic and manual compaction verified end-to-end in headless and TUI modes; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (316 unit tests)
+- `cargo build --release` produces a single binary
+- Automatic compaction triggers at threshold and reduces token usage
+- Manual `/compact` command works in TUI and headless modes
+- CompactionEvent emitted with correct metadata
+- Native compaction interface available on Model trait
+- Configuration validation rejects invalid values
+- Tagged v0.1.0-milestone-18
 
 ### Milestone 19 — Additional model providers (Anthropic, OpenAI, Google)
 **Scope:** Add multiple model providers behind feature flags.
@@ -781,7 +810,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 **Post-MVP (independent, can parallelize):**
 | Milestone | Deliverable | Sessions (est.) | Depends on |
 |-----------|-------------|-----------------|------------|
-| 18 | Context compaction | 2 | M16 |
+| 18 | ✅ Context compaction | 2 | M16 |
 | 19 | Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
 | 20 | WebSocket RPC | 1 | M14 |
 | 21 | MCP client | 2–3 | M16 |

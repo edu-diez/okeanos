@@ -182,6 +182,8 @@ pub struct Config {
     pub ui: Option<UiSection>,
     #[serde(default)]
     pub snapshots: Option<SnapshotsSection>,
+    #[serde(default)]
+    pub compaction: Option<CompactionSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -198,6 +200,7 @@ impl std::fmt::Debug for Config {
             .field("cost", &self.cost)
             .field("ui", &self.ui)
             .field("snapshots", &self.snapshots)
+            .field("compaction", &self.compaction)
             .finish()
     }
 }
@@ -293,6 +296,62 @@ pub struct UiSection {
 pub struct SnapshotsSection {
     /// Enable git snapshots (default: false - opt-in)
     pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CompactionSection {
+    /// Enable context compaction (default: true)
+    pub enabled: Option<bool>,
+    /// Trigger ratio: compact when context reaches this fraction of the cap (default: 0.75)
+    pub trigger_ratio: Option<f32>,
+    /// Target ratio: compact down to this fraction of the cap (default: 0.5)
+    pub target_ratio: Option<f32>,
+    /// Number of recent tokens to preserve verbatim (default: 15000)
+    pub preserve_recent_tokens: Option<usize>,
+    /// Compaction strategy: "basic" (deterministic), "agentic" (LLM summary), "auto" (tier-aware)
+    pub strategy: Option<String>,
+    /// Optional cheaper model for agentic summarization (e.g., "openrouter/google/gemini-flash-1.5")
+    pub summarizer_model: Option<String>,
+    /// Per-provider native compaction settings
+    #[serde(default)]
+    pub providers: CompactionProvidersSection,
+    /// Per-model strategy overrides
+    #[serde(default)]
+    pub model_overrides: std::collections::HashMap<String, CompactionModelOverride>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CompactionProvidersSection {
+    /// OpenAI Responses API native compaction settings
+    #[serde(default)]
+    pub openai_responses: OpenAIResponsesCompactionSection,
+    /// Anthropic native compaction settings
+    #[serde(default)]
+    pub anthropic: AnthropicCompactionSection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OpenAIResponsesCompactionSection {
+    /// Use native compaction endpoint (default: true)
+    pub native_enabled: Option<bool>,
+    /// Native compaction version: "v1" or "v2" (default: "v2")
+    pub native_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AnthropicCompactionSection {
+    /// Use native compaction API (default: true)
+    pub native_enabled: Option<bool>,
+    /// Compaction type: "on_demand" or "threshold" (default: "on_demand")
+    pub compaction_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CompactionModelOverride {
+    /// Force strategy for this model: "basic", "agentic", or "auto"
+    pub strategy: Option<String>,
+    /// Override preserve_recent_tokens for this model
+    pub preserve_recent_tokens: Option<usize>,
 }
 
 /// Errors raised while loading or validating configuration.
@@ -519,6 +578,78 @@ impl Config {
             return Err(ConfigError::Validation {
                 message: format!("provider.kind must be 'openai-compatible', got '{kind}'"),
             });
+        }
+
+        // Validate compaction section
+        if let Some(compaction) = &self.compaction {
+            if let Some(trigger) = compaction.trigger_ratio
+                && !(0.0 < trigger && trigger <= 1.0)
+            {
+                return Err(ConfigError::Validation {
+                    message: "compaction.trigger_ratio must be in (0, 1]".to_string(),
+                });
+            }
+            if let Some(target) = compaction.target_ratio
+                && !(0.0 < target && target <= 1.0)
+            {
+                return Err(ConfigError::Validation {
+                    message: "compaction.target_ratio must be in (0, 1]".to_string(),
+                });
+            }
+            if let Some(preserve) = compaction.preserve_recent_tokens
+                && preserve == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "compaction.preserve_recent_tokens must be > 0".to_string(),
+                });
+            }
+            if let Some(strategy) = &compaction.strategy
+                && !matches!(strategy.as_str(), "basic" | "agentic" | "auto")
+            {
+                return Err(ConfigError::Validation {
+                    message: "compaction.strategy must be 'basic', 'agentic', or 'auto'"
+                        .to_string(),
+                });
+            }
+            // Validate OpenAI Responses native version
+            if let Some(version) = &compaction.providers.openai_responses.native_version
+                && !matches!(version.as_str(), "v1" | "v2")
+            {
+                return Err(ConfigError::Validation {
+                    message:
+                        "compaction.providers.openai_responses.native_version must be 'v1' or 'v2'"
+                            .to_string(),
+                });
+            }
+            // Validate Anthropic compaction type
+            if let Some(ctype) = &compaction.providers.anthropic.compaction_type
+                && !matches!(ctype.as_str(), "on_demand" | "threshold")
+            {
+                return Err(ConfigError::Validation {
+                    message: "compaction.providers.anthropic.compaction_type must be 'on_demand' or 'threshold'".to_string(),
+                });
+            }
+            // Validate model overrides
+            for (model_name, override_) in &compaction.model_overrides {
+                if let Some(strategy) = &override_.strategy
+                    && !matches!(strategy.as_str(), "basic" | "agentic" | "auto")
+                {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "compaction.model_overrides.{model_name}.strategy must be 'basic', 'agentic', or 'auto'"
+                        ),
+                    });
+                }
+                if let Some(preserve) = override_.preserve_recent_tokens
+                    && preserve == 0
+                {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "compaction.model_overrides.{model_name}.preserve_recent_tokens must be > 0"
+                        ),
+                    });
+                }
+            }
         }
 
         Ok(())

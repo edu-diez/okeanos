@@ -1,3 +1,4 @@
+use crate::context::compaction::{NativeCompactionRequest, NativeCompactionResponse};
 use crate::events::ToolCall;
 use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
@@ -185,6 +186,18 @@ pub trait Model: Send + Sync {
         Pin<Box<dyn Stream<Item = Result<ModelStreamChunk, ModelError>> + Send + 'static>>,
         ModelError,
     >;
+
+    /// Optional: provider-native context compaction.
+    ///
+    /// Returns `None` if not supported (client-side fallback will be used).
+    /// Implementations should delegate to provider compaction endpoints
+    /// (e.g., OpenAI Responses `compaction_trigger`, Anthropic compaction API).
+    async fn compact_native(
+        &self,
+        _request: NativeCompactionRequest,
+    ) -> Result<Option<NativeCompactionResponse>, ModelError> {
+        Ok(None)
+    }
 
     /// Validate that the model has the required capabilities.
     fn require_capability(&self, capability: &str) -> Result<(), ModelError> {

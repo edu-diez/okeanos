@@ -268,7 +268,7 @@ impl Conversation {
     }
 
     /// Recalculate total estimated tokens (system + messages + files).
-    fn recalculate_tokens(&mut self) {
+    pub fn recalculate_tokens(&mut self) {
         let system_tokens = self
             .token_counter
             .count_message("system", &self.system_prompt);
@@ -282,6 +282,12 @@ impl Conversation {
             .sum();
         let file_tokens: usize = self.included_files.iter().map(|f| f.tokens).sum();
         self.estimated_tokens = system_tokens + message_tokens + file_tokens;
+    }
+
+    /// Replace message history (used for compaction).
+    pub fn replace_messages(&mut self, messages: Vec<crate::events::Message>) {
+        self.messages = messages;
+        self.recalculate_tokens();
     }
 
     /// Get context usage breakdown for status display.

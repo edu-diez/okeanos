@@ -952,6 +952,44 @@ async fn run_tui_and_loop(
             }
         }
 
+        // Check for compaction actions from command palette
+        if let Ok(action) = tui_app.compaction_rx.try_recv() {
+            match action {
+                okeanos::ui::CompactionAction::Compact => match loop_.compact_context().await {
+                    Ok(Some(result)) => {
+                        let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                            okeanos::events::Log {
+                                level: okeanos::events::LogLevel::Info,
+                                message: format!(
+                                    "Compaction complete: {} -> {} tokens ({} msgs removed)",
+                                    result.tokens_before,
+                                    result.tokens_after,
+                                    result.messages_removed
+                                ),
+                            },
+                        ));
+                    }
+                    Ok(None) => {
+                        let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                            okeanos::events::Log {
+                                level: okeanos::events::LogLevel::Warn,
+                                message: "Compaction not available (no compaction manager)"
+                                    .to_string(),
+                            },
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = loop_.event_tx().send(okeanos::events::Event::Log(
+                            okeanos::events::Log {
+                                level: okeanos::events::LogLevel::Error,
+                                message: format!("Compaction failed: {}", e),
+                            },
+                        ));
+                    }
+                },
+            }
+        }
+
         // Check for composer input (user submitted a prompt)
         if let Ok(user_prompt) = composer_rx.try_recv() {
             // Hide welcome screen on first user input

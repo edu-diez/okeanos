@@ -32,6 +32,13 @@ pub enum UndoRedoAction {
     Redo,
 }
 
+/// Compaction action from command palette.
+#[derive(Debug, Clone, Copy)]
+pub enum CompactionAction {
+    /// Trigger manual compaction now.
+    Compact,
+}
+
 /// TUI application state for single-turn interactive mode.
 pub struct TerminalApp {
     pub theme_manager: ThemeManager,
@@ -60,6 +67,9 @@ pub struct TerminalApp {
     /// Channel for undo/redo actions
     pub undo_redo_tx: mpsc::Sender<UndoRedoAction>,
     pub undo_redo_rx: mpsc::Receiver<UndoRedoAction>,
+    /// Channel for compaction actions
+    pub compaction_tx: mpsc::Sender<CompactionAction>,
+    pub compaction_rx: mpsc::Receiver<CompactionAction>,
     pub terminal: Terminal<CrosstermBackend<io::Stdout>>,
     pub last_tick: Instant,
     pub running: bool,
@@ -114,6 +124,7 @@ impl TerminalApp {
         let (composer_tx, composer_rx) = mpsc::channel(16);
         let (palette_tx, palette_rx) = mpsc::channel(16);
         let (undo_redo_tx, undo_redo_rx) = mpsc::channel(16);
+        let (compaction_tx, compaction_rx) = mpsc::channel(16);
 
         // Create layout
         let area = ratatui::layout::Rect::new(0, 0, width, height);
@@ -169,6 +180,8 @@ impl TerminalApp {
             palette_rx,
             undo_redo_tx,
             undo_redo_rx,
+            compaction_tx,
+            compaction_rx,
             terminal,
             last_tick: Instant::now(),
             running: true,
@@ -696,6 +709,14 @@ impl TerminalApp {
             }
             CommandAction::Logs => {
                 self.log_tail.cycle_filter();
+            }
+            CommandAction::Compact => {
+                let _ = self.compaction_tx.try_send(CompactionAction::Compact);
+                self.emit_log(
+                    crate::events::LogLevel::Info,
+                    "Manual compaction requested".to_string(),
+                )
+                .await;
             }
             CommandAction::Custom(_) => {}
         }

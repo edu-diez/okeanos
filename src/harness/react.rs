@@ -1,10 +1,11 @@
 //! ReAct loop — core control flow: think → tool → observe → repeat.
 
+use crate::context::compaction::{CompactionConfig, CompactionManager};
 use crate::context::{Conversation, ConversationError};
 use crate::cost::{CostBudgetError, CostTracker};
 use crate::events::{
-    Approval, ApprovalDecision, ApprovalRequest, Event, EventSender, LogLevel, Message,
-    MessageRole, ToolCall, ToolCallStatus, ToolResult,
+    Approval, ApprovalDecision, ApprovalRequest, CompactionEvent, CompactionTrigger, Event,
+    EventSender, LogLevel, Message, MessageRole, ToolCall, ToolCallStatus, ToolResult,
 };
 use crate::harness::retry::{RetryDecision, RetryPolicy};
 use crate::model::text_tool::{TextToolError, TextToolParser};
@@ -132,6 +133,8 @@ pub struct ReactLoop<M: Model> {
     cost_tracker: Option<CostTracker>,
     /// Optional snapshot store for git snapshots before destructive actions.
     snapshot_store: Option<SnapshotStore>,
+    /// Optional compaction manager for context compaction.
+    compaction_manager: Option<CompactionManager>,
     /// Event index counter for snapshot metadata.
     event_index: usize,
     /// Project root for selective context inclusion.
@@ -162,6 +165,7 @@ impl<M: Model> ReactLoop<M> {
             session: None,
             cost_tracker: None,
             snapshot_store: None,
+            compaction_manager: None,
             event_index: 0,
             project_root: None,
         }
@@ -227,6 +231,12 @@ impl<M: Model> ReactLoop<M> {
     /// Set the snapshot store for git snapshots before destructive actions.
     pub fn with_snapshot_store(mut self, store: SnapshotStore) -> Self {
         self.snapshot_store = Some(store);
+        self
+    }
+
+    /// Set the compaction manager for context compaction.
+    pub fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction_manager = Some(CompactionManager::new(config));
         self
     }
 
@@ -339,6 +349,45 @@ impl<M: Model> ReactLoop<M> {
             .unwrap_or(false)
     }
 
+    /// Manually trigger context compaction.
+    ///
+    /// This can be called from slash commands (e.g., `/compact`) to force
+    /// compaction regardless of the current token usage.
+    pub async fn compact_context(
+        &mut self,
+    ) -> Result<Option<crate::context::compaction::CompactionResult>, ReactError> {
+        if let Some(compaction_manager) = &mut self.compaction_manager {
+            let result = compaction_manager
+                .maybe_compact(
+                    &*self.model,
+                    &mut self.conversation,
+                    CompactionTrigger::Manual,
+                )
+                .await
+                .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?;
+
+            if let Some(ref result) = result {
+                // Emit compaction event
+                let compaction_event = CompactionEvent {
+                    trigger: CompactionTrigger::Manual,
+                    strategy: result.strategy_used.clone(),
+                    tokens_before: result.tokens_before,
+                    tokens_after: result.tokens_after,
+                    messages_removed: result.messages_removed,
+                    turns_summarized: result.turns_summarized,
+                    native_provider: result.native_provider.clone(),
+                    summary: result.summary.clone(),
+                    ts: current_timestamp(),
+                };
+                self.emit_compaction(compaction_event).await;
+            }
+
+            Ok(result)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Run the ReAct loop until completion or termination.
     pub async fn run(mut self, initial_prompt: String) -> Result<String, ReactError> {
         // Add initial user message
@@ -423,6 +472,32 @@ impl<M: Model> ReactLoop<M> {
                 .await;
             }
 
+            // Check and perform context compaction if needed
+            if let Some(compaction_manager) = &mut self.compaction_manager
+                && let Some(result) = compaction_manager
+                    .maybe_compact(
+                        &*self.model,
+                        &mut self.conversation,
+                        CompactionTrigger::Auto,
+                    )
+                    .await
+                    .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?
+            {
+                // Emit compaction event
+                let compaction_event = CompactionEvent {
+                    trigger: CompactionTrigger::Auto,
+                    strategy: result.strategy_used.clone(),
+                    tokens_before: result.tokens_before,
+                    tokens_after: result.tokens_after,
+                    messages_removed: result.messages_removed,
+                    turns_summarized: result.turns_summarized,
+                    native_provider: result.native_provider.clone(),
+                    summary: result.summary.clone(),
+                    ts: current_timestamp(),
+                };
+                self.emit_compaction(compaction_event).await;
+            }
+
             // Run one iteration
             match self.iterate(&mut shutdown_rx).await? {
                 LoopDecision::Continue => {
@@ -498,6 +573,32 @@ impl<M: Model> ReactLoop<M> {
                 ),
             )
             .await;
+        }
+
+        // Check and perform context compaction if needed
+        if let Some(compaction_manager) = &mut self.compaction_manager
+            && let Some(result) = compaction_manager
+                .maybe_compact(
+                    &*self.model,
+                    &mut self.conversation,
+                    CompactionTrigger::Auto,
+                )
+                .await
+                .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?
+        {
+            // Emit compaction event
+            let compaction_event = CompactionEvent {
+                trigger: CompactionTrigger::Auto,
+                strategy: result.strategy_used.clone(),
+                tokens_before: result.tokens_before,
+                tokens_after: result.tokens_after,
+                messages_removed: result.messages_removed,
+                turns_summarized: result.turns_summarized,
+                native_provider: result.native_provider.clone(),
+                summary: result.summary.clone(),
+                ts: current_timestamp(),
+            };
+            self.emit_compaction(compaction_event).await;
         }
 
         // Run exactly one iteration with the provided shutdown receiver
@@ -1369,6 +1470,15 @@ impl<M: Model> ReactLoop<M> {
     /// Emit a log event.
     async fn emit_log(&mut self, level: crate::events::LogLevel, message: String) {
         let event = Event::Log(crate::events::Log { level, message });
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &mut self.session {
+            let _ = session.log_event(event);
+        }
+    }
+
+    /// Emit a compaction event.
+    async fn emit_compaction(&mut self, event: CompactionEvent) {
+        let event = Event::Compaction(event);
         let _ = self.event_tx.send(event.clone());
         if let Some(session) = &mut self.session {
             let _ = session.log_event(event);

@@ -23,6 +23,7 @@ pub enum CommandAction {
     Deny,
     Todos,
     Logs,
+    Compact,
     Custom(String),
 }
 
@@ -37,6 +38,7 @@ impl CommandAction {
             CommandAction::Deny => "/deny",
             CommandAction::Todos => "/todos",
             CommandAction::Logs => "/logs",
+            CommandAction::Compact => "/compact",
             CommandAction::Custom(s) => s,
         }
     }
@@ -51,6 +53,7 @@ impl CommandAction {
             CommandAction::Deny => "Deny pending tool call",
             CommandAction::Todos => "Show/hide todo panel",
             CommandAction::Logs => "Show/hide log panel",
+            CommandAction::Compact => "Compact context (summarize history)",
             CommandAction::Custom(_) => "Custom command",
         }
     }
@@ -65,6 +68,7 @@ impl CommandAction {
             CommandAction::Deny,
             CommandAction::Todos,
             CommandAction::Logs,
+            CommandAction::Compact,
         ]
     }
 }
@@ -420,7 +424,7 @@ mod tests {
         let palette = CommandPalette::new(test_theme());
         assert!(!palette.is_visible());
         assert_eq!(palette.query(), "");
-        assert_eq!(palette.filtered.len(), 7); // 7 built-in commands
+        assert_eq!(palette.filtered.len(), 8); // 8 built-in commands (including /compact)
     }
 
     #[test]
@@ -501,9 +505,14 @@ mod tests {
         assert_eq!(CommandAction::Deny.command(), "/deny");
         assert_eq!(CommandAction::Todos.command(), "/todos");
         assert_eq!(CommandAction::Logs.command(), "/logs");
+        assert_eq!(CommandAction::Compact.command(), "/compact");
 
         assert_eq!(CommandAction::Help.description(), "Show help");
         assert_eq!(CommandAction::Undo.description(), "Undo last action");
+        assert_eq!(
+            CommandAction::Compact.description(),
+            "Compact context (summarize history)"
+        );
     }
 
     #[test]

@@ -169,6 +169,55 @@ pub struct Thinking {
     pub ts: u64,
 }
 
+/// Context compaction event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompactionEvent {
+    /// The trigger that initiated compaction.
+    pub trigger: CompactionTrigger,
+    /// The compaction strategy used.
+    pub strategy: CompactionStrategy,
+    /// Tokens before compaction.
+    pub tokens_before: usize,
+    /// Tokens after compaction.
+    pub tokens_after: usize,
+    /// Number of messages removed.
+    pub messages_removed: usize,
+    /// Number of turns summarized.
+    pub turns_summarized: usize,
+    /// Whether native provider compaction was used.
+    pub native_provider: Option<String>,
+    /// Human-readable summary of what was compacted.
+    pub summary: String,
+    /// Timestamp in milliseconds.
+    pub ts: u64,
+}
+
+/// Trigger that initiated compaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// Automatic compaction at threshold.
+    Auto,
+    /// Manual compaction via /compact command.
+    Manual,
+    /// Compaction due to provider context overflow.
+    OverflowRecovery,
+    /// Compaction after model switch to smaller context.
+    ModelDownshift,
+}
+
+/// Compaction strategy used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    /// Deterministic truncation with dropped-work summaries.
+    Basic,
+    /// LLM-based summarization.
+    Agentic,
+    /// Native provider compaction (OpenAI Responses, Anthropic).
+    Native,
+}
+
 /// Action taken on the configuration modal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +263,7 @@ pub enum Event {
     ConfigSaved(ConfigSaved),
     Interrupted(Interrupted),
     Thinking(Thinking),
+    Compaction(CompactionEvent),
 }
 
 impl Event {
@@ -289,6 +339,10 @@ impl Event {
 
     pub fn thinking(content: String, ts: u64) -> Self {
         Event::Thinking(Thinking { content, ts })
+    }
+
+    pub fn compaction(event: CompactionEvent) -> Self {
+        Event::Compaction(event)
     }
 }
 
