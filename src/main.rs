@@ -11,8 +11,8 @@ use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::headless::{EventEmitter, HeadlessConfig};
 use okeanos::model::{
-    GenerationParams, MockModel, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse,
-    ModelStreamChunk, OpenRouterModel,
+    AnthropicModel, GenerationParams, GoogleModel, MockModel, Model, ModelCapabilities, ModelError,
+    ModelMessage, ModelResponse, ModelStreamChunk, OpenAIModel, OpenRouterModel,
 };
 use okeanos::session::{SessionManager, replay_events};
 use okeanos::snapshot::store::SnapshotStore;
@@ -69,13 +69,16 @@ async fn main() -> anyhow::Result<()> {
 
 // Helper to run with a prompt (for Run subcommand or implicit run)
 
-// ActiveModel wraps either a MockModel (testing/dev) or an OpenRouterModel
-// (real provider) behind a single concrete type that implements `Model`.
+// ActiveModel wraps either a MockModel (testing/dev) or a real provider model
+// behind a single concrete type that implements `Model`.
 // This is needed because `ReactLoop` is generic over `M: Model` and requires
 // `M: Sized`, so we cannot use `dyn Model` directly.
 enum ActiveModel {
     Mock(MockModel),
     OpenRouter(OpenRouterModel),
+    OpenAI(OpenAIModel),
+    Anthropic(AnthropicModel),
+    Google(GoogleModel),
 }
 
 #[async_trait::async_trait]
@@ -84,6 +87,9 @@ impl Model for ActiveModel {
         match self {
             ActiveModel::Mock(m) => m.capabilities(),
             ActiveModel::OpenRouter(m) => m.capabilities(),
+            ActiveModel::OpenAI(m) => m.capabilities(),
+            ActiveModel::Anthropic(m) => m.capabilities(),
+            ActiveModel::Google(m) => m.capabilities(),
         }
     }
 
@@ -91,6 +97,9 @@ impl Model for ActiveModel {
         match self {
             ActiveModel::Mock(m) => m.model_id(),
             ActiveModel::OpenRouter(m) => m.model_id(),
+            ActiveModel::OpenAI(m) => m.model_id(),
+            ActiveModel::Anthropic(m) => m.model_id(),
+            ActiveModel::Google(m) => m.model_id(),
         }
     }
 
@@ -103,6 +112,9 @@ impl Model for ActiveModel {
         match self {
             ActiveModel::Mock(m) => m.complete(messages, params, tools).await,
             ActiveModel::OpenRouter(m) => m.complete(messages, params, tools).await,
+            ActiveModel::OpenAI(m) => m.complete(messages, params, tools).await,
+            ActiveModel::Anthropic(m) => m.complete(messages, params, tools).await,
+            ActiveModel::Google(m) => m.complete(messages, params, tools).await,
         }
     }
 
@@ -118,6 +130,9 @@ impl Model for ActiveModel {
         match self {
             ActiveModel::Mock(m) => m.stream(messages, params, tools).await,
             ActiveModel::OpenRouter(m) => m.stream(messages, params, tools).await,
+            ActiveModel::OpenAI(m) => m.stream(messages, params, tools).await,
+            ActiveModel::Anthropic(m) => m.stream(messages, params, tools).await,
+            ActiveModel::Google(m) => m.stream(messages, params, tools).await,
         }
     }
 
@@ -125,6 +140,9 @@ impl Model for ActiveModel {
         match self {
             ActiveModel::Mock(m) => m.require_capability(capability),
             ActiveModel::OpenRouter(m) => m.require_capability(capability),
+            ActiveModel::OpenAI(m) => m.require_capability(capability),
+            ActiveModel::Anthropic(m) => m.require_capability(capability),
+            ActiveModel::Google(m) => m.require_capability(capability),
         }
     }
 }
@@ -220,7 +238,7 @@ fn default_config_content() -> String {
 
 # Model configuration
 [model]
-# Model name (e.g., "gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet")
+# Model name (e.g., "gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet", "gemini-1.5-pro")
 # For local/self-hosted models, you must also provide [model.capabilities]
 name = "gpt-4o-mini"
 # Tier: "small" or "frontier" (affects prompt size, tool selection, generation params)
@@ -248,9 +266,9 @@ tier = "frontier"
 
 # Provider configuration
 [provider]
-# Provider kind (currently only "openai-compatible")
+# Provider kind: "openai-compatible" (OpenRouter, local vLLM), "anthropic", "openai", or "google"
 kind = "openai-compatible"
-# Base URL for the API (e.g., "https://openrouter.ai/api/v1")
+# Base URL for the API (e.g., "https://openrouter.ai/api/v1", "https://api.anthropic.com", "https://api.openai.com", "https://generativelanguage.googleapis.com")
 base_url = "https://openrouter.ai/api/v1"
 # API key: use {env:VAR} or {file:path} for secret substitution
 # api_key = "{env:OPENROUTER_API_KEY}"
@@ -583,8 +601,8 @@ async fn run_interactive_tui(
         .unwrap_or(model_capabilities.max_context)
         .max(1);
 
-    // Create model: real OpenRouter/OpenAI-compatible provider when an API key
-    // is configured, otherwise fall back to the mock model for testing.
+    // Create model: real provider when an API key is configured,
+    // otherwise fall back to the mock model for testing.
     let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
         && let Some(api_key) = &provider.api_key
         && !api_key.is_empty()
@@ -592,17 +610,49 @@ async fn run_interactive_tui(
         let base_url = provider
             .base_url
             .as_deref()
-            .unwrap_or(okeanos::model::DEFAULT_BASE_URL);
+            .unwrap_or(match provider.kind.as_deref() {
+                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
+                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
+                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
+                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
+            });
         let client = reqwest::Client::new();
-        let pricing = None;
-        Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-            client,
-            base_url,
-            api_key,
-            &model_name,
-            model_capabilities.clone(),
-            pricing,
-        )))
+        let pricing = None; // Pricing would come from discovery
+        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
+        match provider_kind {
+            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+        }
     } else {
         let m = MockModel::new(model_capabilities.clone(), model_name.clone());
         // For mock model in interactive mode, provide a simple completion response
@@ -1226,8 +1276,8 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         .unwrap_or(model_capabilities.max_context)
         .max(1); // Ensure at least 1
 
-    // Create model: real OpenRouter/OpenAI-compatible provider when an API key
-    // is configured, otherwise fall back to the mock model for testing.
+    // Create model: real provider when an API key is configured,
+    // otherwise fall back to the mock model for testing.
     let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
         && let Some(api_key) = &provider.api_key
         && !api_key.is_empty()
@@ -1235,17 +1285,49 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         let base_url = provider
             .base_url
             .as_deref()
-            .unwrap_or(okeanos::model::DEFAULT_BASE_URL);
+            .unwrap_or(match provider.kind.as_deref() {
+                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
+                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
+                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
+                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
+            });
         let client = reqwest::Client::new();
-        let pricing = None; // Pricing would come from discovery (M9)
-        Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-            client,
-            base_url,
-            api_key,
-            &model_name,
-            model_capabilities.clone(),
-            pricing,
-        )))
+        let pricing = None; // Pricing would come from discovery
+        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
+        match provider_kind {
+            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+        }
     } else {
         let m = MockModel::new(model_capabilities.clone(), model_name.clone());
         m.push_response(okeanos::model::mock::MockModel::text_response(
@@ -1792,17 +1874,49 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
         let base_url = provider
             .base_url
             .as_deref()
-            .unwrap_or(okeanos::model::DEFAULT_BASE_URL);
+            .unwrap_or(match provider.kind.as_deref() {
+                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
+                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
+                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
+                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
+            });
         let client = reqwest::Client::new();
         let pricing = None;
-        Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-            client,
-            base_url,
-            api_key,
-            &model_name,
-            model_capabilities.clone(),
-            pricing,
-        )))
+        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
+        match provider_kind {
+            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
+                client,
+                base_url,
+                api_key,
+                &model_name,
+                model_capabilities.clone(),
+                pricing,
+            ))),
+        }
     } else {
         let m = MockModel::new(model_capabilities.clone(), model_name.clone());
         m.push_response(okeanos::model::mock::MockModel::text_response(

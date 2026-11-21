@@ -477,6 +477,10 @@ impl Config {
                         | "gpt-3.5-turbo"
                         | "claude-3-5-sonnet"
                         | "claude-3-haiku"
+                        | "gemini-1.5-pro"
+                        | "gemini-1.5-flash"
+                        | "gemini-1.0-pro"
+                        | "gemini-1.0-ultra"
                 )
             });
 
@@ -573,10 +577,15 @@ impl Config {
         // Validate provider section
         if let Some(provider) = &self.provider
             && let Some(kind) = &provider.kind
-            && kind != "openai-compatible"
+            && !matches!(
+                kind.as_str(),
+                "openai-compatible" | "anthropic" | "openai" | "google"
+            )
         {
             return Err(ConfigError::Validation {
-                message: format!("provider.kind must be 'openai-compatible', got '{kind}'"),
+                message: format!(
+                    "provider.kind must be 'openai-compatible', 'anthropic', 'openai', or 'google', got '{kind}'"
+                ),
             });
         }
 

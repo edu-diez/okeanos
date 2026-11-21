@@ -714,6 +714,9 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - Tagged v0.1.0-milestone-18
 
 ### Milestone 19 — Additional model providers (Anthropic, OpenAI, Google)
+
+**Status:** complete — tagged v0.3.0
+
 **Scope:** Add multiple model providers behind feature flags.
 - **Anthropic/Claude**: Implement `Model` trait for Anthropic Messages API
 - **OpenAI**: Implement `Model` trait for native OpenAI API (distinct from OpenRouter)
@@ -722,6 +725,25 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - Config-driven selection: `provider.kind = "anthropic" | "openai" | "google"`
 - Provider-specific auth/config: base_url, api_key, model-specific parameters
 - **Out of scope:** Azure, Vertex, Bedrock, etc. — separate milestones.
+
+**Acceptance criteria:**
+- ✅ `AnthropicModel` implements `Model` trait with Messages API, native tool calling, SSE streaming, thinking channel
+- ✅ `OpenAIModel` implements `Model` trait with Chat Completions API, native function calling, SSE streaming, o1 reasoning support
+- ✅ `GoogleModel` implements `Model` trait with Generative AI API, native function calling, SSE streaming
+- ✅ All three providers map `ModelCapabilities` correctly
+- ✅ Config validation accepts `provider.kind = "anthropic" | "openai" | "google" | "openai-compatible"`
+- ✅ Provider-specific base URLs default correctly
+- ✅ Secret substitution works with `{env:VAR}` and `{file:path}` for all providers
+- ✅ Unit tests for all three providers (construction, error mapping, request/response conversion, cost estimation, streaming)
+
+**Testing requirements:** Unit tests for each provider's request building, response parsing, error mapping, streaming, tool calling, cost estimation. No network (mock HTTP not needed as tests use static responses).
+
+**Definition of Done:** CI green; all three providers verified via unit tests; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (354 unit tests)
+- `cargo build --release` produces a single binary
+- Tagged v0.3.0
 
 ### Milestone 20 — WebSocket RPC transport
 **Scope:** Add WebSocket transport for JSON-RPC (feature-gated).
@@ -811,7 +833,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | Milestone | Deliverable | Sessions (est.) | Depends on |
 |-----------|-------------|-----------------|------------|
 | 18 | ✅ Context compaction | 2 | M16 |
-| 19 | Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
+| 19 | ✅ Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
 | 20 | WebSocket RPC | 1 | M14 |
 | 21 | MCP client | 2–3 | M16 |
 | 22 | Session log rotation | 1 | M13 |
