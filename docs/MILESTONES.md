@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -746,11 +746,31 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - Tagged v0.3.0
 
 ### Milestone 20 — WebSocket RPC transport
+
+**Status:** complete — tagged v0.4.0
+
 **Scope:** Add WebSocket transport for JSON-RPC (feature-gated).
 - `jsonrpsee` WebSocket server/client
 - `--rpc-ws` flag for WebSocket mode
 - Same event stream as stdio/TCP RPC
 - **Out of scope:** Auth/TLS for WebSocket (deferred).
+
+**Acceptance criteria:**
+- ✅ `--rpc-ws` flag accepted and starts JSON-RPC WebSocket server
+- ✅ WebSocket server listens on configurable address (default 127.0.0.1:0 for random port)
+- ✅ Same RPC methods available: `approve`, `deny`, `get_status`, `list_sessions`, `resume`
+- ✅ Same event stream as stdio/TCP RPC mode
+- ✅ ReAct loop runs identically in WebSocket mode
+- ✅ Session management works (resume, list_sessions)
+- ✅ Approval handling via RPC `approve`/`deny` methods works
+- ✅ `cargo fmt --check` passes
+- ✅ `cargo clippy -- -D warnings` passes
+- ✅ `cargo test` passes (354 unit tests)
+- ✅ `cargo build --release` produces a single binary
+
+**Testing requirements:** Event-parity test across modes; RPC request/response round-trip tests; WebSocket connection test.
+
+**Definition of Done:** CI green; parity test covers every event in DESIGN.md §7; milestone tagged.
 
 ### Milestone 21 — MCP client (lazy)
 **Scope:** Lazy MCP server handling behind `mcp` feature flag.
@@ -834,7 +854,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 |-----------|-------------|-----------------|------------|
 | 18 | ✅ Context compaction | 2 | M16 |
 | 19 | ✅ Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
-| 20 | WebSocket RPC | 1 | M14 |
+| 20 | ✅ WebSocket RPC | 1 | M14 |
 | 21 | MCP client | 2–3 | M16 |
 | 22 | Session log rotation | 1 | M13 |
 | 23 | Tool result caching | 1–2 | M16 |
@@ -878,7 +898,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 |-----------|---------|-------|
 | M18 Context compaction | `0.2.0` | First post-MVP feature |
 | M19 Additional providers | `0.3.0` | Can be parallel with M18 → combine if shipped together |
-| M20 WebSocket RPC | `0.4.0` | |
+| M20 WebSocket RPC | `0.4.0` | ✅ Complete |
 | M21 MCP client | `0.5.0` | |
 | M22 Session log rotation | `0.6.0` | |
 | M23 Tool result caching | `0.7.0` | |

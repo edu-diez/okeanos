@@ -40,6 +40,14 @@ ratatui = { version = "0.28", optional = true }
 crossterm = { version = "0.28", optional = true }
 tempfile = { version = "3.15", optional = true }
 jsonrpsee = { version = "0.24", optional = true, features = ["ws-client", "http-client", "server"] }
+futures-util = { version = "0.3", optional = true }
+
+# WebSocket auth dependencies
+base64 = { version = "0.22", optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+jsonwebtoken = { version = "9", optional = true }
+http = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3.15"
@@ -48,9 +56,10 @@ tempfile = "3.15"
 default = ["tui", "config-file"]
 tui = ["ratatui", "crossterm"]
 config-file = ["toml"]
-rpc = ["jsonrpsee"]
+rpc = ["jsonrpsee", "http", "futures-util"]
 mcp = []
 mock-provider = []
 simd-json = []
+# ws-auth = ["base64", "hmac", "sha2", "jsonwebtoken"]
 
 [workspace]

@@ -119,9 +119,158 @@ pub struct Cli {
         long,
         conflicts_with = "headless",
         conflicts_with = "interactive",
+        conflicts_with = "rpc_ws",
         global = true
     )]
     pub rpc: bool,
+
+    /// Run in JSON-RPC mode over WebSocket (requires 'rpc' feature).
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "WebSocket server address (default: 127.0.0.1:0 for random port)",
+        conflicts_with = "headless",
+        conflicts_with = "interactive",
+        conflicts_with = "rpc",
+        global = true,
+        num_args = 0..=1,
+        default_missing_value = "127.0.0.1:0",
+    )]
+    pub rpc_ws: Option<String>,
+
+    /// WebSocket authentication mode.
+    #[arg(
+        long,
+        value_name = "MODE",
+        help = "WebSocket auth mode: capability-token or signed-bearer-token",
+        global = true,
+        value_parser = ["capability-token", "signed-bearer-token"],
+        conflicts_with = "rpc",
+        conflicts_with = "headless",
+        conflicts_with = "interactive",
+    )]
+    pub ws_auth: Option<String>,
+
+    /// Path to capability token file (for capability-token auth).
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Absolute path to raw capability token file",
+        global = true,
+        conflicts_with = "ws_token_sha256",
+        requires = "ws_auth"
+    )]
+    pub ws_token_file: Option<std::path::PathBuf>,
+
+    /// SHA-256 of capability token (for capability-token auth).
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "64-char hex SHA-256 of the capability token",
+        global = true,
+        conflicts_with = "ws_token_file",
+        requires = "ws_auth"
+    )]
+    pub ws_token_sha256: Option<String>,
+
+    /// Path to HS256 shared secret file (for signed-bearer-token auth).
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Absolute path to HS256 secret file (>=32 bytes)",
+        global = true,
+        requires = "ws_auth"
+    )]
+    pub ws_shared_secret_file: Option<std::path::PathBuf>,
+
+    /// Expected JWT issuer claim (for signed-bearer-token auth).
+    #[arg(
+        long,
+        value_name = "ISSUER",
+        help = "Expected 'iss' claim in JWT",
+        global = true,
+        requires = "ws_auth"
+    )]
+    pub ws_issuer: Option<String>,
+
+    /// Expected JWT audience claim (for signed-bearer-token auth).
+    #[arg(
+        long,
+        value_name = "AUDIENCE",
+        help = "Expected 'aud' claim in JWT (string or array)",
+        global = true,
+        requires = "ws_auth"
+    )]
+    pub ws_audience: Option<String>,
+
+    /// Max clock skew for JWT validation in seconds (default: 30).
+    #[arg(
+        long,
+        value_name = "SECS",
+        help = "Clock skew tolerance for exp/nbf claims",
+        global = true,
+        default_value = "30",
+        requires = "ws_auth"
+    )]
+    pub ws_max_clock_skew_sec: u64,
+
+    /// Disable health check endpoints (/readyz, /healthz).
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "rpc",
+        conflicts_with = "headless",
+        conflicts_with = "interactive"
+    )]
+    pub ws_no_health: bool,
+
+    /// WebSocket ping interval in seconds (default: 30, 0 to disable).
+    #[arg(
+        long,
+        value_name = "SECS",
+        global = true,
+        default_value = "30",
+        conflicts_with = "rpc",
+        conflicts_with = "headless",
+        conflicts_with = "interactive"
+    )]
+    pub ws_ping_interval_sec: u64,
+
+    /// WebSocket ping max failures before disconnect (default: 2).
+    #[arg(
+        long,
+        value_name = "COUNT",
+        global = true,
+        default_value = "2",
+        conflicts_with = "rpc",
+        conflicts_with = "headless",
+        conflicts_with = "interactive"
+    )]
+    pub ws_ping_max_failures: u32,
+
+    /// WebSocket inactivity timeout in seconds (default: 60).
+    #[arg(
+        long,
+        value_name = "SECS",
+        global = true,
+        default_value = "60",
+        conflicts_with = "rpc",
+        conflicts_with = "headless",
+        conflicts_with = "interactive"
+    )]
+    pub ws_inactive_timeout_sec: u64,
+
+    /// Max inbound queue size per WebSocket connection (default: 32768).
+    #[arg(
+        long,
+        value_name = "COUNT",
+        global = true,
+        default_value = "32768",
+        conflicts_with = "rpc",
+        conflicts_with = "headless",
+        conflicts_with = "interactive"
+    )]
+    pub ws_max_queue: usize,
 
     /// Approval policy for headless/RPC mode: auto (allow all), deny (block all), prompt (wait for stdin JSON).
     #[arg(long, value_name = "POLICY", global = true, default_value = "prompt")]
@@ -162,12 +311,15 @@ pub enum Mode {
     Interactive,
     Headless,
     Rpc,
+    RpcWs,
 }
 
 impl Cli {
     pub fn mode(&self) -> Mode {
         if self.rpc {
             Mode::Rpc
+        } else if self.rpc_ws.is_some() {
+            Mode::RpcWs
         } else if self.headless {
             Mode::Headless
         } else {
