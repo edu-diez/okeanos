@@ -184,6 +184,8 @@ pub struct Config {
     pub snapshots: Option<SnapshotsSection>,
     #[serde(default)]
     pub compaction: Option<CompactionSection>,
+    #[serde(default)]
+    pub mcp: Option<McpSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -201,6 +203,7 @@ impl std::fmt::Debug for Config {
             .field("ui", &self.ui)
             .field("snapshots", &self.snapshots)
             .field("compaction", &self.compaction)
+            .field("mcp", &self.mcp)
             .finish()
     }
 }
@@ -352,6 +355,49 @@ pub struct CompactionModelOverride {
     pub strategy: Option<String>,
     /// Override preserve_recent_tokens for this model
     pub preserve_recent_tokens: Option<usize>,
+}
+
+/// MCP (Model Context Protocol) client configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct McpSection {
+    /// Startup policy for MCP connections.
+    #[serde(default)]
+    pub startup_policy: Option<String>,
+    /// List of MCP servers to connect to.
+    #[serde(default)]
+    pub servers: Vec<McpServerConfigSection>,
+}
+
+/// Configuration for a single MCP server.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct McpServerConfigSection {
+    /// Unique name for this server (used in tool name prefixing).
+    pub name: String,
+    /// Command to execute for the MCP server.
+    pub command: String,
+    /// Arguments to pass to the command.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Environment variables to set for the server process.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Working directory for the server process.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Whether to enable this server (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Timeout for tool calls (seconds, default: 30).
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_timeout() -> u64 {
+    30
 }
 
 /// Errors raised while loading or validating configuration.

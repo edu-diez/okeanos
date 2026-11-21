@@ -19,6 +19,9 @@ use okeanos::snapshot::store::SnapshotStore;
 use okeanos::tool::builtin::{DeleteTool, EditTool, GrepTool, ReadTool, RunTool, WriteTool};
 use okeanos::tool::{TodoList, TodoTool};
 use okeanos::tool::{ToolRegistry, ToolSpec};
+
+#[cfg(feature = "mcp")]
+use okeanos::tool::mcp::{McpClient, McpClientConfig, McpServerConfig, McpStartupPolicy, McpTool};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -312,6 +315,28 @@ allow_list = ["todo", "read", "grep"]
 # [snapshots]
 # Enable git snapshots for undo/redo (default: false)
 # enabled = false
+
+# MCP (Model Context Protocol) client configuration (requires 'mcp' feature)
+# [mcp]
+# Startup policy: "eager", "defer_cached", or "defer_explicit" (default: "eager")
+# startup_policy = "eager"
+# List of MCP servers to connect to
+# [[mcp.servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+# env = {}
+# cwd = null
+# enabled = true
+# timeout_secs = 30
+#
+# [[mcp.servers]]
+# name = "github"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-github"]
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "{env:GITHUB_TOKEN}" }
+# enabled = true
+# timeout_secs = 30
 "#
     .to_string()
 }
@@ -782,6 +807,10 @@ async fn run_interactive_tui(
             ]
         }
     };
+
+    // Initialize MCP client and register discovered tools (feature-gated)
+    #[cfg(feature = "mcp")]
+    let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
@@ -1454,6 +1483,10 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         }
     };
 
+    // Initialize MCP client and register discovered tools (feature-gated)
+    #[cfg(feature = "mcp")]
+    let _mcp_client = { init_mcp_client(&mut tools, config).await? };
+
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
         .permissions
@@ -1693,6 +1726,91 @@ fn apply_cli_overrides(
 /// List of available tools for dry-run display.
 fn tools_list() -> Vec<&'static str> {
     vec!["todo", "read", "write", "edit", "delete", "run", "grep"]
+}
+
+#[cfg(feature = "mcp")]
+/// Convert config MCP section to McpClientConfig.
+fn config_to_mcp_client_config(config: &Config) -> McpClientConfig {
+    use std::collections::HashMap;
+
+    let mut client_config = McpClientConfig::default();
+
+    if let Some(mcp_section) = &config.mcp {
+        // Parse startup policy
+        if let Some(policy_str) = &mcp_section.startup_policy {
+            client_config.startup_policy = match policy_str.as_str() {
+                "eager" => McpStartupPolicy::Eager,
+                "defer_cached" => McpStartupPolicy::DeferCached,
+                "defer_explicit" => McpStartupPolicy::DeferExplicit,
+                _ => {
+                    eprintln!(
+                        "[WARN] Unknown MCP startup policy '{}', using 'eager'",
+                        policy_str
+                    );
+                    McpStartupPolicy::Eager
+                }
+            };
+        }
+
+        // Convert servers
+        for server_section in &mcp_section.servers {
+            let mut env = HashMap::new();
+            for (k, v) in &server_section.env {
+                env.insert(k.clone(), v.clone());
+            }
+
+            let server_config = McpServerConfig {
+                name: server_section.name.clone(),
+                command: server_section.command.clone(),
+                args: server_section.args.clone(),
+                env,
+                cwd: server_section.cwd.clone(),
+                enabled: server_section.enabled,
+                timeout_secs: server_section.timeout_secs,
+            };
+            client_config.servers.push(server_config);
+        }
+    }
+
+    client_config
+}
+
+#[cfg(feature = "mcp")]
+/// Initialize MCP client, connect to servers, and register discovered tools.
+async fn init_mcp_client(
+    tools: &mut ToolRegistry,
+    config: &Config,
+) -> anyhow::Result<Option<Arc<McpClient>>> {
+    let client_config = config_to_mcp_client_config(config);
+    if client_config.servers.is_empty() {
+        return Ok(None);
+    }
+
+    let client = Arc::new(McpClient::new(client_config));
+
+    // Connect to servers according to startup policy
+    if let Err(e) = client.connect_all().await {
+        eprintln!("[WARN] Some MCP servers failed to connect: {}", e);
+    }
+
+    // Register discovered tools
+    let discovered_tools = client.discovered_tools().await;
+    for spec in discovered_tools {
+        // Extract server name and tool name from the prefixed name (mcp__{server}__{tool})
+        if let Some(rest) = spec.name.strip_prefix("mcp__") {
+            if let Some((server_name, tool_name)) = rest.split_once("__") {
+                let mcp_tool = McpTool::new(
+                    client.clone(),
+                    server_name.to_string(),
+                    tool_name.to_string(),
+                    spec,
+                );
+                tools.register(mcp_tool);
+            }
+        }
+    }
+
+    Ok(Some(client))
 }
 
 /// Dry-run mode: show execution plan without executing.
@@ -2021,6 +2139,12 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
             tools.register(GrepTool::new());
         }
     }
+
+    // Initialize MCP client and register discovered tools (feature-gated)
+    #[cfg(feature = "mcp")]
+    let _mcp_client = {
+        init_mcp_client(&mut tools, config).await?
+    };
 
     // Build permission policy from config
     let allow_list = config
@@ -2571,6 +2695,12 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             tools.register(GrepTool::new());
         }
     }
+
+    // Initialize MCP client and register discovered tools (feature-gated)
+    #[cfg(feature = "mcp")]
+    let _mcp_client = {
+        init_mcp_client(&mut tools, config).await?
+    };
 
     // Build permission policy from config
     let allow_list = config

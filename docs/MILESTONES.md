@@ -772,12 +772,16 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 
 **Definition of Done:** CI green; parity test covers every event in DESIGN.md §7; milestone tagged.
 
-### Milestone 21 — MCP client (lazy)
+### Milestone 21 — MCP client (lazy) ✅
 **Scope:** Lazy MCP server handling behind `mcp` feature flag.
-- MCP client trait + stdio transport
-- Tool discovery from MCP servers at runtime
-- Register discovered tools in `ToolRegistry`
+- ✅ MCP client trait + stdio transport
+- ✅ Tool discovery from MCP servers at runtime
+- ✅ Register discovered tools in `ToolRegistry`
 - **Out of scope:** MCP server implementation, SSE transport.
+
+**Testing requirements:** Unit tests for McpClient (connect, discover, call); integration test with mock MCP server; config parsing for mcp section; tool name prefixing and description truncation.
+
+**Definition of Done:** CI green; all tests pass with `mcp` feature; milestone tagged.
 
 ### Milestone 22 — Session log rotation / compression
 **Scope:** Rotate and compress JSONL session logs.
@@ -855,7 +859,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 18 | ✅ Context compaction | 2 | M16 |
 | 19 | ✅ Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
 | 20 | ✅ WebSocket RPC | 1 | M14 |
-| 21 | MCP client | 2–3 | M16 |
+| 21 | ✅ MCP client | 2–3 | M16 |
 | 22 | Session log rotation | 1 | M13 |
 | 23 | Tool result caching | 1–2 | M16 |
 | 24 | Expensive call confirmation | 1 | M10, M16 |
@@ -877,17 +881,18 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 
 ## Versioning Strategy
 
-### Current State (Pre-MVP)
-- **`Cargo.toml` version**: `0.1.0` (pre-1.0, pre-release)
-- **Milestone tags**: `v0.1.0-milestone-N` — lightweight git tags for each completed milestone
-- **No crates.io publishes** until MVP release
+### MVP Release (Completed)
+- **`Cargo.toml` version**: `0.1.0`
+- **MVP features complete**: M16 (MVP completion), M17 (Config cleanup) ✅
+- **MVP release tag**: `v0.1.0` — not yet tagged (pending final release prep)
+- **Historical pre-MVP milestone tags**: `v0.1.0-milestone-N` — used for M0–M17
 
 ### Post-MVP: Semantic Versioning (Cargo Convention)
 Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay in `0.x` until API/CLI/config are genuinely stable.
 
 | Phase | Cargo Version | Git Tag | Trigger |
 |-------|---------------|---------|---------|
-| **MVP Release** | `0.1.0` | `v0.1.0` | After M17 complete, CI green, ready for external use |
+| **MVP Release** | `0.1.0` | `v0.1.0` | Pending: final CI green, release artifacts |
 | **Post-MVP feature milestones** | `0.2.0`, `0.3.0`, `0.4.0`… | `v0.2.0`, `v0.3.0`, `v0.4.0`… | Each independent milestone (M18, M19, M20…) |
 | **Breaking changes** (CLI flags, config schema, public Rust API) | Minor bump (`0.x.0`) | `v0.x.0` | Any user-facing breaking change |
 | **Bug fixes only** | Patch bump (`0.x.y`) | `v0.x.y` | Non-breaking fixes |
@@ -899,7 +904,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M18 Context compaction | `0.2.0` | First post-MVP feature |
 | M19 Additional providers | `0.3.0` | Can be parallel with M18 → combine if shipped together |
 | M20 WebSocket RPC | `0.4.0` | ✅ Complete |
-| M21 MCP client | `0.5.0` | |
+| M21 MCP client | `0.5.0` | ✅ Complete |
 | M22 Session log rotation | `0.6.0` | |
 | M23 Tool result caching | `0.7.0` | |
 | M24 Expensive call confirmation | `0.8.0` | |
