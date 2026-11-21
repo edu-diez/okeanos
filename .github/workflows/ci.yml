@@ -134,7 +134,9 @@ jobs:
         run: |
           cd release-assets
           for dir in okeanos-*/; do
-            (cd "$dir" && sha256sum okeanos* > SHA256SUMS.txt 2>/dev/null || shasum -a 256 okeanos* > SHA256SUMS.txt)
+            # Extract target triple from directory name (e.g., "okeanos-x86_64-unknown-linux-gnu")
+            target=$(basename "$dir" | sed 's/^okeanos-//')
+            (cd "$dir" && sha256sum okeanos* > "SHA256SUMS-${target}.txt" 2>/dev/null || shasum -a 256 okeanos* > "SHA256SUMS-${target}.txt")
           done
 
       - name: Create Release
