@@ -29,13 +29,11 @@ use okeanos::ui::TerminalApp;
 
 #[cfg(feature = "rpc")]
 use {
-    jsonrpsee::core::server::helpers::prepare_error,
-    jsonrpsee::server::middleware::rpc::{RpcServiceBuilder, RpcServiceT},
-    jsonrpsee::server::{PingConfig, RpcModule, ServerBuilder, ServerHandle},
-    jsonrpsee::types::{ErrorObject, Params, Request},
+    jsonrpsee::server::{PingConfig, RpcModule, ServerBuilder},
+    jsonrpsee::types::{ErrorObject, Params},
     std::collections::HashMap,
     std::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    tokio::sync::{Mutex as TokioMutex, RwLock, mpsc as tokio_mpsc},
+    tokio::sync::{Mutex as TokioMutex, RwLock},
     tokio::time::Duration,
 };
 
@@ -2720,6 +2718,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
 
                 // Parse initialize params
                 #[derive(serde::Deserialize)]
+                #[allow(dead_code)]
                 struct InitializeParams {
                     #[serde(default)]
                     client_info: Option<serde_json::Value>,
@@ -3021,6 +3020,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
                 drop(conns);
 
                 #[derive(serde::Deserialize)]
+                #[allow(dead_code)]
                 struct ThreadStartParams {
                     prompt: String,
                     #[serde(default)]
