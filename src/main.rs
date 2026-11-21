@@ -29,19 +29,15 @@ use okeanos::ui::TerminalApp;
 
 #[cfg(feature = "rpc")]
 use {
-    futures_util::future::BoxFuture,
-    jsonrpsee::core::server::{MethodResponse, helpers::prepare_error},
+    jsonrpsee::core::server::helpers::prepare_error,
     jsonrpsee::server::middleware::rpc::{RpcServiceBuilder, RpcServiceT},
-    jsonrpsee::server::{PingConfig, RpcModule, ServerBuilder, ServerConfig, ServerHandle},
+    jsonrpsee::server::{PingConfig, RpcModule, ServerBuilder, ServerHandle},
     jsonrpsee::types::{ErrorObject, Params, Request},
     std::collections::HashMap,
     std::sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     tokio::sync::{Mutex as TokioMutex, RwLock, mpsc as tokio_mpsc},
-    tokio::time::{Duration, interval},
+    tokio::time::Duration,
 };
-
-#[cfg(feature = "rpc")]
-use http::{HeaderMap, HeaderValue, Method as HttpMethod, StatusCode};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -2806,10 +2802,10 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
                 // Check initialization
                 let conn_id = ext.get::<usize>().copied().unwrap_or(0);
                 let conns = connections.read().await;
-                if let Some(state) = conns.get(&conn_id) {
-                    if !state.initialized || !state.authenticated {
-                        return Ok::<serde_json::Value, ErrorObject<'static>>(serde_json::json!({"approved": false, "error": "not initialized or authenticated"}));
-                    }
+                if let Some(state) = conns.get(&conn_id)
+                    && (!state.initialized || !state.authenticated)
+                {
+                    return Ok::<serde_json::Value, ErrorObject<'static>>(serde_json::json!({"approved": false, "error": "not initialized or authenticated"}));
                 }
                 drop(conns);
 
@@ -2856,10 +2852,10 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             async move {
                 let conn_id = ext.get::<usize>().copied().unwrap_or(0);
                 let conns = connections.read().await;
-                if let Some(state) = conns.get(&conn_id) {
-                    if !state.initialized || !state.authenticated {
-                        return Ok::<serde_json::Value, ErrorObject<'static>>(serde_json::json!({"denied": false, "error": "not initialized or authenticated"}));
-                    }
+                if let Some(state) = conns.get(&conn_id)
+                    && (!state.initialized || !state.authenticated)
+                {
+                    return Ok::<serde_json::Value, ErrorObject<'static>>(serde_json::json!({"denied": false, "error": "not initialized or authenticated"}));
                 }
                 drop(conns);
 
@@ -2906,14 +2902,14 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             async move {
                 let conn_id = ext.get::<usize>().copied().unwrap_or(0);
                 let conns = connections.read().await;
-                if let Some(state) = conns.get(&conn_id) {
-                    if !state.initialized || !state.authenticated {
-                        return Err(ErrorObject::owned(
-                            -32002,
-                            "not initialized or authenticated",
-                            None::<()>,
-                        ));
-                    }
+                if let Some(state) = conns.get(&conn_id)
+                    && (!state.initialized || !state.authenticated)
+                {
+                    return Err(ErrorObject::owned(
+                        -32002,
+                        "not initialized or authenticated",
+                        None::<()>,
+                    ));
                 }
                 drop(conns);
 
@@ -2938,14 +2934,14 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             async move {
                 let conn_id = ext.get::<usize>().copied().unwrap_or(0);
                 let conns = connections.read().await;
-                if let Some(state) = conns.get(&conn_id) {
-                    if !state.initialized || !state.authenticated {
-                        return Err(ErrorObject::owned(
-                            -32002,
-                            "not initialized or authenticated",
-                            None::<()>,
-                        ));
-                    }
+                if let Some(state) = conns.get(&conn_id)
+                    && (!state.initialized || !state.authenticated)
+                {
+                    return Err(ErrorObject::owned(
+                        -32002,
+                        "not initialized or authenticated",
+                        None::<()>,
+                    ));
                 }
                 drop(conns);
 
@@ -2969,14 +2965,14 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             async move {
                 let conn_id = ext.get::<usize>().copied().unwrap_or(0);
                 let conns = connections.read().await;
-                if let Some(state) = conns.get(&conn_id) {
-                    if !state.initialized || !state.authenticated {
-                        return Err(ErrorObject::owned(
-                            -32002,
-                            "not initialized or authenticated",
-                            None::<()>,
-                        ));
-                    }
+                if let Some(state) = conns.get(&conn_id)
+                    && (!state.initialized || !state.authenticated)
+                {
+                    return Err(ErrorObject::owned(
+                        -32002,
+                        "not initialized or authenticated",
+                        None::<()>,
+                    ));
                 }
                 drop(conns);
 
@@ -3002,9 +2998,6 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     let connections_for_thread = connections.clone();
     let event_tx_for_thread = event_tx.clone();
     let project_root_for_thread = project_root.clone();
-    let pending_approvals_for_thread = pending_approvals.clone();
-    let rpc_approval_tx_for_thread = rpc_approval_tx.clone();
-    let loop_running_for_thread = loop_running.clone();
 
     rpc_module.register_async_method(
         "thread/start",
@@ -3013,20 +3006,17 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             let connections = connections_for_thread.clone();
             let event_tx = event_tx_for_thread.clone();
             let project_root = project_root_for_thread.clone();
-            let pending_approvals = pending_approvals_for_thread.clone();
-            let rpc_approval_tx = rpc_approval_tx_for_thread.clone();
-            let loop_running = loop_running_for_thread.clone();
             async move {
                 let conn_id = ext.get::<usize>().copied().unwrap_or(0);
                 let conns = connections.read().await;
-                if let Some(state) = conns.get(&conn_id) {
-                    if !state.initialized || !state.authenticated {
-                        return Err(ErrorObject::owned(
-                            -32002,
-                            "not initialized or authenticated",
-                            None::<()>,
-                        ));
-                    }
+                if let Some(state) = conns.get(&conn_id)
+                    && (!state.initialized || !state.authenticated)
+                {
+                    return Err(ErrorObject::owned(
+                        -32002,
+                        "not initialized or authenticated",
+                        None::<()>,
+                    ));
                 }
                 drop(conns);
 
