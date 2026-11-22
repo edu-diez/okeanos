@@ -69,6 +69,11 @@ impl Policy {
             self.allow_always(tool);
         }
     }
+
+    /// Check if a tool has a session allow-always grant.
+    pub fn has_session_allow(&self, tool: &str) -> bool {
+        self.session_allows.contains(tool)
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +163,34 @@ mod tests {
             policy.check("fetch", &network_spec),
             PolicyDecision::RequireApproval
         );
+    }
+
+    #[test]
+    fn test_policy_has_session_allow() {
+        let mut policy = Policy::new(vec![]);
+        let spec = write_spec();
+
+        // Initially no session allow
+        assert!(!policy.has_session_allow("write"));
+        assert_eq!(
+            policy.check("write", &spec),
+            PolicyDecision::RequireApproval
+        );
+
+        // Grant allow-always
+        policy.allow_always("write");
+        assert!(policy.has_session_allow("write"));
+        assert_eq!(policy.check("write", &spec), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn test_policy_record_decision_allow_always_updates_session_allow() {
+        let mut policy = Policy::new(vec![]);
+        let spec = write_spec();
+
+        assert!(!policy.has_session_allow("write"));
+        policy.record_decision("write", ApprovalDecision::AllowAlways);
+        assert!(policy.has_session_allow("write"));
+        assert_eq!(policy.check("write", &spec), PolicyDecision::Allow);
     }
 }

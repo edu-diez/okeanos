@@ -1228,6 +1228,9 @@ impl<M: Model> ReactLoop<M> {
             }
         }
 
+        // Check expensive call confirmation before executing the tool.
+        self.check_expensive_call_confirmation(&tool_call).await?;
+
         // Check cost budget before executing the tool.
         self.check_cost_budget(&tool_call).await?;
 
@@ -1357,6 +1360,66 @@ impl<M: Model> ReactLoop<M> {
         tracker
             .check_per_turn_warning(estimated_cost.total_cost_usd(), &self.event_tx)
             .await;
+
+        Ok(())
+    }
+
+    /// Check if a tool call requires expensive call confirmation.
+    ///
+    /// If the estimated cost exceeds the configured threshold, emits an ApprovalRequest
+    /// and waits for user decision. Returns an error if denied.
+    async fn check_expensive_call_confirmation(
+        &mut self,
+        tool_call: &ToolCall,
+    ) -> Result<(), ReactError> {
+        let Some(tracker) = &self.cost_tracker else {
+            return Ok(()); // Cost tracking not enabled
+        };
+
+        // Estimate input tokens from tool call args
+        let input_tokens = crate::context::tokens::TokenCounter.count(&tool_call.args.to_string());
+        // Estimate output tokens (rough heuristic: 1000 tokens for tool result)
+        let estimated_output_tokens = 1000;
+
+        // Check if estimated cost exceeds expensive call confirmation threshold
+        let estimated_cost =
+            match tracker.estimate_tool_call_cost(input_tokens, estimated_output_tokens) {
+                Ok(cost) => cost,
+                Err(_) => return Ok(()), // Unknown pricing - fail open for confirmation (budget check handles fail-closed)
+            };
+
+        if !tracker.requires_expensive_call_confirmation(estimated_cost.total_cost_usd()) {
+            return Ok(()); // Below threshold, no confirmation needed
+        }
+
+        // Check if tool has session allow-always grant (skip confirmation)
+        if self.policy.has_session_allow(&tool_call.name) {
+            return Ok(());
+        }
+
+        // Emit approval request and pause the loop until a decision arrives.
+        let approval_id = format!("approval-expensive-{}", self.iteration);
+        self.emit_approval_request(ApprovalRequest {
+            id: approval_id.clone(),
+            tool: tool_call.name.clone(),
+            args: tool_call.args.clone(),
+        })
+        .await;
+
+        let decision = self.wait_for_approval(&approval_id).await?;
+
+        match decision {
+            ApprovalDecision::Allow => {}
+            ApprovalDecision::AllowAlways => {
+                self.policy.allow_always(&tool_call.name);
+            }
+            ApprovalDecision::Deny => {
+                return Err(ReactError::Tool(format!(
+                    "permission denied (expensive call): {}",
+                    tool_call.name
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -2290,6 +2353,7 @@ mod tests {
             crate::cost::CostBudgetConfig {
                 session_cap_usd: Some(0.01),
                 per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: None,
             },
             "gpt-4o".to_string(),
             pricing,
@@ -2341,6 +2405,7 @@ mod tests {
             crate::cost::CostBudgetConfig {
                 session_cap_usd: Some(10.0),
                 per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: None,
             },
             "gpt-4o".to_string(),
             pricing,
@@ -2389,6 +2454,7 @@ mod tests {
             crate::cost::CostBudgetConfig {
                 session_cap_usd: Some(10.0),
                 per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: None,
             },
             "unknown-model-xyz".to_string(),
             pricing,
@@ -2442,6 +2508,7 @@ mod tests {
             crate::cost::CostBudgetConfig {
                 session_cap_usd: Some(10.0),
                 per_turn_warning_usd: Some(0.000001),
+                expensive_call_confirmation_usd: None,
             },
             "gpt-4o".to_string(),
             pricing,
@@ -2617,6 +2684,295 @@ mod tests {
         assert!(
             found_interrupted,
             "expected interrupted event with user_initiated=false"
+        );
+    }
+
+    /// Test that expensive call confirmation prompts when tool cost exceeds threshold.
+    #[tokio::test]
+    async fn test_react_loop_expensive_call_confirmation_prompts() {
+        // Use a model that will make a tool call (frontier = native tool calling)
+        let model = Arc::new(MockModel::frontier("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use an expensive tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Expensive task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        // Create cost tracker with very low expensive call confirmation threshold ($0.000001)
+        // This will trigger confirmation for any tool call
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: Some(0.000001),
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let mut loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+
+        // Create approval channel and inject Allow decision
+        let (approval_tx, approval_rx) = mpsc::channel(16);
+        loop_ = loop_.with_approval_receiver(approval_rx);
+
+        // Start the turn in a background task
+        let turn_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
+
+        // Wait for approval request and send Allow
+        let mut found_approval_request = false;
+        for _ in 0..100 {
+            if let Ok(event) = event_rx.try_recv()
+                && matches!(event, crate::events::Event::ApprovalRequest(_))
+            {
+                found_approval_request = true;
+                approval_tx
+                    .send(crate::events::Approval {
+                        id: "approval-expensive-0".into(),
+                        decision: crate::events::ApprovalDecision::Allow,
+                    })
+                    .await
+                    .expect("failed to send approval");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let result = turn_handle.await.expect("turn task panicked");
+
+        // Should succeed after approval
+        assert!(result.is_ok(), "result: {result:?}");
+        assert!(found_approval_request, "expected ApprovalRequest event");
+    }
+
+    /// Test that expensive call confirmation is skipped when tool has allow-always grant.
+    #[tokio::test]
+    async fn test_react_loop_expensive_call_confirmation_skip_allow_always() {
+        let model = Arc::new(MockModel::frontier("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use a tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Task 1"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        // Create cost tracker with very low expensive call confirmation threshold
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: Some(0.000001),
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let mut loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+
+        // Pre-grant allow-always for todo tool
+        loop_.policy.allow_always("todo");
+
+        let result = loop_.run("Test prompt".into()).await;
+
+        // Should succeed without any approval request (allow-always skips confirmation)
+        assert!(result.is_ok(), "result: {result:?}");
+
+        // Verify no ApprovalRequest was emitted
+        let mut found_approval_request = false;
+        for _ in 0..50 {
+            if let Ok(event) = event_rx.try_recv()
+                && matches!(event, crate::events::Event::ApprovalRequest(_))
+            {
+                found_approval_request = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !found_approval_request,
+            "expected no ApprovalRequest due to allow-always"
+        );
+    }
+
+    /// Test that expensive call confirmation denies execution when user denies.
+    #[tokio::test]
+    async fn test_react_loop_expensive_call_confirmation_deny() {
+        let model = Arc::new(MockModel::frontier("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use an expensive tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Expensive task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        // Create cost tracker with very low expensive call confirmation threshold
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: Some(0.000001),
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let mut loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+
+        // Create approval channel and inject Deny decision
+        let (approval_tx, approval_rx) = mpsc::channel(16);
+        loop_ = loop_.with_approval_receiver(approval_rx);
+
+        // Start the turn in a background task
+        let turn_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
+
+        // Wait for approval request and send Deny
+        let mut found_approval_request = false;
+        for _ in 0..100 {
+            if let Ok(event) = event_rx.try_recv()
+                && matches!(event, crate::events::Event::ApprovalRequest(_))
+            {
+                found_approval_request = true;
+                approval_tx
+                    .send(crate::events::Approval {
+                        id: "approval-expensive-0".into(),
+                        decision: crate::events::ApprovalDecision::Deny,
+                    })
+                    .await
+                    .expect("failed to send approval");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let result = turn_handle.await.expect("turn task panicked");
+
+        // Should fail with permission denied
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ReactError::Tool(msg) => {
+                assert!(msg.contains("permission denied (expensive call)"));
+            }
+            e => panic!("expected Tool error, got: {e:?}"),
+        }
+    }
+
+    /// Test that expensive call confirmation is disabled by default (no threshold set).
+    #[tokio::test]
+    async fn test_react_loop_expensive_call_confirmation_disabled_by_default() {
+        let model = Arc::new(MockModel::frontier("test-model"));
+        model.push_response(crate::model::mock::MockModel::tool_call_response(
+            "Let me use a tool",
+            vec![crate::events::ToolCall {
+                id: "call-1".into(),
+                name: "todo".into(),
+                args: serde_json::json!({"action": "add", "title": "Task"}),
+                status: crate::events::ToolCallStatus::Pending,
+            }],
+        ));
+        model.push_response(crate::model::mock::MockModel::text_response(
+            "Task complete",
+        ));
+
+        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
+        let mut tools = ToolRegistry::new();
+        tools.register(TodoTool::new_empty());
+        let config = ReactConfig {
+            max_iterations: 10,
+            max_elapsed_sec: 60,
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = crate::events::event_channel();
+
+        // Create cost tracker WITHOUT expensive call confirmation threshold
+        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
+        let cost_tracker = crate::cost::CostTracker::new(
+            crate::cost::CostBudgetConfig {
+                session_cap_usd: Some(10.0),
+                per_turn_warning_usd: None,
+                expensive_call_confirmation_usd: None, // Disabled
+            },
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
+            .with_cost_tracker(cost_tracker);
+
+        let result = loop_.run("Test prompt".into()).await;
+
+        // Should succeed without any approval request
+        assert!(result.is_ok(), "result: {result:?}");
+
+        // Verify no ApprovalRequest was emitted
+        let mut found_approval_request = false;
+        for _ in 0..50 {
+            if let Ok(event) = event_rx.try_recv()
+                && matches!(event, crate::events::Event::ApprovalRequest(_))
+            {
+                found_approval_request = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !found_approval_request,
+            "expected no ApprovalRequest when disabled"
         );
     }
 }

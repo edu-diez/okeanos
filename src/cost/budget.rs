@@ -33,6 +33,9 @@ pub struct CostBudgetConfig {
     pub session_cap_usd: Option<f64>,
     /// Soft warning threshold per turn in USD. None = disabled.
     pub per_turn_warning_usd: Option<f64>,
+    /// Confirmation threshold for expensive tool calls in USD. None = disabled.
+    /// When a tool call's estimated cost exceeds this threshold, user confirmation is required.
+    pub expensive_call_confirmation_usd: Option<f64>,
 }
 
 impl CostBudgetConfig {
@@ -41,12 +44,20 @@ impl CostBudgetConfig {
         Self {
             session_cap_usd: section.session_cap_usd,
             per_turn_warning_usd: section.per_turn_warning_usd,
+            expensive_call_confirmation_usd: section.expensive_call_confirmation_usd,
         }
     }
 
     /// Check if cost budget is enabled (has any limit).
     pub fn is_enabled(&self) -> bool {
-        self.session_cap_usd.is_some() || self.per_turn_warning_usd.is_some()
+        self.session_cap_usd.is_some()
+            || self.per_turn_warning_usd.is_some()
+            || self.expensive_call_confirmation_usd.is_some()
+    }
+
+    /// Get the expensive call confirmation threshold.
+    pub fn expensive_call_confirmation_usd(&self) -> Option<f64> {
+        self.expensive_call_confirmation_usd
     }
 }
 
@@ -133,6 +144,20 @@ impl CostTracker {
     /// Get the per-turn warning threshold if configured.
     pub fn per_turn_warning_usd(&self) -> Option<f64> {
         self.config.per_turn_warning_usd
+    }
+
+    /// Get the expensive call confirmation threshold if configured.
+    pub fn expensive_call_confirmation_usd(&self) -> Option<f64> {
+        self.config.expensive_call_confirmation_usd
+    }
+
+    /// Check if a tool call's estimated cost exceeds the expensive call confirmation threshold.
+    ///
+    /// Returns true if confirmation is required (cost exceeds threshold).
+    pub fn requires_expensive_call_confirmation(&self, projected_cost: f64) -> bool {
+        self.config
+            .expensive_call_confirmation_usd
+            .is_some_and(|threshold| projected_cost > threshold)
     }
 
     /// Get the model ID.
@@ -233,6 +258,7 @@ impl CostTracker {
             spent_usd: self.spent_usd,
             session_cap_usd: self.config.session_cap_usd,
             per_turn_warning_usd: self.config.per_turn_warning_usd,
+            expensive_call_confirmation_usd: self.config.expensive_call_confirmation_usd,
             model_id: self.model_id.clone(),
             remaining_usd: self.config.session_cap_usd.map(|cap| cap - self.spent_usd),
         }
@@ -245,6 +271,7 @@ pub struct CostBudgetSummary {
     pub spent_usd: f64,
     pub session_cap_usd: Option<f64>,
     pub per_turn_warning_usd: Option<f64>,
+    pub expensive_call_confirmation_usd: Option<f64>,
     pub model_id: String,
     pub remaining_usd: Option<f64>,
 }
@@ -468,6 +495,7 @@ mod tests {
         let config = CostBudgetConfig {
             session_cap_usd: Some(10.0),
             per_turn_warning_usd: Some(0.5),
+            expensive_call_confirmation_usd: None,
         };
         let pricing = Arc::new(TestPricingProvider {
             table: default_pricing_table(),
@@ -483,7 +511,101 @@ mod tests {
         assert_eq!(summary.spent_usd, 0.0);
         assert_eq!(summary.session_cap_usd, Some(10.0));
         assert_eq!(summary.per_turn_warning_usd, Some(0.5));
+        assert_eq!(summary.expensive_call_confirmation_usd, None);
         assert_eq!(summary.model_id, "gpt-4o");
         assert_eq!(summary.remaining_usd, Some(10.0));
+    }
+
+    #[test]
+    fn test_cost_tracker_enabled_with_expensive_call_confirmation() {
+        let config = CostBudgetConfig {
+            expensive_call_confirmation_usd: Some(0.5),
+            ..Default::default()
+        };
+        let pricing = Arc::new(TestPricingProvider {
+            table: default_pricing_table(),
+        });
+        let tracker = CostTracker::new(
+            config,
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+        assert!(tracker.is_enabled());
+    }
+
+    #[test]
+    fn test_requires_expensive_call_confirmation_below_threshold() {
+        let config = CostBudgetConfig {
+            expensive_call_confirmation_usd: Some(1.0),
+            ..Default::default()
+        };
+        let pricing = Arc::new(TestPricingProvider {
+            table: default_pricing_table(),
+        });
+        let tracker = CostTracker::new(
+            config,
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+        // Cost well below threshold
+        assert!(!tracker.requires_expensive_call_confirmation(0.1));
+    }
+
+    #[test]
+    fn test_requires_expensive_call_confirmation_above_threshold() {
+        let config = CostBudgetConfig {
+            expensive_call_confirmation_usd: Some(0.1),
+            ..Default::default()
+        };
+        let pricing = Arc::new(TestPricingProvider {
+            table: default_pricing_table(),
+        });
+        let tracker = CostTracker::new(
+            config,
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+        // Cost above threshold
+        assert!(tracker.requires_expensive_call_confirmation(0.5));
+    }
+
+    #[test]
+    fn test_requires_expensive_call_confirmation_disabled() {
+        let config = CostBudgetConfig::default(); // No threshold set
+        let pricing = Arc::new(TestPricingProvider {
+            table: default_pricing_table(),
+        });
+        let tracker = CostTracker::new(
+            config,
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+        // Disabled = never requires confirmation
+        assert!(!tracker.requires_expensive_call_confirmation(1000.0));
+    }
+
+    #[test]
+    fn test_summary_includes_expensive_call_confirmation() {
+        let config = CostBudgetConfig {
+            session_cap_usd: Some(10.0),
+            per_turn_warning_usd: Some(0.5),
+            expensive_call_confirmation_usd: Some(0.25),
+        };
+        let pricing = Arc::new(TestPricingProvider {
+            table: default_pricing_table(),
+        });
+        let tracker = CostTracker::new(
+            config,
+            "gpt-4o".to_string(),
+            pricing,
+            ModelCapabilities::default(),
+        );
+
+        let summary = tracker.summary();
+        assert_eq!(summary.expensive_call_confirmation_usd, Some(0.25));
     }
 }

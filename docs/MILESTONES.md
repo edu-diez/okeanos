@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0), Milestone 24 complete & tagged (v0.8.0).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -851,11 +851,36 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - Tagged v0.7.0
 
 ### Milestone 24 — Per-turn expensive call confirmation
+
+**Status:** complete — tagged v0.8.0
+
 **Scope:** User confirmation before tool calls exceeding cost threshold.
 - Configurable per-turn cost warning threshold (USD)
 - TUI modal + headless `ApprovalRequest` event
 - Skip confirmation for `allow-always` grants
 - **Out of scope:** Budget forecasting, predictive cost estimates.
+
+**Acceptance criteria:**
+- Config `cost.expensive_call_confirmation_usd` with validation (>= 0)
+- CostTracker `requires_expensive_call_confirmation()` checks threshold
+- ReAct loop emits `ApprovalRequest` when tool call cost exceeds threshold
+- TUI modal + headless event parity (reuses existing approval infrastructure)
+- Allow-always grant skips confirmation
+- Disabled by default (opt-in)
+
+**Testing requirements:** Unit tests for threshold check, allow-always skip, disabled-by-default. Integration tests for prompt/allow/deny/allow-always flows.
+
+**Definition of Done:** CI green; expensive call confirmation verified end-to-end in headless and TUI modes; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (382 unit tests)
+- `cargo build --release` produces a single binary
+- Config section `cost.expensive_call_confirmation_usd` with validation
+- CostTracker `requires_expensive_call_confirmation()` method
+- ReAct loop integrates check before tool execution
+- Allow-always grant bypasses confirmation
+- Feature disabled by default (opt-in)
+- Tagged v0.8.0
 
 ### Milestone 25 — Tree-sitter symbol scanning (optional)
 **Scope:** C-based symbol scanner for richer context selection (opt-in).
@@ -915,7 +940,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 21 | ✅ MCP client | 2–3 | M16 |
 | 22 | ✅ Session log rotation | 1 | M13 |
 | 23 | ✅ Tool result caching | 1–2 | M16 |
-| 24 | Expensive call confirmation | 1 | M10, M16 |
+| 24 | ✅ Expensive call confirmation | 1 | M10, M16 |
 | 25 | Tree-sitter scanning (opt-in) | 2 | M16 |
 | 26 | Markdown rendering | 1–2 | M12 |
 | 27 | Multi-agent delegation | 3+ | M16, M13 |
@@ -960,7 +985,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M21 MCP client | `0.5.0` | ✅ Complete |
 | M22 Session log rotation | `0.6.0` | ✅ Complete |
 | M23 Tool result caching | `0.7.0` | |
-| M24 Expensive call confirmation | `0.8.0` | |
+| M24 Expensive call confirmation | `0.8.0` | ✅ Complete |
 | M25 Tree-sitter scanning | `0.9.0` | |
 | M26 Markdown rendering | `0.10.0` | |
 | M27 Multi-agent delegation | `0.11.0` | |

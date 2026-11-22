@@ -294,6 +294,9 @@ pub struct PermissionsSection {
 pub struct CostSection {
     pub session_cap_usd: Option<f64>,
     pub per_turn_warning_usd: Option<f64>,
+    /// Confirmation threshold for expensive tool calls in USD. None = disabled.
+    /// When a tool call's estimated cost exceeds this threshold, user confirmation is required.
+    pub expensive_call_confirmation_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -553,6 +556,13 @@ impl Config {
             {
                 return Err(ConfigError::Validation {
                     message: "cost.per_turn_warning_usd must be >= 0".to_string(),
+                });
+            }
+            if let Some(expensive) = cost.expensive_call_confirmation_usd
+                && expensive < 0.0
+            {
+                return Err(ConfigError::Validation {
+                    message: "cost.expensive_call_confirmation_usd must be >= 0".to_string(),
                 });
             }
         }
