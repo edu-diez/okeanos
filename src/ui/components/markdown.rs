@@ -312,10 +312,8 @@ fn render_markdown_internal(content: &str, theme: &Theme, max_width: u16) -> Vec
                 // Not supported
             }
             Event::SoftBreak => {
-                if !in_code_block {
-                    if !current_line_spans.is_empty() {
-                        lines.push(Line::from(std::mem::take(&mut current_line_spans)));
-                    }
+                if !in_code_block && !current_line_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_line_spans)));
                 }
             }
             Event::HardBreak => {
