@@ -1812,16 +1812,16 @@ async fn init_mcp_client(
     let discovered_tools = client.discovered_tools().await;
     for spec in discovered_tools {
         // Extract server name and tool name from the prefixed name (mcp__{server}__{tool})
-        if let Some(rest) = spec.name.strip_prefix("mcp__") {
-            if let Some((server_name, tool_name)) = rest.split_once("__") {
-                let mcp_tool = McpTool::new(
-                    client.clone(),
-                    server_name.to_string(),
-                    tool_name.to_string(),
-                    spec,
-                );
-                tools.register(mcp_tool);
-            }
+        if let Some(rest) = spec.name.strip_prefix("mcp__")
+            && let Some((server_name, tool_name)) = rest.split_once("__")
+        {
+            let mcp_tool = McpTool::new(
+                client.clone(),
+                server_name.to_string(),
+                tool_name.to_string(),
+                spec,
+            );
+            tools.register(mcp_tool);
         }
     }
 
