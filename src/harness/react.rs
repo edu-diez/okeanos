@@ -2881,12 +2881,10 @@ mod tests {
         let turn_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
 
         // Wait for approval request and send Deny
-        let mut found_approval_request = false;
         for _ in 0..100 {
             if let Ok(event) = event_rx.try_recv()
                 && matches!(event, crate::events::Event::ApprovalRequest(_))
             {
-                found_approval_request = true;
                 approval_tx
                     .send(crate::events::Approval {
                         id: "approval-expensive-0".into(),
