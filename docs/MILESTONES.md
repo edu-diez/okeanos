@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -784,11 +784,39 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 **Definition of Done:** CI green; all tests pass with `mcp` feature; milestone tagged.
 
 ### Milestone 22 — Session log rotation / compression
+**Status:** complete — tagged v0.6.0
+
 **Scope:** Rotate and compress JSONL session logs.
 - Configurable max file size / age before rotation
-- gzip compression for rotated segments
-- `--resume` works across rotated segments
+- zstd compression (with long-distance matching) for rotated segments; gzip fallback
+- `--resume` works transparently across rotated/compressed segments
+- Background worker for automatic compression (startup + periodic)
+- Manual `/rotate` command in command palette
 - **Out of scope:** Remote log shipping, structured query API.
+
+**Acceptance criteria:**
+- Rotation at compaction boundary (primary) and size threshold (safety net)
+- Segment naming: `session-{id}.jsonl` (active) → `session-{id}.N.jsonl[.zst|.gz]` (rotated)
+- Each segment has header with `segment_index`, `parent_segment`, `is_compressed`
+- Background worker compresses eligible segments (≥1 MB, ≥30 min idle, not current)
+- File locking prevents compressing active writers
+- Auto-cleanup: keeps `keep_rotated_segments` (default 20) and removes segments older than `max_age_days` (default 30)
+- `load_session()` walks segment chain, decompresses on-the-fly, returns events in order
+- `/rotate` slash command triggers manual rotation
+
+**Testing requirements:** Unit tests for rotation at compaction boundary, manual rotation, resume across compressed segments, compression worker eligibility, file locking. Integration test for long session → rotate → compress → resume.
+
+**Definition of Done:** CI green; rotation at compaction boundary verified; manual rotation via `/rotate` verified; resume across compressed segments verified; background worker compresses eligible segments without corrupting active session; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (357 unit tests)
+- `cargo build --release` produces a single binary
+- Rotation at compaction boundary creates new segment with updated headers
+- Manual `/rotate` command works in TUI
+- `load_session()` correctly replays events across multiple compressed segments
+- Background worker respects file locks and only compresses idle segments
+- Auto-cleanup removes old segments beyond retention limits
+- Tagged v0.6.0
 
 ### Milestone 23 — Tool result caching (TTL)
 **Scope:** Optional caching for idempotent tool calls.
@@ -860,7 +888,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 19 | ✅ Additional providers (Anthropic, OpenAI, Google) | 2–3 | M16 |
 | 20 | ✅ WebSocket RPC | 1 | M14 |
 | 21 | ✅ MCP client | 2–3 | M16 |
-| 22 | Session log rotation | 1 | M13 |
+| 22 | ✅ Session log rotation | 1 | M13 |
 | 23 | Tool result caching | 1–2 | M16 |
 | 24 | Expensive call confirmation | 1 | M10, M16 |
 | 25 | Tree-sitter scanning (opt-in) | 2 | M16 |
@@ -905,7 +933,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M19 Additional providers | `0.3.0` | Can be parallel with M18 → combine if shipped together |
 | M20 WebSocket RPC | `0.4.0` | ✅ Complete |
 | M21 MCP client | `0.5.0` | ✅ Complete |
-| M22 Session log rotation | `0.6.0` | |
+| M22 Session log rotation | `0.6.0` | ✅ Complete |
 | M23 Tool result caching | `0.7.0` | |
 | M24 Expensive call confirmation | `0.8.0` | |
 | M25 Tree-sitter scanning | `0.9.0` | |

@@ -7,7 +7,7 @@ use okeanos::cli::{Cli, Command, ConfigAction, Mode, Shell, Verbosity};
 use okeanos::config::Config;
 use okeanos::context::{Conversation, build_system_prompt, tokens::default_pricing_table};
 use okeanos::cost::{CostBudgetConfig, CostTracker};
-use okeanos::events::{Approval, ApprovalDecision, Event, Log, LogLevel};
+use okeanos::events::Event;
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::headless::{EventEmitter, HeadlessConfig};
 use okeanos::model::{
@@ -437,6 +437,8 @@ async fn cmd_doctor(cli: &Cli) -> anyhow::Result<()> {
 
 /// List resumable sessions.
 async fn cmd_sessions(cli: &Cli) -> anyhow::Result<()> {
+    let config = Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+
     let project_root = cli
         .root
         .as_deref()
@@ -444,8 +446,8 @@ async fn cmd_sessions(cli: &Cli) -> anyhow::Result<()> {
     let project_root =
         std::fs::canonicalize(project_root).context("failed to resolve project root")?;
 
-    let session_manager =
-        SessionManager::new(&project_root).context("failed to create session manager")?;
+    let session_manager = SessionManager::new_with_config(&project_root, config.rotation.clone())
+        .context("failed to create session manager")?;
     let sessions = session_manager
         .list_sessions()
         .context("failed to list sessions")?;
@@ -545,9 +547,10 @@ async fn run_interactive_tui(
     // Determine CWD
     let cwd = std::env::current_dir().context("failed to get CWD")?;
 
-    // Create session manager
+    // Create session manager with rotation config
     let mut session_manager =
-        SessionManager::new(&project_root).context("failed to create session manager")?;
+        SessionManager::new_with_config(&project_root, config.rotation.clone())
+            .context("failed to create session manager")?;
 
     // Handle resume or start new session
     let (session_id, restored_messages, restored_todos, resume_warnings) =
@@ -587,6 +590,9 @@ async fn run_interactive_tui(
     for warning in &resume_warnings {
         eprintln!("[WARN] {}", warning);
     }
+
+    // Wrap session manager in Arc<Mutex> for sharing with TUI
+    let session_manager = std::sync::Arc::new(tokio::sync::Mutex::new(session_manager));
 
     // Get the prompt from CLI (for initial prompt if provided)
     let initial_prompt = match (cli.resume.is_some(), prompt) {
@@ -844,7 +850,8 @@ async fn run_interactive_tui(
         .and_then(|t| t.parse::<ThemeVariant>().ok())
         .unwrap_or(ThemeVariant::Dark);
 
-    let mut tui_app = TerminalApp::new(theme_variant).context("failed to create TUI app")?;
+    let mut tui_app = TerminalApp::new(theme_variant, Some(session_manager.clone()))
+        .context("failed to create TUI app")?;
 
     // Set provider/model configuration status for welcome screen
     tui_app.set_config_status(provider_configured, configured_model);
@@ -935,7 +942,7 @@ async fn run_tui_and_loop(
     mut tui_app: okeanos::ui::TerminalApp,
     mut loop_: okeanos::harness::react::ReactLoop<ActiveModel>,
     mut composer_rx: tokio::sync::mpsc::Receiver<String>,
-    mut session_manager: okeanos::session::SessionManager,
+    session_manager: std::sync::Arc<tokio::sync::Mutex<okeanos::session::log::SessionManager>>,
 ) -> anyhow::Result<()> {
     // Set up signal handling for graceful shutdown
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -1135,7 +1142,11 @@ async fn run_tui_and_loop(
         tui_app.handle_events_from_loop(&mut loop_).await;
         // Log events to session manager
         while let Ok(event) = tui_app.event_rx.try_recv() {
-            session_manager.log_event(event).ok();
+            let sm = session_manager.clone();
+            tokio::spawn(async move {
+                let mut sm = sm.lock().await;
+                sm.log_event(event).ok();
+            });
         }
 
         // Check for completed turn
@@ -1178,9 +1189,11 @@ async fn run_tui_and_loop(
     // Cleanup
     tui_app.cleanup()?;
     // Flush session log on exit
-    session_manager
-        .end_session()
-        .context("failed to end session")?;
+    {
+        let sm = session_manager.clone();
+        let mut sm = sm.lock().await;
+        sm.end_session().context("failed to end session")?;
+    }
     Ok(())
 }
 
@@ -1199,9 +1212,10 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     // Determine CWD
     let cwd = std::env::current_dir().context("failed to get CWD")?;
 
-    // Create session manager
+    // Create session manager with rotation config
     let mut session_manager =
-        SessionManager::new(&project_root).context("failed to create session manager")?;
+        SessionManager::new_with_config(&project_root, config.rotation.clone())
+            .context("failed to create session manager")?;
 
     // Handle resume or start new session
     let (session_id, restored_messages, restored_todos, resume_warnings) =
@@ -1868,7 +1882,7 @@ fn run_dry_run(
 async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::Result<()> {
     use jsonrpsee::server::RpcModule;
     use jsonrpsee::types::{ErrorObject, Params};
-    use okeanos::events::{Approval, ApprovalDecision, Event};
+    use okeanos::events::Event;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::mpsc;
 
@@ -1886,9 +1900,10 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     // Determine CWD
     let cwd = std::env::current_dir().context("failed to get CWD")?;
 
-    // Create session manager (wrapped in Arc<Mutex> for shared access)
+    // Create session manager with rotation config (wrapped in Arc<Mutex> for shared access)
     let session_manager = Arc::new(Mutex::new(
-        SessionManager::new(&project_root).context("failed to create session manager")?,
+        SessionManager::new_with_config(&project_root, config.rotation.clone())
+            .context("failed to create session manager")?,
     ));
 
     // Handle resume or start new session
@@ -2142,9 +2157,7 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
-    let _mcp_client = {
-        init_mcp_client(&mut tools, config).await?
-    };
+    let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
     // Build permission policy from config
     let allow_list = config
@@ -2442,9 +2455,10 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     // Determine CWD
     let cwd = std::env::current_dir().context("failed to get CWD")?;
 
-    // Create session manager (wrapped in Arc<Mutex> for shared access)
+    // Create session manager with rotation config (wrapped in Arc<Mutex> for shared access)
     let session_manager = Arc::new(TokioMutex::new(
-        SessionManager::new(&project_root).context("failed to create session manager")?,
+        SessionManager::new_with_config(&project_root, config.rotation.clone())
+            .context("failed to create session manager")?,
     ));
 
     // Handle resume or start new session
@@ -2698,9 +2712,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
-    let _mcp_client = {
-        init_mcp_client(&mut tools, config).await?
-    };
+    let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
     // Build permission policy from config
     let allow_list = config

@@ -186,6 +186,8 @@ pub struct Config {
     pub compaction: Option<CompactionSection>,
     #[serde(default)]
     pub mcp: Option<McpSection>,
+    #[serde(default)]
+    pub rotation: Option<RotationSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -204,6 +206,7 @@ impl std::fmt::Debug for Config {
             .field("snapshots", &self.snapshots)
             .field("compaction", &self.compaction)
             .field("mcp", &self.mcp)
+            .field("rotation", &self.rotation)
             .finish()
     }
 }
@@ -355,6 +358,31 @@ pub struct CompactionModelOverride {
     pub strategy: Option<String>,
     /// Override preserve_recent_tokens for this model
     pub preserve_recent_tokens: Option<usize>,
+}
+
+/// Session log rotation and compression configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RotationSection {
+    /// Enable session log rotation (default: true)
+    pub enabled: Option<bool>,
+    /// Rotate at compaction boundaries (default: true)
+    pub rotate_on_compaction: Option<bool>,
+    /// Maximum file size in MB before forced rotation (default: 50)
+    pub max_file_size_mb: Option<u64>,
+    /// Compress rotated segments (default: true)
+    pub compress_after_rotation: Option<bool>,
+    /// Compression algorithm: "zstd" or "gzip" (default: "zstd")
+    pub compression: Option<String>,
+    /// zstd compression level 1-22 (default: 3)
+    pub zstd_level: Option<i32>,
+    /// Enable zstd long-distance matching for repeated content (default: true)
+    pub zstd_long_distance_matching: Option<bool>,
+    /// Maximum age in days before segments are eligible for cleanup (default: 30)
+    pub max_age_days: Option<u64>,
+    /// Maximum number of rotated segments to keep per session (0 = unlimited, default: 20)
+    pub keep_rotated_segments: Option<usize>,
+    /// Background worker interval in seconds (default: 1800 = 30 min)
+    pub background_worker_interval_sec: Option<u64>,
 }
 
 /// MCP (Model Context Protocol) client configuration.
@@ -704,6 +732,38 @@ impl Config {
                         ),
                     });
                 }
+            }
+        }
+
+        // Validate rotation section
+        if let Some(rotation) = &self.rotation {
+            if let Some(size) = rotation.max_file_size_mb
+                && size == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "rotation.max_file_size_mb must be > 0".to_string(),
+                });
+            }
+            if let Some(level) = rotation.zstd_level
+                && !(1..=22).contains(&level)
+            {
+                return Err(ConfigError::Validation {
+                    message: "rotation.zstd_level must be between 1 and 22".to_string(),
+                });
+            }
+            if let Some(comp) = &rotation.compression
+                && !matches!(comp.as_str(), "zstd" | "gzip")
+            {
+                return Err(ConfigError::Validation {
+                    message: "rotation.compression must be 'zstd' or 'gzip'".to_string(),
+                });
+            }
+            if let Some(interval) = rotation.background_worker_interval_sec
+                && interval == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "rotation.background_worker_interval_sec must be > 0".to_string(),
+                });
             }
         }
 

@@ -70,6 +70,9 @@ pub struct TerminalApp {
     /// Channel for compaction actions
     pub compaction_tx: mpsc::Sender<CompactionAction>,
     pub compaction_rx: mpsc::Receiver<CompactionAction>,
+    /// Session manager for log rotation (shared with harness)
+    pub session_manager:
+        Option<std::sync::Arc<tokio::sync::Mutex<crate::session::log::SessionManager>>>,
     pub terminal: Terminal<CrosstermBackend<io::Stdout>>,
     pub last_tick: Instant,
     pub running: bool,
@@ -87,8 +90,13 @@ pub struct TerminalApp {
 }
 
 impl TerminalApp {
-    /// Create a new TerminalApp with the given theme variant.
-    pub fn new(theme_variant: ThemeVariant) -> Result<Self> {
+    /// Create a new TerminalApp with the given theme variant and optional session manager.
+    pub fn new(
+        theme_variant: ThemeVariant,
+        session_manager: Option<
+            std::sync::Arc<tokio::sync::Mutex<crate::session::log::SessionManager>>,
+        >,
+    ) -> Result<Self> {
         let theme_manager = ThemeManager::new(theme_variant)?;
         let theme = theme_manager.current();
 
@@ -182,6 +190,7 @@ impl TerminalApp {
             undo_redo_rx,
             compaction_tx,
             compaction_rx,
+            session_manager,
             terminal,
             last_tick: Instant::now(),
             running: true,
@@ -717,6 +726,19 @@ impl TerminalApp {
                     "Manual compaction requested".to_string(),
                 )
                 .await;
+            }
+            CommandAction::Rotate => {
+                if let Some(session_manager) = &self.session_manager {
+                    let session_manager = session_manager.clone();
+                    tokio::spawn(async move {
+                        let mut sm = session_manager.lock().await;
+                        if let Err(e) = sm.rotate() {
+                            eprintln!("Failed to rotate session: {}", e);
+                        } else {
+                            eprintln!("Session log rotated to new segment");
+                        }
+                    });
+                }
             }
             CommandAction::Custom(_) => {}
         }

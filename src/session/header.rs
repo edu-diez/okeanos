@@ -43,6 +43,10 @@ pub enum SessionError {
     SerializeEvent { source: serde_json::Error },
     #[error("no cwd available for session storage")]
     NoCwd,
+    #[error("compression failed: {message}")]
+    Compression { message: String },
+    #[error("decompression failed: {message}")]
+    Decompression { message: String },
 }
 
 /// Session header (first line of JSONL file).
@@ -58,6 +62,15 @@ pub struct SessionHeader {
     pub started_at: u64,
     /// Project root directory (git root or CWD).
     pub project_root: String,
+    /// Segment index: 0 = active, 1+ = rotated segments.
+    #[serde(default)]
+    pub segment_index: u32,
+    /// Previous segment filename (for segment chain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_segment: Option<String>,
+    /// Whether this segment is compressed (zstd/gzip).
+    #[serde(default)]
+    pub is_compressed: bool,
 }
 
 /// A logged event with metadata.

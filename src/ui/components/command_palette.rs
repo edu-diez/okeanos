@@ -24,6 +24,7 @@ pub enum CommandAction {
     Todos,
     Logs,
     Compact,
+    Rotate,
     Custom(String),
 }
 
@@ -39,6 +40,7 @@ impl CommandAction {
             CommandAction::Todos => "/todos",
             CommandAction::Logs => "/logs",
             CommandAction::Compact => "/compact",
+            CommandAction::Rotate => "/rotate",
             CommandAction::Custom(s) => s,
         }
     }
@@ -54,6 +56,7 @@ impl CommandAction {
             CommandAction::Todos => "Show/hide todo panel",
             CommandAction::Logs => "Show/hide log panel",
             CommandAction::Compact => "Compact context (summarize history)",
+            CommandAction::Rotate => "Rotate session log (start new segment)",
             CommandAction::Custom(_) => "Custom command",
         }
     }
@@ -69,6 +72,7 @@ impl CommandAction {
             CommandAction::Todos,
             CommandAction::Logs,
             CommandAction::Compact,
+            CommandAction::Rotate,
         ]
     }
 }
@@ -424,7 +428,7 @@ mod tests {
         let palette = CommandPalette::new(test_theme());
         assert!(!palette.is_visible());
         assert_eq!(palette.query(), "");
-        assert_eq!(palette.filtered.len(), 8); // 8 built-in commands (including /compact)
+        assert_eq!(palette.filtered.len(), 9); // 9 built-in commands (including /compact, /rotate)
     }
 
     #[test]
@@ -506,12 +510,17 @@ mod tests {
         assert_eq!(CommandAction::Todos.command(), "/todos");
         assert_eq!(CommandAction::Logs.command(), "/logs");
         assert_eq!(CommandAction::Compact.command(), "/compact");
+        assert_eq!(CommandAction::Rotate.command(), "/rotate");
 
         assert_eq!(CommandAction::Help.description(), "Show help");
         assert_eq!(CommandAction::Undo.description(), "Undo last action");
         assert_eq!(
             CommandAction::Compact.description(),
             "Compact context (summarize history)"
+        );
+        assert_eq!(
+            CommandAction::Rotate.description(),
+            "Rotate session log (start new segment)"
         );
     }
 
