@@ -302,7 +302,10 @@ mod tests {
 
     #[test]
     fn test_cache_config_is_cacheable() {
-        let config = CacheConfig { enabled: true, ..Default::default() };
+        let config = CacheConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(config.is_cacheable("read"));
         assert!(config.is_cacheable("grep"));
         assert!(!config.is_cacheable("write"));
@@ -310,7 +313,10 @@ mod tests {
         assert!(!config.is_cacheable("run"));
         assert!(!config.is_cacheable("todo"));
 
-        let config_disabled = CacheConfig { enabled: false, ..Default::default() };
+        let config_disabled = CacheConfig {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(!config_disabled.is_cacheable("read"));
     }
 
