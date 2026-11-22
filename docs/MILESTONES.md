@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0), Milestone 24 complete & tagged (v0.8.0).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0), Milestone 24 complete & tagged (v0.8.0), Milestone 26 complete & tagged (v0.9.0).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -890,11 +890,33 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - **Out of scope:** Full AST-based refactoring, cross-file analysis.
 
 ### Milestone 26 — Rich text / markdown rendering in TUI
+
+**Status:** complete — tagged v0.9.0
+
 **Scope:** Render markdown in conversation pane.
-- Feature-gated `pulldown-cmark` + `ratatui` markdown widget
+- Feature-gated `pulldown-cmark` + `syntect` (pure Rust) markdown widget
 - Code blocks with syntax highlighting
 - Configurable: plain / markdown / auto
 - **Out of scope:** Image rendering, interactive widgets.
+
+**Acceptance criteria:**
+- `cargo build --release --features markdown` compiles; `cargo build --release` (without feature) compiles with plain text fallback
+- Assistant messages render with markdown formatting when enabled
+- Code blocks show syntax highlighting (keywords, strings, comments colored)
+- Config option `ui.markdown_render` works (plain/markdown/auto)
+- Theme colors respected throughout
+- No C dependencies added (syntect uses fancy-regex pure Rust backend)
+
+**Testing requirements:** Unit tests for markdown widget (headings, code blocks, lists); integration test rendering markdown message in conversation pane; test feature-gated compilation both ways.
+
+**Definition of Done:** CI green; markdown rendering verified end-to-end in TUI and headless modes; feature-gated compilation verified; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test --features markdown` passes (393 tests)
+- `cargo test` passes (382 tests without feature)
+- `cargo build --release --features markdown` produces a single binary
+- `cargo build --release` produces a single binary (plain text fallback)
+- Tagged v0.9.0
 
 ### Milestone 27 — Multi-agent crew / delegation
 **Scope:** Delegate subtasks to sub-agents via `todo` tool extension.

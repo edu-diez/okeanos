@@ -30,6 +30,8 @@ use tracing_subscriber::EnvFilter;
 
 #[cfg(feature = "tui")]
 use okeanos::ui::TerminalApp;
+#[cfg(all(feature = "tui", feature = "markdown"))]
+use okeanos::ui::components::markdown::RenderMode;
 
 #[cfg(feature = "rpc")]
 use {
@@ -311,6 +313,8 @@ allow_list = ["todo", "read", "grep"]
 [ui]
 # Theme: "dark" or "light"
 # theme = "dark"
+# Markdown rendering mode for assistant messages: "plain", "markdown", or "auto" (default: "auto")
+# markdown_render = "auto"
 
 # Snapshots configuration (opt-in)
 # [snapshots]
@@ -851,6 +855,19 @@ async fn run_interactive_tui(
         .and_then(|t| t.parse::<ThemeVariant>().ok())
         .unwrap_or(ThemeVariant::Dark);
 
+    #[cfg(feature = "markdown")]
+    let render_mode = config
+        .ui
+        .as_ref()
+        .and_then(|u| u.markdown_render.as_deref())
+        .and_then(|m| m.parse::<RenderMode>().ok())
+        .unwrap_or(RenderMode::Auto);
+
+    #[cfg(feature = "markdown")]
+    let mut tui_app = TerminalApp::new(theme_variant, Some(session_manager.clone()), render_mode)
+        .context("failed to create TUI app")?;
+
+    #[cfg(not(feature = "markdown"))]
     let mut tui_app = TerminalApp::new(theme_variant, Some(session_manager.clone()))
         .context("failed to create TUI app")?;
 

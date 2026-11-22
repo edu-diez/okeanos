@@ -7,6 +7,7 @@ bg = "#0b0e11"        # Near-black, cool
 fg = "#e2e8f0"        # Primary foreground
 muted = "#94a3b8"     # Muted text, timestamps, retry counts
 border = "#1e293b"    # Structural borders
+code_block_bg = "#111418"  # Slightly lighter than bg for code blocks
 
 # Semantic colors - paired with glyphs for accessibility
 [semantic]

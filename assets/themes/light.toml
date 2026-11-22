@@ -7,6 +7,7 @@ bg = "#f8fafc"        # Off-white
 fg = "#0f172a"        # Primary foreground (dark)
 muted = "#475569"     # Muted text, timestamps, retry counts
 border = "#cbd5e1"    # Structural borders
+code_block_bg = "#eef2f7"  # Slightly darker than bg for code blocks
 
 # Semantic colors - paired with glyphs for accessibility
 # Lightness shifted for light canvas (darker accents)

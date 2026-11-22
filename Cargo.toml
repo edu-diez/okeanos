@@ -46,6 +46,8 @@ jsonrpsee = { version = "0.24", optional = true, features = ["ws-client", "http-
 futures-util = { version = "0.3", optional = true }
 http = { version = "1.2", optional = true }
 rmcp = { version = "3.11", optional = true, features = ["client", "transport-child-process", "schemars"] }
+pulldown-cmark = { version = "0.12", optional = true }
+syntect = { version = "5.0", optional = true, default-features = false, features = ["default-fancy"] }
 
 [dev-dependencies]
 tempfile = "3.15"
@@ -58,5 +60,6 @@ rpc = ["jsonrpsee", "http", "futures-util"]
 mcp = ["rmcp"]
 mock-provider = []
 simd-json = []
+markdown = ["pulldown-cmark", "syntect", "tui"]
 
 [workspace]

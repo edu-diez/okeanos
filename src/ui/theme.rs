@@ -41,6 +41,8 @@ pub struct CanvasColors {
     pub fg: String,
     pub muted: String,
     pub border: String,
+    /// Background color for code blocks (slightly different from canvas bg)
+    pub code_block_bg: String,
 }
 
 /// Semantic colors (paired with glyphs for accessibility).
@@ -259,6 +261,7 @@ impl Theme {
             SemanticRole::CanvasFg => &self.canvas.fg,
             SemanticRole::CanvasMuted => &self.canvas.muted,
             SemanticRole::CanvasBorder => &self.canvas.border,
+            SemanticRole::CodeBlockBg => &self.canvas.code_block_bg,
         };
         Self::hex_to_color(hex)
     }
@@ -304,6 +307,8 @@ pub enum SemanticRole {
     CanvasFg,
     CanvasMuted,
     CanvasBorder,
+    /// Background for code blocks (distinct from canvas bg)
+    CodeBlockBg,
 }
 
 /// Theme manager for runtime theme switching.

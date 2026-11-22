@@ -90,12 +90,13 @@ pub struct TerminalApp {
 }
 
 impl TerminalApp {
-    /// Create a new TerminalApp with the given theme variant and optional session manager.
+    /// Create a new TerminalApp with the given theme variant, optional session manager, and markdown render mode.
     pub fn new(
         theme_variant: ThemeVariant,
         session_manager: Option<
             std::sync::Arc<tokio::sync::Mutex<crate::session::log::SessionManager>>,
         >,
+        #[cfg(feature = "markdown")] render_mode: crate::ui::components::markdown::RenderMode,
     ) -> Result<Self> {
         let theme_manager = ThemeManager::new(theme_variant)?;
         let theme = theme_manager.current();
@@ -139,7 +140,14 @@ impl TerminalApp {
         let layout = LayoutRects::new(area, &theme);
 
         // Create components
+        #[cfg(feature = "markdown")]
+        let mut conversation = ConversationPane::new(theme.clone());
+        #[cfg(not(feature = "markdown"))]
         let conversation = ConversationPane::new(theme.clone());
+        #[cfg(feature = "markdown")]
+        {
+            conversation.set_render_mode(render_mode);
+        }
         let tool_panel = ToolPanel::new(theme.clone());
         let todo_panel = TodoPanel::new(theme.clone());
         let status_bar = StatusBar::new(theme.clone());

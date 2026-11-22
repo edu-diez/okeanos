@@ -8,6 +8,8 @@
 //! - Typewriter cursor blink; typing indicator (three pulsing dots) while model thinking
 
 use crate::events::{Event, Message, MessageRole, ToolCall, ToolCallStatus, ToolResult};
+#[cfg(feature = "markdown")]
+use crate::ui::components::markdown::{RenderMode, render_markdown};
 use crate::ui::theme::{SemanticRole, Theme};
 use ratatui::{
     buffer::Buffer,
@@ -71,6 +73,8 @@ pub struct ConversationPane {
     theme: Arc<Theme>,
     reduced_motion: bool,
     max_width: u16,
+    #[cfg(feature = "markdown")]
+    render_mode: RenderMode,
 }
 
 impl ConversationPane {
@@ -87,7 +91,15 @@ impl ConversationPane {
             theme,
             reduced_motion,
             max_width: 80,
+            #[cfg(feature = "markdown")]
+            render_mode: RenderMode::Auto,
         }
+    }
+
+    /// Set the markdown render mode (feature-gated).
+    #[cfg(feature = "markdown")]
+    pub fn set_render_mode(&mut self, mode: RenderMode) {
+        self.render_mode = mode;
     }
 
     /// Set the theme (for runtime theme switching).
@@ -353,13 +365,13 @@ impl ConversationPane {
                 ]));
             }
             MessageRole::Assistant => {
-                let mut spans = vec![
+                let chip_spans = vec![
                     Span::styled(" assistant ", self.chip_style(SemanticRole::Assistant)),
                     Span::raw(" "),
                 ];
 
                 if msg.is_streaming {
-                    // Streaming: show content + cursor
+                    // Streaming: show content + cursor (plain text during streaming)
                     let content = msg.message.content.clone();
                     let cursor_pos = msg.stream_cursor_pos.min(content.len());
                     let before = content[..cursor_pos].to_string();
@@ -369,6 +381,7 @@ impl ConversationPane {
                         String::new()
                     };
 
+                    let mut spans = chip_spans;
                     spans.push(Span::styled(
                         before,
                         self.theme.style(SemanticRole::Assistant),
@@ -405,14 +418,39 @@ impl ConversationPane {
                     } else if self.typing_indicator && self.reduced_motion {
                         spans.push(Span::raw(" …"));
                     }
-                } else {
-                    spans.push(Span::styled(
-                        msg.message.content.clone(),
-                        self.theme.style(SemanticRole::Assistant),
-                    ));
-                }
 
-                lines.push(Line::from(spans));
+                    lines.push(Line::from(spans));
+                } else {
+                    // Non-streaming: render with markdown if enabled
+                    #[cfg(feature = "markdown")]
+                    {
+                        let markdown_lines = render_markdown(
+                            &msg.message.content,
+                            &self.theme,
+                            self.max_width,
+                            self.render_mode,
+                        );
+                        // Prepend chip to first line
+                        if let Some(first_line) = markdown_lines.first() {
+                            let mut chip_spans_with_content = chip_spans.clone();
+                            chip_spans_with_content.extend(first_line.spans.iter().cloned());
+                            lines.push(Line::from(chip_spans_with_content));
+                        }
+                        // Add remaining lines
+                        for line in markdown_lines.iter().skip(1) {
+                            lines.push(line.clone());
+                        }
+                    }
+                    #[cfg(not(feature = "markdown"))]
+                    {
+                        let mut spans = chip_spans;
+                        spans.push(Span::styled(
+                            msg.message.content.clone(),
+                            self.theme.style(SemanticRole::Assistant),
+                        ));
+                        lines.push(Line::from(spans));
+                    }
+                }
             }
             MessageRole::Tool => {
                 lines.push(Line::from(vec![

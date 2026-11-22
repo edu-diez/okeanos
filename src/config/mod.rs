@@ -302,6 +302,8 @@ pub struct CostSection {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct UiSection {
     pub theme: Option<String>, // "dark" or "light"
+    /// Markdown rendering mode for assistant messages: "plain", "markdown", or "auto" (default: "auto")
+    pub markdown_render: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
