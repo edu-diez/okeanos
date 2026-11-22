@@ -14,8 +14,8 @@ use crate::model::{
 };
 use crate::session::SessionManager;
 use crate::snapshot::store::{SnapshotEntry, SnapshotError, SnapshotStore};
-use crate::tool::ToolRegistry;
 use crate::tool::tool_trait::ToolCategory;
+use crate::tool::{CacheConfig, ToolRegistry, ToolResultCache};
 use anyhow::Context as _;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -135,6 +135,8 @@ pub struct ReactLoop<M: Model> {
     snapshot_store: Option<SnapshotStore>,
     /// Optional compaction manager for context compaction.
     compaction_manager: Option<CompactionManager>,
+    /// Optional tool result cache for idempotent tools (read, grep).
+    tool_cache: Option<ToolResultCache>,
     /// Event index counter for snapshot metadata.
     event_index: usize,
     /// Project root for selective context inclusion.
@@ -166,6 +168,7 @@ impl<M: Model> ReactLoop<M> {
             cost_tracker: None,
             snapshot_store: None,
             compaction_manager: None,
+            tool_cache: None,
             event_index: 0,
             project_root: None,
         }
@@ -237,6 +240,12 @@ impl<M: Model> ReactLoop<M> {
     /// Set the compaction manager for context compaction.
     pub fn with_compaction(mut self, config: CompactionConfig) -> Self {
         self.compaction_manager = Some(CompactionManager::new(config));
+        self
+    }
+
+    /// Set the tool result cache for idempotent tool calls (read, grep).
+    pub fn with_tool_cache(mut self, config: CacheConfig) -> Self {
+        self.tool_cache = Some(ToolResultCache::new(config));
         self
     }
 
@@ -1125,6 +1134,7 @@ impl<M: Model> ReactLoop<M> {
     /// is returned.
     ///
     /// Takes a git snapshot before executing destructive tools (Write, Delete, Network).
+    /// Checks tool result cache for idempotent tools (read, grep) before execution.
     async fn execute_tool(
         &mut self,
         tool_call: ToolCall,
@@ -1137,6 +1147,50 @@ impl<M: Model> ReactLoop<M> {
             .get(&tool_call.name)
             .ok_or_else(|| ReactError::Tool(format!("unknown tool: {}", tool_call.name)))?;
         let spec = tool.spec();
+
+        // Check tool result cache for idempotent tools (read, grep) before policy/cost checks.
+        // This avoids unnecessary approval prompts and cost checks for cached results.
+        if let Some(cache) = &mut self.tool_cache
+            && let Some(cached_exec_result) = cache.get(&tool_call.name, &tool_call.args)
+        {
+            // Cache hit - emit log and return cached result
+            self.emit_log(
+                LogLevel::Debug,
+                format!(
+                    "Tool result cache hit for {} (skipping execution)",
+                    tool_call.name
+                ),
+            )
+            .await;
+
+            let duration_ms = 0; // cached result has no execution time
+            let result = ToolResult {
+                id: tool_call.id,
+                name: tool_call.name,
+                args: tool_call.args,
+                output: cached_exec_result.output,
+                ok: true,
+                duration_ms,
+                truncated: cached_exec_result.truncated,
+                exit_code: cached_exec_result.exit_code,
+                timed_out: cached_exec_result.timed_out,
+                cancelled: cached_exec_result.cancelled,
+            };
+
+            // Record actual cost after tool execution (zero for cached).
+            self.record_tool_cost(&result).await;
+
+            // Emit tool call completed event
+            self.emit_tool_call(ToolCall {
+                id: result.id.clone(),
+                name: result.name.clone(),
+                args: result.args.clone(),
+                status: ToolCallStatus::Ok,
+            })
+            .await;
+
+            return Ok(result);
+        }
 
         // Gate execution behind the permission policy.
         match self.policy.check(&tool_call.name, &spec) {
@@ -1225,10 +1279,13 @@ impl<M: Model> ReactLoop<M> {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Clone exec_result for caching before we move its output into result.
+        let exec_result_for_cache = exec_result.clone();
+
         let result = ToolResult {
             id: tool_call.id,
-            name: tool_call.name,
-            args: tool_call.args,
+            name: tool_call.name.clone(), // clone for cache invalidation below
+            args: tool_call.args.clone(), // clone for cache invalidation below
             output: exec_result.output,
             ok: true,
             duration_ms,
@@ -1237,6 +1294,29 @@ impl<M: Model> ReactLoop<M> {
             timed_out: exec_result.timed_out,
             cancelled: exec_result.cancelled,
         };
+
+        // Store result in cache for idempotent tools (read, grep).
+        if let Some(cache) = &mut self.tool_cache {
+            cache.put(&tool_call.name, &tool_call.args, &exec_result_for_cache);
+        }
+
+        // Invalidate cache for paths affected by write/delete/run operations.
+        if let Some(cache) = &mut self.tool_cache
+            && matches!(
+                spec.category,
+                ToolCategory::Write | ToolCategory::Delete | ToolCategory::Network
+            )
+        {
+            // Extract paths from tool args and invalidate cache for those paths
+            use crate::tool::cache::extract_paths;
+            for path in extract_paths(&tool_call.name, &tool_call.args) {
+                cache.invalidate_path(&path);
+            }
+            // For run tool, also invalidate all since it can modify arbitrary files
+            if tool_call.name == "run" {
+                cache.invalidate_all();
+            }
+        }
 
         // Record actual cost after tool execution.
         self.record_tool_cost(&result).await;

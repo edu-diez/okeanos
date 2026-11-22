@@ -188,6 +188,8 @@ pub struct Config {
     pub mcp: Option<McpSection>,
     #[serde(default)]
     pub rotation: Option<RotationSection>,
+    #[serde(default)]
+    pub tool_cache: Option<ToolCacheSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -207,6 +209,7 @@ impl std::fmt::Debug for Config {
             .field("compaction", &self.compaction)
             .field("mcp", &self.mcp)
             .field("rotation", &self.rotation)
+            .field("tool_cache", &self.tool_cache)
             .finish()
     }
 }
@@ -383,6 +386,21 @@ pub struct RotationSection {
     pub keep_rotated_segments: Option<usize>,
     /// Background worker interval in seconds (default: 1800 = 30 min)
     pub background_worker_interval_sec: Option<u64>,
+}
+
+/// Tool result caching configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ToolCacheSection {
+    /// Enable tool result caching (default: false).
+    pub enabled: Option<bool>,
+    /// Default TTL in seconds for cacheable tools (default: 300 = 5 minutes).
+    pub default_ttl_secs: Option<u64>,
+    /// Per-tool TTL overrides in seconds.
+    /// e.g., { read = 600, grep = 300 }
+    #[serde(default)]
+    pub per_tool_ttl: std::collections::HashMap<String, u64>,
+    /// Maximum number of cache entries (default: 1000).
+    pub max_entries: Option<usize>,
 }
 
 /// MCP (Model Context Protocol) client configuration.
@@ -763,6 +781,24 @@ impl Config {
             {
                 return Err(ConfigError::Validation {
                     message: "rotation.background_worker_interval_sec must be > 0".to_string(),
+                });
+            }
+        }
+
+        // Validate tool_cache section
+        if let Some(tool_cache) = &self.tool_cache {
+            if let Some(ttl) = tool_cache.default_ttl_secs
+                && ttl == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "tool_cache.default_ttl_secs must be > 0".to_string(),
+                });
+            }
+            if let Some(max_entries) = tool_cache.max_entries
+                && max_entries == 0
+            {
+                return Err(ConfigError::Validation {
+                    message: "tool_cache.max_entries must be > 0".to_string(),
                 });
             }
         }

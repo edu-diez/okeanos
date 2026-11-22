@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -819,11 +819,36 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - Tagged v0.6.0
 
 ### Milestone 23 — Tool result caching (TTL)
+
+**Status:** complete — tagged v0.7.0
+
 **Scope:** Optional caching for idempotent tool calls.
 - TTL-based cache for `read`, `grep` results
 - Configurable per-tool TTL; disabled by default
 - Invalidate on any `write`/`delete`/`run` in same path
 - **Out of scope:** Distributed cache, cache warming.
+
+**Acceptance criteria:**
+- Cache enabled via `[tool_cache]` config section
+- `read` and `grep` results cached with TTL (default 5 min, configurable per tool)
+- Cache invalidated on `write`/`delete`/`run` affecting same path
+- Cache disabled by default (opt-in via `tool_cache.enabled = true`)
+- File modification detection via hash+mtime invalidates stale entries
+- LRU eviction when max entries reached (default 1000)
+
+**Testing requirements:** Unit tests for cache hit/miss, TTL expiry, file modification invalidation, path invalidation on write/delete/run, canonical key stability, non-cacheable tools never cached, max entries eviction, cache disabled by default.
+
+**Definition of Done:** CI green; caching verified end-to-end in headless mode; milestone tagged.
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (371 unit tests)
+- `cargo build --release` produces a single binary
+- Tool result cache module exists at `src/tool/cache.rs`
+- Config section `tool_cache` with `enabled`, `default_ttl_secs`, `per_tool_ttl`, `max_entries`
+- `read`/`grep` cache hits logged at Debug level
+- Cache invalidated on write/delete/run operations
+- Cache disabled by default
+- Tagged v0.7.0
 
 ### Milestone 24 — Per-turn expensive call confirmation
 **Scope:** User confirmation before tool calls exceeding cost threshold.
@@ -889,7 +914,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 20 | ✅ WebSocket RPC | 1 | M14 |
 | 21 | ✅ MCP client | 2–3 | M16 |
 | 22 | ✅ Session log rotation | 1 | M13 |
-| 23 | Tool result caching | 1–2 | M16 |
+| 23 | ✅ Tool result caching | 1–2 | M16 |
 | 24 | Expensive call confirmation | 1 | M10, M16 |
 | 25 | Tree-sitter scanning (opt-in) | 2 | M16 |
 | 26 | Markdown rendering | 1–2 | M12 |
