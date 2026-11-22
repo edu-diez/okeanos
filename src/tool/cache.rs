@@ -302,8 +302,7 @@ mod tests {
 
     #[test]
     fn test_cache_config_is_cacheable() {
-        let mut config = CacheConfig::default();
-        config.enabled = true;
+        let config = CacheConfig { enabled: true, ..Default::default() };
         assert!(config.is_cacheable("read"));
         assert!(config.is_cacheable("grep"));
         assert!(!config.is_cacheable("write"));
@@ -311,15 +310,17 @@ mod tests {
         assert!(!config.is_cacheable("run"));
         assert!(!config.is_cacheable("todo"));
 
-        config.enabled = false;
-        assert!(!config.is_cacheable("read"));
+        let config_disabled = CacheConfig { enabled: false, ..Default::default() };
+        assert!(!config_disabled.is_cacheable("read"));
     }
 
     #[test]
     fn test_cache_config_per_tool_ttl() {
-        let mut config = CacheConfig::default();
-        config.enabled = true;
-        config.per_tool_ttl = HashMap::from([("read".to_string(), 600), ("grep".to_string(), 150)]);
+        let config = CacheConfig {
+            enabled: true,
+            per_tool_ttl: HashMap::from([("read".to_string(), 600), ("grep".to_string(), 150)]),
+            ..Default::default()
+        };
 
         assert_eq!(config.ttl_for("read").as_secs(), 600);
         assert_eq!(config.ttl_for("grep").as_secs(), 150);
