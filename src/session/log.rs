@@ -1069,7 +1069,6 @@ mod tests {
     use super::*;
     use crate::config::RotationSection;
     use crate::events::{Event, Message, MessageRole};
-    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn create_test_config() -> RotationSection {

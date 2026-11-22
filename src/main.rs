@@ -7,7 +7,8 @@ use okeanos::cli::{Cli, Command, ConfigAction, Mode, Shell, Verbosity};
 use okeanos::config::Config;
 use okeanos::context::{Conversation, build_system_prompt, tokens::default_pricing_table};
 use okeanos::cost::{CostBudgetConfig, CostTracker};
-use okeanos::events::Event;
+#[allow(unused_imports)]
+use okeanos::events::{Approval, ApprovalDecision, Event, Log, LogLevel};
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::headless::{EventEmitter, HeadlessConfig};
 use okeanos::model::{
