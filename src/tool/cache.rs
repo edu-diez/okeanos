@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_hit_miss() {
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             ..Default::default()
         };
@@ -390,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_ttl_expiry() {
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             default_ttl_secs: 1, // 1 second TTL
             ..Default::default()
@@ -414,7 +414,7 @@ mod tests {
         let file_path = dir.path().join("test.txt");
         fs::write(&file_path, "original content").unwrap();
 
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             ..Default::default()
         };
@@ -437,7 +437,7 @@ mod tests {
         let file_path = dir.path().join("test.txt");
         fs::write(&file_path, "original content").unwrap();
 
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             default_ttl_secs: 60,
             ..Default::default()
@@ -460,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_non_cacheable_tools() {
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             ..Default::default()
         };
@@ -498,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_max_entries_eviction() {
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             max_entries: 2,
             ..Default::default()
@@ -518,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_invalidate_all() {
-        let mut config = CacheConfig {
+        let config = CacheConfig {
             enabled: true,
             ..Default::default()
         };
