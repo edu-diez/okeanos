@@ -151,6 +151,45 @@ pub struct ReactLoop<M: Model> {
     spawn_budget: u32,
     /// Current delegation depth.
     delegation_depth: u32,
+    /// Signature of the previous tool call and its consecutive repeat count.
+    last_call_sig: Option<u64>,
+    repeat_count: u32,
+    /// Whether the last model response was cut off by the output token limit.
+    last_truncated: bool,
+}
+
+/// Identical consecutive tool calls before the model is told to change course.
+const DOOM_LOOP_WARN: u32 = 3;
+/// Identical consecutive tool calls before the loop is stopped.
+const DOOM_LOOP_STOP: u32 = 5;
+
+/// Aborts the wrapped task when dropped so a finished `run()` doesn't leak
+/// its signal handler.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn tool_result_from_exec(
+    tool_call: &ToolCall,
+    exec: crate::tool::tool_trait::ToolExecutionResult,
+    duration_ms: u64,
+) -> ToolResult {
+    ToolResult {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        args: tool_call.args.clone(),
+        output: exec.output,
+        ok: true,
+        duration_ms,
+        truncated: exec.truncated,
+        exit_code: exec.exit_code,
+        timed_out: exec.timed_out,
+        cancelled: exec.cancelled,
+    }
 }
 
 impl<M: Model + 'static> ReactLoop<M> {
@@ -185,6 +224,9 @@ impl<M: Model + 'static> ReactLoop<M> {
             subagent_handles: Vec::new(),
             spawn_budget: 64,
             delegation_depth: 0,
+            last_call_sig: None,
+            repeat_count: 0,
+            last_truncated: false,
         }
     }
 
@@ -534,7 +576,7 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         // Spawn signal handler
         let shutdown_tx_clone = shutdown_tx.clone();
-        tokio::spawn(async move {
+        let _signal_guard = AbortOnDrop(tokio::spawn(async move {
             #[cfg(unix)]
             {
                 let mut sigint =
@@ -551,7 +593,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             if let Some(tx) = shutdown_tx_clone {
                 let _ = tx.send(()).await;
             }
-        });
+        }));
 
         loop {
             // Check for completed sub-agents
@@ -563,61 +605,8 @@ impl<M: Model + 'static> ReactLoop<M> {
                 return Err(ReactError::Interrupted);
             }
 
-            // Check iteration limit
-            if self.iteration >= self.config.max_iterations {
-                return Err(ReactError::MaxIterations {
-                    max_iter: self.config.max_iterations,
-                });
-            }
-
-            // Check elapsed time limit
-            if self.start_time.elapsed() >= Duration::from_secs(self.config.max_elapsed_sec) {
-                return Err(ReactError::MaxElapsed {
-                    max_elapsed_sec: self.config.max_elapsed_sec,
-                });
-            }
-
-            // Check context cap warning
-            if self.conversation.warning_level() == crate::context::cap::ContextWarning::Warning {
-                self.emit_log(
-                    crate::events::LogLevel::Warn,
-                    format!(
-                        "Context usage at {}% ({}/{} tokens)",
-                        (self.conversation.estimated_tokens() as f64
-                            / self.conversation.cap().max_tokens as f64
-                            * 100.0) as u32,
-                        self.conversation.estimated_tokens(),
-                        self.conversation.cap().max_tokens
-                    ),
-                )
-                .await;
-            }
-
-            // Check and perform context compaction if needed
-            if let Some(compaction_manager) = &mut self.compaction_manager
-                && let Some(result) = compaction_manager
-                    .maybe_compact(
-                        &*self.model,
-                        &mut self.conversation,
-                        CompactionTrigger::Auto,
-                    )
-                    .await
-                    .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?
-            {
-                // Emit compaction event
-                let compaction_event = CompactionEvent {
-                    trigger: CompactionTrigger::Auto,
-                    strategy: result.strategy_used.clone(),
-                    tokens_before: result.tokens_before,
-                    tokens_after: result.tokens_after,
-                    messages_removed: result.messages_removed,
-                    turns_summarized: result.turns_summarized,
-                    native_provider: result.native_provider.clone(),
-                    summary: result.summary.clone(),
-                    ts: current_timestamp(),
-                };
-                self.emit_compaction(compaction_event).await;
-            }
+            // Check iteration/time limits, warn on context, compact if needed
+            self.prepare_iteration().await?;
 
             // Run one iteration
             match self.iterate(&mut shutdown_rx).await? {
@@ -639,19 +628,16 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
     }
 
-    /// Run exactly one ReAct turn with the given prompt.
+    /// Run one user turn: iterate think → tool → observe until the model
+    /// completes, stops, or a limit is hit.
     ///
-    /// This is the single-turn entry point used by the TUI in interactive mode.
-    /// The TUI owns the input loop and calls this method once per user prompt.
-    /// Returns the LoopDecision so the caller can decide whether to continue.
+    /// This is the entry point used by the TUI in interactive mode; the TUI
+    /// owns the input loop and calls this once per user prompt. Iteration and
+    /// elapsed-time limits are reset at the start of every turn.
     ///
-    /// Unlike `run()`, this method does NOT:
-    /// - Set up signal handlers
-    /// - Loop until completion
-    /// - Take session start/end snapshots automatically
-    ///
-    /// The caller is responsible for checking iteration/time limits and context caps.
-    /// The caller provides a shutdown receiver to allow interrupting the model generation.
+    /// Unlike `run()`, this method does NOT set up signal handlers or take a
+    /// session-start snapshot. The caller provides a shutdown receiver to
+    /// allow interrupting the model generation.
     pub async fn run_turn(
         &mut self,
         prompt: String,
@@ -668,7 +654,33 @@ impl<M: Model + 'static> ReactLoop<M> {
         // Emit status update
         self.emit_status().await;
 
-        // Check limits before iterating
+        // Limits apply per user turn, not per session.
+        self.iteration = 0;
+        self.start_time = Instant::now();
+        self.last_call_sig = None;
+        self.repeat_count = 0;
+
+        let mut shutdown_rx = shutdown_rx;
+        loop {
+            self.prepare_iteration().await?;
+
+            match self.iterate(&mut shutdown_rx).await? {
+                LoopDecision::Continue => {
+                    self.iteration += 1;
+                    self.take_boundary_snapshot().await?;
+                }
+                decision @ LoopDecision::Complete(_) => {
+                    self.take_snapshot("Session complete").await?;
+                    return Ok(decision);
+                }
+                decision @ LoopDecision::Stop(_) => return Ok(decision),
+            }
+        }
+    }
+
+    /// Per-iteration preamble shared by `run` and `run_turn`: enforce limits,
+    /// warn on context usage and compact if needed.
+    async fn prepare_iteration(&mut self) -> Result<(), ReactError> {
         if self.iteration >= self.config.max_iterations {
             return Err(ReactError::MaxIterations {
                 max_iter: self.config.max_iterations,
@@ -680,7 +692,6 @@ impl<M: Model + 'static> ReactLoop<M> {
             });
         }
 
-        // Check context cap warning
         if self.conversation.warning_level() == crate::context::cap::ContextWarning::Warning {
             self.emit_log(
                 crate::events::LogLevel::Warn,
@@ -696,7 +707,6 @@ impl<M: Model + 'static> ReactLoop<M> {
             .await;
         }
 
-        // Check and perform context compaction if needed
         if let Some(compaction_manager) = &mut self.compaction_manager
             && let Some(result) = compaction_manager
                 .maybe_compact(
@@ -707,7 +717,6 @@ impl<M: Model + 'static> ReactLoop<M> {
                 .await
                 .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?
         {
-            // Emit compaction event
             let compaction_event = CompactionEvent {
                 trigger: CompactionTrigger::Auto,
                 strategy: result.strategy_used.clone(),
@@ -721,25 +730,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             };
             self.emit_compaction(compaction_event).await;
         }
-
-        // Run exactly one iteration with the provided shutdown receiver
-        let mut shutdown_rx = shutdown_rx;
-        let decision = self.iterate(&mut shutdown_rx).await?;
-
-        match &decision {
-            LoopDecision::Continue => {
-                self.iteration += 1;
-                // Take snapshot at loop boundary
-                self.take_boundary_snapshot().await?;
-            }
-            LoopDecision::Complete(_) => {
-                // Take final snapshot
-                self.take_snapshot("Session complete").await?;
-            }
-            LoopDecision::Stop(_) => {}
-        }
-
-        Ok(decision)
+        Ok(())
     }
 
     /// Create a shutdown channel for a turn and return the sender to the caller.
@@ -785,27 +776,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         // If there are native tool calls, execute them.
         if let Some(tool_calls) = response.tool_calls {
             if tool_calls.is_empty() {
-                // No tool calls - check if the model is done
-                if self.is_completion_response(&response.content) {
-                    return Ok(LoopDecision::Complete(response.content));
-                }
-                // Model responded but didn't call tools and didn't indicate completion
-                // Continue the loop to prompt for more action
-                return Ok(LoopDecision::Continue);
+                return Ok(self.decide_without_tools(response.content));
             }
 
-            // Execute each tool call
-            for tool_call in tool_calls {
-                let result = self.execute_tool(tool_call, shutdown_rx).await?;
-
-                // Add tool result to conversation
-                self.conversation
-                    .add_tool_message(result.output.clone(), result.id.clone())
-                    .context("failed to add tool result")?;
-
-                // Emit tool result event
-                self.emit_tool_result(result).await;
-            }
+            self.run_tool_calls(tool_calls, shutdown_rx).await?;
 
             // After tool execution, continue to next iteration
             return Ok(LoopDecision::Continue);
@@ -823,11 +797,16 @@ impl<M: Model + 'static> ReactLoop<M> {
                 .await;
         }
 
-        // No tool calls - check for completion
-        if self.is_completion_response(&response.content) {
-            Ok(LoopDecision::Complete(response.content))
+        Ok(self.decide_without_tools(response.content))
+    }
+
+    /// Decide what to do when a native-tool-calling model replied without
+    /// tool calls. A reply is final unless it was cut off by the token limit.
+    fn decide_without_tools(&self, content: String) -> LoopDecision {
+        if self.last_truncated {
+            LoopDecision::Continue
         } else {
-            Ok(LoopDecision::Continue)
+            LoopDecision::Complete(content)
         }
     }
 
@@ -894,13 +873,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                 if let Some(tool_calls) = simpler_response.tool_calls
                     && !tool_calls.is_empty()
                 {
-                    for tool_call in tool_calls {
-                        let result = self.execute_tool(tool_call, shutdown_rx).await?;
-                        self.conversation
-                            .add_tool_message(result.output.clone(), result.id.clone())
-                            .context("failed to add tool result")?;
-                        self.emit_tool_result(result).await;
-                    }
+                    self.run_tool_calls(tool_calls, shutdown_rx).await?;
                     return Ok(LoopDecision::Continue);
                 }
 
@@ -982,13 +955,8 @@ impl<M: Model + 'static> ReactLoop<M> {
                         args: call.args,
                         status: ToolCallStatus::Pending,
                     };
-                    let result = self.execute_tool(tool_call, shutdown_rx).await?;
-
-                    self.conversation
-                        .add_tool_message(result.output.clone(), result.id.clone())
-                        .context("failed to add tool result")?;
-
-                    self.emit_tool_result(result).await;
+                    let result = self.execute_tool_or_error(tool_call, shutdown_rx).await?;
+                    self.record_tool_result(result).await?;
                 }
                 Ok(LoopDecision::Continue)
             }
@@ -997,13 +965,9 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
     }
 
-    /// Check whether the model's response indicates task completion.
+    /// A reply without tool calls is final unless it was truncated.
     fn check_completion(&self, content: &str) -> Result<LoopDecision, ReactError> {
-        if self.is_completion_response(content) {
-            Ok(LoopDecision::Complete(content.to_string()))
-        } else {
-            Ok(LoopDecision::Continue)
-        }
+        Ok(self.decide_without_tools(content.to_string()))
     }
 
     /// Build model messages using a shorter system prompt (Small tier
@@ -1060,8 +1024,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         messages: &[ModelMessage],
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) -> Result<ModelResponse, ReactError> {
-        let retry_policy = self.config.retry_policy.clone();
         let mut attempt = 0usize;
+        let mut compacted = false;
+        let mut messages = messages.to_vec();
+        self.last_truncated = false;
 
         // Pass native tool specs only when the model supports native function calling.
         // Models without native FC use text-based parsing via the system prompt snippet.
@@ -1071,12 +1037,12 @@ impl<M: Model + 'static> ReactLoop<M> {
             None
         };
 
-        loop {
+        'attempt: loop {
             // Get a streaming response from the model
             let stream_result = tokio::select! {
                 biased;
                 result = self.model.stream(
-                    messages,
+                    &messages,
                     &self.config.generation_params,
                     native_tools.as_deref(),
                 ) => result,
@@ -1095,25 +1061,17 @@ impl<M: Model + 'static> ReactLoop<M> {
             let mut stream = match stream_result {
                 Ok(s) => s,
                 Err(error) => {
-                    let retryable = retry_policy.classify(&error);
-                    if retryable == RetryDecision::Retry && attempt < retry_policy.max_retries {
-                        self.retries += 1;
-                        let backoff = retry_policy.backoff_for_attempt(attempt, Some(&error));
-                        let max_retries = retry_policy.max_retries;
-                        self.emit_log(
-                            LogLevel::Warn,
-                            format!(
-                                "Provider error (attempt {}/{}), retrying in {:?}: {}",
-                                attempt + 1,
-                                max_retries,
-                                backoff,
-                                error
-                            ),
+                    if self
+                        .recover_from_model_error(
+                            &error,
+                            &mut attempt,
+                            &mut compacted,
+                            &mut messages,
+                            shutdown_rx,
                         )
-                        .await;
-                        tokio::time::sleep(backoff).await;
-                        attempt += 1;
-                        continue;
+                        .await?
+                    {
+                        continue 'attempt;
                     }
                     return Err(ReactError::Model(error));
                 }
@@ -1158,7 +1116,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                         }
 
                         if let Some(tc) = chunk.tool_calls {
-                            tool_calls = Some(tc);
+                            tool_calls.get_or_insert_with(Vec::new).extend(tc);
                         }
                         if let Some(th) = chunk.thinking {
                             thinking = Some(th.clone());
@@ -1170,38 +1128,119 @@ impl<M: Model + 'static> ReactLoop<M> {
                                 let _ = session.lock().unwrap().log_event(thinking_event);
                             }
                         }
+                        if chunk.usage.is_some() {
+                            usage = chunk.usage;
+                        }
+                        if chunk.truncated {
+                            self.last_truncated = true;
+                        }
                         if chunk.finished {
                             finished = true;
-                            // Usage is not available in streaming chunks; we'd need a final response
-                            // For now, estimate from content
-                            usage = Some(crate::model::Usage {
-                                prompt_tokens: 0, // Would need to be computed
-                                completion_tokens: crate::context::tokens::TokenCounter
-                                    .count(&content),
-                                total_tokens: crate::context::tokens::TokenCounter.count(&content),
-                            });
                         }
                     }
-                    Some(Err(e)) => return Err(ReactError::Model(e)),
-                    None => {
-                        // Stream ended without finished=true
-                        finished = true;
-                        usage = Some(crate::model::Usage {
-                            prompt_tokens: 0,
-                            completion_tokens: crate::context::tokens::TokenCounter.count(&content),
-                            total_tokens: crate::context::tokens::TokenCounter.count(&content),
-                        });
+                    Some(Err(e)) => {
+                        // Only safe to restart when no tool call has been
+                        // observed: partial text is simply discarded.
+                        if tool_calls.is_none()
+                            && self
+                                .recover_from_model_error(
+                                    &e,
+                                    &mut attempt,
+                                    &mut compacted,
+                                    &mut messages,
+                                    shutdown_rx,
+                                )
+                                .await?
+                        {
+                            continue 'attempt;
+                        }
+                        return Err(ReactError::Model(e));
                     }
+                    None => finished = true,
                 }
             }
+
+            // Providers that don't report usage fall back to an estimate.
+            let usage = usage.unwrap_or_else(|| {
+                let counter = crate::context::tokens::TokenCounter;
+                let prompt_tokens: usize =
+                    messages.iter().map(|m| counter.count(&m.content)).sum();
+                let completion_tokens = counter.count(&content);
+                crate::model::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                }
+            });
 
             return Ok(ModelResponse {
                 content,
                 tool_calls,
                 thinking,
-                usage,
+                usage: Some(usage),
             });
         }
+    }
+
+    /// Decide whether a failed model call can be retried, performing the
+    /// recovery step (interruptible backoff, or emergency compaction on
+    /// context overflow). Returns `true` if the caller should retry.
+    async fn recover_from_model_error(
+        &mut self,
+        error: &ModelError,
+        attempt: &mut usize,
+        compacted: &mut bool,
+        messages: &mut Vec<ModelMessage>,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<bool, ReactError> {
+        if matches!(error, ModelError::ContextLengthExceeded(_)) {
+            if *compacted || self.compaction_manager.is_none() {
+                return Ok(false);
+            }
+            *compacted = true;
+            self.emit_log(
+                LogLevel::Warn,
+                format!("Context length exceeded; compacting and retrying: {error}"),
+            )
+            .await;
+            if matches!(self.compact_context().await, Ok(Some(_))) {
+                *messages = self.build_model_messages();
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+
+        let retry_policy = self.config.retry_policy.clone();
+        if retry_policy.classify(error) != RetryDecision::Retry
+            || *attempt >= retry_policy.max_retries
+        {
+            return Ok(false);
+        }
+
+        self.retries += 1;
+        let backoff = retry_policy.backoff_for_attempt(*attempt, Some(error));
+        self.emit_log(
+            LogLevel::Warn,
+            format!(
+                "Provider error (attempt {}/{}), retrying in {:?}: {}",
+                *attempt + 1,
+                retry_policy.max_retries,
+                backoff,
+                error
+            ),
+        )
+        .await;
+
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown_rx.recv() => {
+                self.emit_interrupted(false).await;
+                return Err(ReactError::Interrupted);
+            }
+        }
+        *attempt += 1;
+        Ok(true)
     }
 
     /// Emit an interrupted event to the event stream.
@@ -1262,45 +1301,7 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         // Check tool result cache for idempotent tools (read, grep) before policy/cost checks.
         // This avoids unnecessary approval prompts and cost checks for cached results.
-        if let Some(cache) = &mut self.tool_cache
-            && let Some(cached_exec_result) = cache.get(&tool_call.name, &tool_call.args)
-        {
-            // Cache hit - emit log and return cached result
-            self.emit_log(
-                LogLevel::Debug,
-                format!(
-                    "Tool result cache hit for {} (skipping execution)",
-                    tool_call.name
-                ),
-            )
-            .await;
-
-            let duration_ms = 0; // cached result has no execution time
-            let result = ToolResult {
-                id: tool_call.id,
-                name: tool_call.name,
-                args: tool_call.args,
-                output: cached_exec_result.output,
-                ok: true,
-                duration_ms,
-                truncated: cached_exec_result.truncated,
-                exit_code: cached_exec_result.exit_code,
-                timed_out: cached_exec_result.timed_out,
-                cancelled: cached_exec_result.cancelled,
-            };
-
-            // Record actual cost after tool execution (zero for cached).
-            self.record_tool_cost(&result).await;
-
-            // Emit tool call completed event
-            self.emit_tool_call(ToolCall {
-                id: result.id.clone(),
-                name: result.name.clone(),
-                args: result.args.clone(),
-                status: ToolCallStatus::Ok,
-            })
-            .await;
-
+        if let Some(result) = self.cached_tool_result(&tool_call).await {
             return Ok(result);
         }
 
@@ -1369,7 +1370,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                 .await?;
         }
 
-        // Emit tool call started event (before re-fetching tool to avoid borrow conflict)
+        // Emit tool call started event.
         self.emit_tool_call(ToolCall {
             id: tool_call.id.clone(),
             name: tool_call.name.clone(),
@@ -1377,21 +1378,6 @@ impl<M: Model + 'static> ReactLoop<M> {
             status: ToolCallStatus::Pending,
         })
         .await;
-
-        // Emit tool call started event (before re-fetching tool to avoid borrow conflict)
-        self.emit_tool_call(ToolCall {
-            id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
-            args: tool_call.args.clone(),
-            status: ToolCallStatus::Pending,
-        })
-        .await;
-
-        // Re-fetch the tool (the borrow was dropped above).
-        let tool = self
-            .tools
-            .get(&tool_call.name)
-            .ok_or_else(|| ReactError::Tool(format!("unknown tool: {}", tool_call.name)))?;
 
         let start = Instant::now();
 
@@ -1406,26 +1392,54 @@ impl<M: Model + 'static> ReactLoop<M> {
         .map_err(|e| ReactError::Tool(format!("tool execution failed: {e}")))?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
+        Ok(self
+            .finish_tool_execution(tool_call, &spec, exec_result, duration_ms)
+            .await)
+    }
 
-        // Clone exec_result for caching before we move its output into result.
-        let exec_result_for_cache = exec_result.clone();
+    /// Return a cached result for an idempotent tool call, recording cost and
+    /// emitting the completion event as if it had executed.
+    async fn cached_tool_result(&mut self, tool_call: &ToolCall) -> Option<ToolResult> {
+        let cached = self
+            .tool_cache
+            .as_mut()?
+            .get(&tool_call.name, &tool_call.args)?;
 
-        let result = ToolResult {
-            id: tool_call.id,
-            name: tool_call.name.clone(), // clone for cache invalidation below
-            args: tool_call.args.clone(), // clone for cache invalidation below
-            output: exec_result.output,
-            ok: true,
-            duration_ms,
-            truncated: exec_result.truncated,
-            exit_code: exec_result.exit_code,
-            timed_out: exec_result.timed_out,
-            cancelled: exec_result.cancelled,
-        };
+        self.emit_log(
+            LogLevel::Debug,
+            format!(
+                "Tool result cache hit for {} (skipping execution)",
+                tool_call.name
+            ),
+        )
+        .await;
+
+        let result = tool_result_from_exec(tool_call, cached, 0);
+        self.record_tool_cost(&result).await;
+        self.emit_tool_call(ToolCall {
+            id: result.id.clone(),
+            name: result.name.clone(),
+            args: result.args.clone(),
+            status: ToolCallStatus::Ok,
+        })
+        .await;
+        Some(result)
+    }
+
+    /// Post-process a successful tool execution: cache bookkeeping, cost
+    /// recording and the completion event.
+    async fn finish_tool_execution(
+        &mut self,
+        tool_call: ToolCall,
+        spec: &crate::tool::tool_trait::ToolSpec,
+        exec_result: crate::tool::tool_trait::ToolExecutionResult,
+        duration_ms: u64,
+    ) -> ToolResult {
+        let result = tool_result_from_exec(&tool_call, exec_result.clone(), duration_ms);
 
         // Store result in cache for idempotent tools (read, grep).
         if let Some(cache) = &mut self.tool_cache {
-            cache.put(&tool_call.name, &tool_call.args, &exec_result_for_cache);
+            cache.put(&tool_call.name, &tool_call.args, &exec_result);
         }
 
         // Invalidate cache for paths affected by write/delete/run operations.
@@ -1435,21 +1449,17 @@ impl<M: Model + 'static> ReactLoop<M> {
                 ToolCategory::Write | ToolCategory::Delete | ToolCategory::Network
             )
         {
-            // Extract paths from tool args and invalidate cache for those paths
             use crate::tool::cache::extract_paths;
             for path in extract_paths(&tool_call.name, &tool_call.args) {
                 cache.invalidate_path(&path);
             }
-            // For run tool, also invalidate all since it can modify arbitrary files
+            // `run` can modify arbitrary files.
             if tool_call.name == "run" {
                 cache.invalidate_all();
             }
         }
 
-        // Record actual cost after tool execution.
         self.record_tool_cost(&result).await;
-
-        // Emit tool call completed event
         self.emit_tool_call(ToolCall {
             id: result.id.clone(),
             name: result.name.clone(),
@@ -1458,7 +1468,212 @@ impl<M: Model + 'static> ReactLoop<M> {
         })
         .await;
 
-        Ok(result)
+        result
+    }
+
+    /// Execute a tool call, converting recoverable failures (unknown tool,
+    /// permission denied, execution error) into an error tool result so the
+    /// model can see and correct them. Interrupts, budget and approval-channel
+    /// failures remain fatal.
+    async fn execute_tool_or_error(
+        &mut self,
+        tool_call: ToolCall,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<ToolResult, ReactError> {
+        if let Some(result) = self.check_doom_loop(&tool_call).await? {
+            return Ok(result);
+        }
+        match self.execute_tool(tool_call.clone(), shutdown_rx).await {
+            Err(ReactError::Tool(msg)) => Ok(self.error_tool_result(&tool_call, msg).await),
+            other => other,
+        }
+    }
+
+    /// Build an error tool result and emit the Error status event.
+    async fn error_tool_result(&mut self, tool_call: &ToolCall, message: String) -> ToolResult {
+        self.emit_tool_call(ToolCall {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            args: tool_call.args.clone(),
+            status: ToolCallStatus::Error,
+        })
+        .await;
+        ToolResult {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            args: tool_call.args.clone(),
+            output: format!("Error: {message}"),
+            ok: false,
+            duration_ms: 0,
+            truncated: false,
+            exit_code: None,
+            timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    /// Detect the model repeating an identical call. Returns an error result
+    /// on the warning threshold and stops the loop on the hard threshold.
+    async fn check_doom_loop(
+        &mut self,
+        tool_call: &ToolCall,
+    ) -> Result<Option<ToolResult>, ReactError> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        tool_call.name.hash(&mut hasher);
+        tool_call.args.to_string().hash(&mut hasher);
+        let sig = hasher.finish();
+
+        if self.last_call_sig == Some(sig) {
+            self.repeat_count += 1;
+        } else {
+            self.last_call_sig = Some(sig);
+            self.repeat_count = 1;
+        }
+
+        if self.repeat_count >= DOOM_LOOP_STOP {
+            return Err(ReactError::Stopped {
+                reason: format!(
+                    "repeated identical `{}` call {} times without progress",
+                    tool_call.name, self.repeat_count
+                ),
+            });
+        }
+        if self.repeat_count >= DOOM_LOOP_WARN {
+            let msg = format!(
+                "this exact `{}` call was already made {} times with the same arguments. \
+                 Do not repeat it; change your approach or finish.",
+                tool_call.name,
+                self.repeat_count - 1
+            );
+            return Ok(Some(self.error_tool_result(tool_call, msg).await));
+        }
+        Ok(None)
+    }
+
+    /// Whether a call is a policy-allowed, read-only tool that can run
+    /// concurrently with its neighbours.
+    fn is_parallel_safe(&self, tool_call: &ToolCall) -> bool {
+        if tool_call.name == "todo" {
+            return false;
+        }
+        let Some(tool) = self.tools.get(&tool_call.name) else {
+            return false;
+        };
+        let spec = tool.spec();
+        spec.category == ToolCategory::Read
+            && self.policy.check(&tool_call.name, &spec) == PolicyDecision::Allow
+    }
+
+    /// Execute all tool calls of an assistant turn in order, running runs of
+    /// consecutive read-only calls concurrently. Results are appended to the
+    /// conversation in the original call order.
+    async fn run_tool_calls(
+        &mut self,
+        tool_calls: Vec<ToolCall>,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<(), ReactError> {
+        let mut i = 0;
+        while i < tool_calls.len() {
+            let mut j = i;
+            while j < tool_calls.len() && self.is_parallel_safe(&tool_calls[j]) {
+                j += 1;
+            }
+            if j - i >= 2 {
+                self.execute_parallel_batch(tool_calls[i..j].to_vec(), shutdown_rx)
+                    .await?;
+                i = j;
+            } else {
+                let result = self
+                    .execute_tool_or_error(tool_calls[i].clone(), shutdown_rx)
+                    .await?;
+                self.record_tool_result(result).await?;
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a tool result to the conversation and emit its event.
+    async fn record_tool_result(&mut self, result: ToolResult) -> Result<(), ReactError> {
+        self.conversation
+            .add_tool_message(result.output.clone(), result.id.clone())
+            .context("failed to add tool result")?;
+        self.emit_tool_result(result).await;
+        Ok(())
+    }
+
+    /// Run read-only calls concurrently: sequential prepare (cache, budget,
+    /// events), concurrent execution, sequential in-order finalize.
+    async fn execute_parallel_batch(
+        &mut self,
+        calls: Vec<ToolCall>,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<(), ReactError> {
+        enum Slot {
+            Done(ToolResult),
+            Run(ToolCall, Arc<dyn crate::tool::tool_trait::Tool>),
+        }
+
+        let mut slots = Vec::with_capacity(calls.len());
+        for call in calls {
+            if let Some(result) = self.check_doom_loop(&call).await? {
+                slots.push(Slot::Done(result));
+                continue;
+            }
+            if let Some(result) = self.cached_tool_result(&call).await {
+                slots.push(Slot::Done(result));
+                continue;
+            }
+            self.check_expensive_call_confirmation(&call).await?;
+            self.check_cost_budget(&call).await?;
+            let tool = self.tools.get(&call.name).expect("checked by is_parallel_safe");
+            self.emit_tool_call(ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args: call.args.clone(),
+                status: ToolCallStatus::Pending,
+            })
+            .await;
+            slots.push(Slot::Run(call, tool));
+        }
+
+        let start = Instant::now();
+        let futures: Vec<_> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Run(call, tool) => Some((tool.clone(), call.args.clone())),
+                Slot::Done(_) => None,
+            })
+            .map(|(tool, args)| async move { tool.execute(args).await })
+            .collect();
+
+        let outcomes = tokio::select! {
+            biased;
+            outcomes = futures::future::join_all(futures) => outcomes,
+            _ = shutdown_rx.recv() => return Err(ReactError::Interrupted),
+        };
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let mut outcomes = outcomes.into_iter();
+        for slot in slots {
+            let result = match slot {
+                Slot::Done(result) => result,
+                Slot::Run(call, tool) => match outcomes.next().expect("one outcome per run slot") {
+                    Ok(exec) => {
+                        let spec = tool.spec();
+                        self.finish_tool_execution(call, &spec, exec, duration_ms)
+                            .await
+                    }
+                    Err(e) => {
+                        self.error_tool_result(&call, format!("tool execution failed: {e}"))
+                            .await
+                    }
+                },
+            };
+            self.record_tool_result(result).await?;
+        }
+        Ok(())
     }
 
     /// Handle sub-agent delegation via todo tool.
@@ -1852,16 +2067,6 @@ impl<M: Model + 'static> ReactLoop<M> {
         })
     }
 
-    /// Check if the model's response indicates task completion.
-    fn is_completion_response(&self, content: &str) -> bool {
-        // Simple heuristic: check for completion markers
-        let content_lower = content.to_lowercase();
-        content_lower.contains("task complete")
-            || content_lower.contains("completed successfully")
-            || content_lower.contains("all done")
-            || content_lower.contains("finished")
-    }
-
     /// Emit a message event.
     async fn emit_message(&mut self, msg: Message) {
         let event = Event::Message(msg);
@@ -1975,4 +2180,258 @@ fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::cap::ContextCap;
+    use crate::model::mock::MockModel;
+    use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestTool {
+        name: &'static str,
+        delay_ms: u64,
+        fail: bool,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl TestTool {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                delay_ms: 0,
+                fail: false,
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TestTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new(self.name, "test tool", json!({"type": "object"}))
+        }
+
+        async fn execute(&self, _args: Value) -> Result<ToolExecutionResult, ToolError> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(ToolError::ExecutionFailed("boom".into()));
+            }
+            Ok(ToolExecutionResult {
+                output: format!("{} ok", self.name),
+                exit_code: None,
+                timed_out: false,
+                cancelled: false,
+                truncated: false,
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: json!({}),
+            status: ToolCallStatus::Pending,
+        }
+    }
+
+    fn make_loop(model: MockModel, tools: ToolRegistry) -> ReactLoop<MockModel> {
+        let capabilities = model.capabilities().clone();
+        let conversation =
+            Conversation::new("system".into(), ContextCap::new(100_000), capabilities);
+        let (event_tx, _) = tokio::sync::broadcast::channel(1024);
+        let retry = RetryPolicy {
+            max_retries: 3,
+            base_backoff_ms: 1,
+            max_backoff_ms: 2,
+        };
+        ReactLoop::new(
+            Arc::new(model),
+            conversation,
+            tools,
+            ReactConfig::default(),
+            event_tx,
+        )
+        .with_retry_policy(retry)
+    }
+
+    async fn run_one(
+        loop_: &mut ReactLoop<MockModel>,
+        prompt: &str,
+    ) -> Result<LoopDecision, ReactError> {
+        let (_tx, rx) = mpsc::channel(1);
+        loop_.run_turn(prompt.into(), rx).await
+    }
+
+    fn tool_messages(loop_: &ReactLoop<MockModel>) -> Vec<String> {
+        loop_
+            .conversation()
+            .messages()
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn run_turn_loops_until_model_replies_without_tools() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![call("1", "a")]),
+            MockModel::text_response("here is the answer"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(TestTool::new("a"));
+        let mut loop_ = make_loop(model, tools);
+
+        let decision = run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(
+            decision,
+            LoopDecision::Complete("here is the answer".into())
+        );
+        assert_eq!(tool_messages(&loop_), vec!["a ok".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tool_failure_is_returned_to_the_model() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![call("1", "bad"), call("2", "missing")]),
+            MockModel::text_response("recovered"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(TestTool {
+            fail: true,
+            ..TestTool::new("bad")
+        });
+        let mut loop_ = make_loop(model, tools);
+
+        let decision = run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(decision, LoopDecision::Complete("recovered".into()));
+        let msgs = tool_messages(&loop_);
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].starts_with("Error:") && msgs[0].contains("boom"));
+        assert!(msgs[1].starts_with("Error:") && msgs[1].contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn read_only_calls_run_concurrently_and_keep_order() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![call("1", "a"), call("2", "b")]),
+            MockModel::text_response("done"),
+        ]);
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        for name in ["a", "b"] {
+            tools.register(TestTool {
+                delay_ms: 50,
+                active: active.clone(),
+                max_active: max_active.clone(),
+                ..TestTool::new(name)
+            });
+        }
+        let mut loop_ = make_loop(model, tools);
+
+        run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            tool_messages(&loop_),
+            vec!["a ok".to_string(), "b ok".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_calls_are_warned_then_stopped() {
+        let model = MockModel::frontier("m");
+        for i in 0..8 {
+            model.push_response(MockModel::tool_call_response(
+                "",
+                vec![call(&i.to_string(), "a")],
+            ));
+        }
+        let mut tools = ToolRegistry::new();
+        tools.register(TestTool::new("a"));
+        let mut loop_ = make_loop(model, tools);
+
+        let err = run_one(&mut loop_, "go").await.unwrap_err();
+        assert!(matches!(err, ReactError::Stopped { .. }), "{err:?}");
+        let msgs = tool_messages(&loop_);
+        assert_eq!(msgs.len(), 4);
+        assert!(msgs[2].starts_with("Error:") && msgs[2].contains("Do not repeat"));
+    }
+
+    #[tokio::test]
+    async fn transient_errors_are_retried_with_backoff() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::rate_limit_error(0),
+            MockModel::rate_limit_error(0),
+            MockModel::text_response("ok"),
+        ]);
+        let mut loop_ = make_loop(model, ToolRegistry::new());
+
+        let decision = run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(decision, LoopDecision::Complete("ok".into()));
+        assert_eq!(loop_.retries, 2);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_without_compaction_is_fatal() {
+        let model = MockModel::frontier("m");
+        model.push_response(MockModel::context_length_error("too big"));
+        let mut loop_ = make_loop(model, ToolRegistry::new());
+
+        let err = run_one(&mut loop_, "go").await.unwrap_err();
+        assert!(matches!(
+            err,
+            ReactError::Model(ModelError::ContextLengthExceeded(_))
+        ));
+        assert_eq!(loop_.retries, 0);
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_is_interruptible() {
+        let model = MockModel::frontier("m");
+        model.push_response(MockModel::rate_limit_error(30));
+        let mut loop_ = make_loop(model, ToolRegistry::new());
+
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(()).await.unwrap();
+        let started = Instant::now();
+        let err = loop_.run_turn("go".into(), rx).await.unwrap_err();
+        assert!(matches!(err, ReactError::Interrupted), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn limits_reset_between_turns() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::text_response("one"),
+            MockModel::text_response("two"),
+        ]);
+        let mut loop_ = make_loop(model, ToolRegistry::new());
+        loop_.config.max_elapsed_sec = 1;
+
+        run_one(&mut loop_, "first").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let decision = run_one(&mut loop_, "second").await.unwrap();
+        assert_eq!(decision, LoopDecision::Complete("two".into()));
+    }
 }

@@ -114,12 +114,18 @@ pub struct Usage {
 }
 
 /// Streaming chunk from a model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ModelStreamChunk {
     pub delta: String,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub thinking: Option<String>,
     pub finished: bool,
+    /// Provider-reported token usage (normally on the final chunk).
+    #[serde(default)]
+    pub usage: Option<Usage>,
+    /// The provider stopped because it hit the output token limit.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Errors from model providers.
@@ -143,6 +149,9 @@ pub enum ModelError {
     ServiceUnavailable { retry_after_sec: u64 },
     #[error("capability missing: {0}")]
     MissingCapability(String),
+    /// The connection dropped or errored while the response was streaming.
+    #[error("stream interrupted: {0}")]
+    StreamInterrupted(String),
 }
 
 impl ModelError {
@@ -154,9 +163,55 @@ impl ModelError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            ModelError::RateLimited { .. } | ModelError::ServiceUnavailable { .. }
+            ModelError::RateLimited { .. }
+                | ModelError::ServiceUnavailable { .. }
+                | ModelError::StreamInterrupted(_)
         )
     }
+
+    /// Attach a provider `Retry-After` hint (seconds). `0` means "no hint".
+    pub fn with_retry_after(self, secs: u64) -> Self {
+        match self {
+            ModelError::RateLimited { .. } => ModelError::RateLimited {
+                retry_after_sec: secs,
+            },
+            ModelError::ServiceUnavailable { .. } => ModelError::ServiceUnavailable {
+                retry_after_sec: secs,
+            },
+            other => other,
+        }
+    }
+}
+
+/// Extract a retry delay in whole seconds from provider response headers.
+///
+/// Honors `retry-after-ms` and `retry-after` (delta-seconds form). Returns 0
+/// when no usable hint is present.
+pub fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> u64 {
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(ms) = get("retry-after-ms").and_then(|v| v.trim().parse::<f64>().ok())
+        && ms > 0.0
+    {
+        return (ms / 1000.0).ceil() as u64;
+    }
+    get("retry-after")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| *s > 0.0)
+        .map(|s| s.ceil() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether an HTTP error message indicates the prompt exceeded the context window.
+pub fn is_context_overflow_message(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("context length")
+        || m.contains("context_length")
+        || m.contains("context window")
+        || m.contains("prompt is too long")
+        || m.contains("maximum context")
+        || m.contains("too many tokens")
+        || m.contains("exceeds the maximum number of tokens")
+        || m.contains("request too large")
 }
 
 /// The Model trait - text-in/text-out as the primitive.

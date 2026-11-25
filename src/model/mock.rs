@@ -220,6 +220,16 @@ impl Model for MockModel {
 
         // Create a stream that yields control between chunks when streaming is enabled
         let chunk_stream = stream! {
+            if content.is_empty() {
+                // Tool-call-only responses have no text; still emit the terminal chunk.
+                yield Ok(ModelStreamChunk {
+                    tool_calls: response.tool_calls.clone(),
+                    thinking: response.thinking.clone(),
+                    finished: true,
+                    usage: response.usage.clone(),
+                    ..Default::default()
+                });
+            }
             for (i, chunk) in content.as_bytes().chunks(chunk_size).enumerate() {
                 let delta = String::from_utf8_lossy(chunk).to_string();
                 let finished = i == total_chunks - 1;
@@ -236,6 +246,8 @@ impl Model for MockModel {
                         None
                     },
                     finished,
+                    usage: if finished { response.usage.clone() } else { None },
+                    truncated: false,
                 });
 
                 // Yield control between chunks when streaming to allow interruption

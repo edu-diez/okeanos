@@ -8,7 +8,7 @@ use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage,
+    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
 };
 #[cfg(test)]
 use crate::tool::builtin::EditFormat;
@@ -113,7 +113,9 @@ struct AnthropicResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct AnthropicUsage {
+    #[serde(default)]
     input_tokens: usize,
+    #[serde(default)]
     output_tokens: usize,
     cache_creation_input_tokens: Option<usize>,
     cache_read_input_tokens: Option<usize>,
@@ -142,9 +144,10 @@ struct AnthropicStreamChunk {
     message: Option<AnthropicStreamMessage>,
     delta: Option<AnthropicStreamDelta>,
     usage: Option<AnthropicUsage>,
+    /// Present on mid-stream `error` events.
+    #[serde(default)]
+    error: Option<AnthropicErrorBody>,
 }
-
-/// Streaming message (initial message_start event).
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct AnthropicStreamMessage {
@@ -162,8 +165,10 @@ struct AnthropicStreamMessage {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct AnthropicStreamDelta {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     delta_type: String,
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -251,6 +256,10 @@ impl AnthropicModel {
         match status {
             StatusCode::UNAUTHORIZED => ModelError::AuthFailed,
             StatusCode::NOT_FOUND => ModelError::ModelNotFound(error_message),
+            StatusCode::PAYLOAD_TOO_LARGE => ModelError::ContextLengthExceeded(error_message),
+            StatusCode::BAD_REQUEST if is_context_overflow_message(&error_message) => {
+                ModelError::ContextLengthExceeded(error_message)
+            }
             StatusCode::UNPROCESSABLE_ENTITY => ModelError::InvalidRequest(error_message),
             StatusCode::TOO_MANY_REQUESTS => ModelError::RateLimited { retry_after_sec: 0 },
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -259,9 +268,11 @@ impl AnthropicModel {
             StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN => {
                 ModelError::InvalidRequest(error_message)
             }
+            // 529 is Anthropic's "overloaded" status.
             StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::GATEWAY_TIMEOUT => ModelError::ServiceUnavailable { retry_after_sec: 0 },
+            s if s.as_u16() == 529 => ModelError::ServiceUnavailable { retry_after_sec: 0 },
             _ => ModelError::Provider(format!("HTTP {status}: {error_message}")),
         }
     }
@@ -493,10 +504,11 @@ impl Model for AnthropicModel {
             .map_err(Self::map_reqwest_error)?;
 
         let status = response.status();
+        let retry_after = retry_after_secs(response.headers());
         let body = response.text().await.map_err(Self::map_reqwest_error)?;
 
         if !status.is_success() {
-            return Err(Self::map_http_error(status, &body));
+            return Err(Self::map_http_error(status, &body).with_retry_after(retry_after));
         }
 
         let resp: AnthropicResponse = serde_json::from_str(&body)
@@ -528,11 +540,12 @@ impl Model for AnthropicModel {
             .map_err(Self::map_reqwest_error)?;
 
         let status = response.status();
+        let retry_after = retry_after_secs(response.headers());
 
         // For streaming, check the status code first.
         if !status.is_success() {
             let body = response.text().await.map_err(Self::map_reqwest_error)?;
-            return Err(Self::map_http_error(status, &body));
+            return Err(Self::map_http_error(status, &body).with_retry_after(retry_after));
         }
 
         let byte_stream = response.bytes_stream();
@@ -548,6 +561,9 @@ pub(crate) struct SseStream {
     pending_thinking: StreamingThinking,
     finished: bool,
     message_started: bool,
+    input_tokens: usize,
+    output_tokens: usize,
+    truncated: bool,
 }
 
 impl SseStream {
@@ -561,6 +577,9 @@ impl SseStream {
             pending_thinking: StreamingThinking::default(),
             finished: false,
             message_started: false,
+            input_tokens: 0,
+            output_tokens: 0,
+            truncated: false,
         }
     }
 
@@ -570,22 +589,7 @@ impl SseStream {
 
         if trimmed == "[DONE]" {
             self.finished = true;
-            // Flush any accumulated tool calls
-            if !self.pending_tool_calls.is_empty() {
-                let tool_calls = self.flush_tool_calls();
-                return Some(Ok(ModelStreamChunk {
-                    delta: String::new(),
-                    tool_calls: Some(tool_calls),
-                    thinking: self.flush_thinking(),
-                    finished: true,
-                }));
-            }
-            return Some(Ok(ModelStreamChunk {
-                delta: String::new(),
-                tool_calls: None,
-                thinking: self.flush_thinking(),
-                finished: true,
-            }));
+            return Some(Ok(self.final_chunk()));
         }
 
         // Parse the JSON chunk
@@ -597,6 +601,10 @@ impl SseStream {
         match chunk.r#type.as_str() {
             "message_start" => {
                 self.message_started = true;
+                if let Some(msg) = chunk.message {
+                    self.input_tokens = msg.usage.input_tokens;
+                    self.output_tokens = msg.usage.output_tokens;
+                }
                 None // Don't emit chunk for message_start
             }
             "content_block_start" => {
@@ -623,9 +631,7 @@ impl SseStream {
                             if let Some(text) = delta.text {
                                 return Some(Ok(ModelStreamChunk {
                                     delta: text,
-                                    tool_calls: None,
-                                    thinking: None,
-                                    finished: false,
+                                    ..Default::default()
                                 }));
                             }
                         }
@@ -668,8 +674,7 @@ impl SseStream {
                                     args,
                                     status: crate::events::ToolCallStatus::Ok,
                                 }]),
-                                thinking: None,
-                                finished: false,
+                                ..Default::default()
                             }));
                         }
                     }
@@ -677,31 +682,54 @@ impl SseStream {
                 None
             }
             "message_delta" => {
-                if let Some(_usage) = chunk.usage {
-                    // Update usage - but we don't emit a chunk for this
+                if let Some(usage) = chunk.usage {
+                    if usage.input_tokens > 0 {
+                        self.input_tokens = usage.input_tokens;
+                    }
+                    self.output_tokens = usage.output_tokens;
+                }
+                if chunk.delta.and_then(|d| d.stop_reason).as_deref() == Some("max_tokens") {
+                    self.truncated = true;
                 }
                 None
             }
             "message_stop" => {
                 self.finished = true;
-                // Flush any pending tool calls
-                if !self.pending_tool_calls.is_empty() {
-                    let tool_calls = self.flush_tool_calls();
-                    return Some(Ok(ModelStreamChunk {
-                        delta: String::new(),
-                        tool_calls: Some(tool_calls),
-                        thinking: self.flush_thinking(),
-                        finished: true,
-                    }));
-                }
-                Some(Ok(ModelStreamChunk {
-                    delta: String::new(),
-                    tool_calls: None,
-                    thinking: self.flush_thinking(),
-                    finished: true,
-                }))
+                Some(Ok(self.final_chunk()))
+            }
+            "error" => {
+                self.finished = true;
+                // e.g. `overloaded_error` delivered mid-stream.
+                Some(Err(ModelError::StreamInterrupted(
+                    chunk
+                        .error
+                        .map(|e| format!("{}: {}", e.r#type, e.message))
+                        .unwrap_or_else(|| "stream error event".to_string()),
+                )))
             }
             _ => None,
+        }
+    }
+
+    /// Build the terminal chunk: flush pending tool calls/thinking and attach usage.
+    fn final_chunk(&mut self) -> ModelStreamChunk {
+        let tool_calls = if self.pending_tool_calls.is_empty() {
+            None
+        } else {
+            Some(self.flush_tool_calls())
+        };
+        let usage = (self.input_tokens > 0 || self.output_tokens > 0).then(|| Usage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.input_tokens + self.output_tokens,
+        });
+        ModelStreamChunk {
+            delta: String::new(),
+            tool_calls,
+            thinking: self.flush_thinking(),
+            finished: true,
+            usage,
+            truncated: self.truncated,
         }
     }
 
@@ -777,7 +805,9 @@ impl Stream for SseStream {
                     continue;
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
-                    return std::task::Poll::Ready(Some(Err(ModelError::Streaming(e.to_string()))));
+                    return std::task::Poll::Ready(Some(Err(ModelError::StreamInterrupted(
+                        e.to_string(),
+                    ))));
                 }
                 std::task::Poll::Ready(None) => {
                     // Stream ended without [DONE]
@@ -801,21 +831,7 @@ impl Stream for SseStream {
                         }
                     }
                     // Flush pending tool calls
-                    if !this.pending_tool_calls.is_empty() {
-                        let tool_calls = this.flush_tool_calls();
-                        return std::task::Poll::Ready(Some(Ok(ModelStreamChunk {
-                            delta: String::new(),
-                            tool_calls: Some(tool_calls),
-                            thinking: this.flush_thinking(),
-                            finished: true,
-                        })));
-                    }
-                    return std::task::Poll::Ready(Some(Ok(ModelStreamChunk {
-                        delta: String::new(),
-                        tool_calls: None,
-                        thinking: this.flush_thinking(),
-                        finished: true,
-                    })));
+                    return std::task::Poll::Ready(Some(Ok(this.final_chunk())));
                 }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }

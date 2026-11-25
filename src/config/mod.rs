@@ -1300,7 +1300,7 @@ api_key = "{env:OKEANOS_MISSING_SECRET_12345}"
                 &format!(
                     r#"
 [provider]
-api_key = "{{file:{}}}"
+api_key = '{{file:{}}}'
 "#,
                     secret_path.display()
                 ),

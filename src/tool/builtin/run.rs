@@ -215,16 +215,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Run a shell script portably: `sh -c` on Unix, `cmd /C` on Windows.
+    fn shell(script: &str) -> Value {
+        if cfg!(windows) {
+            json!({ "command": "cmd", "args": ["/C", script] })
+        } else {
+            json!({ "command": "sh", "args": ["-c", script] })
+        }
+    }
+
     #[tokio::test]
     async fn test_run_tool_basic() {
         let tool = RunTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "echo",
-                "args": ["hello", "world"]
-            }))
-            .await
-            .unwrap();
+        let result = tool.execute(shell("echo hello world")).await.unwrap();
 
         assert!(!result.timed_out);
         assert!(!result.cancelled);
@@ -236,19 +239,16 @@ mod tests {
     #[tokio::test]
     async fn test_run_tool_timeout() {
         let tool = RunTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "sleep",
-                "args": ["100"],
-                "timeout_secs": 1
-            }))
-            .await
-            .unwrap();
+        let args = if cfg!(windows) {
+            json!({ "command": "ping", "args": ["-n", "100", "127.0.0.1"], "timeout_secs": 1 })
+        } else {
+            json!({ "command": "sleep", "args": ["100"], "timeout_secs": 1 })
+        };
+        let result = tool.execute(args).await.unwrap();
 
         assert!(result.timed_out);
         assert!(!result.cancelled);
         assert!(result.exit_code.is_none());
-        // Output may be empty since sleep produces no output.
     }
 
     #[tokio::test]
@@ -279,13 +279,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_tool_non_zero_exit() {
         let tool = RunTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "sh",
-                "args": ["-c", "exit 42"]
-            }))
-            .await
-            .unwrap();
+        let result = tool.execute(shell("exit 42")).await.unwrap();
 
         assert_eq!(result.exit_code, Some(42));
         assert!(!result.timed_out);

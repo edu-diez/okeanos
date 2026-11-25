@@ -8,7 +8,7 @@ use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage,
+    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
 };
 #[cfg(test)]
 use crate::tool::builtin::EditFormat;
@@ -170,8 +170,11 @@ struct GoogleSafetyRating {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct GoogleUsageMetadata {
+    #[serde(default, alias = "promptTokenCount")]
     prompt_token_count: usize,
+    #[serde(default, alias = "candidatesTokenCount")]
     candidates_token_count: usize,
+    #[serde(default, alias = "totalTokenCount")]
     total_token_count: usize,
     cached_content_token_count: Option<usize>,
 }
@@ -199,6 +202,7 @@ struct GoogleErrorBody {
 struct GoogleStreamChunk {
     candidates: Option<Vec<GoogleStreamCandidate>>,
     prompt_feedback: Option<GooglePromptFeedback>,
+    #[serde(alias = "usageMetadata")]
     usage_metadata: Option<GoogleUsageMetadata>,
 }
 
@@ -280,6 +284,10 @@ impl GoogleModel {
         match status {
             StatusCode::UNAUTHORIZED => ModelError::AuthFailed,
             StatusCode::NOT_FOUND => ModelError::ModelNotFound(error_message),
+            StatusCode::PAYLOAD_TOO_LARGE => ModelError::ContextLengthExceeded(error_message),
+            StatusCode::BAD_REQUEST if is_context_overflow_message(&error_message) => {
+                ModelError::ContextLengthExceeded(error_message)
+            }
             StatusCode::UNPROCESSABLE_ENTITY => ModelError::InvalidRequest(error_message),
             StatusCode::TOO_MANY_REQUESTS => ModelError::RateLimited { retry_after_sec: 0 },
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -542,10 +550,11 @@ impl Model for GoogleModel {
             .map_err(Self::map_reqwest_error)?;
 
         let status = response.status();
+        let retry_after = retry_after_secs(response.headers());
         let body = response.text().await.map_err(Self::map_reqwest_error)?;
 
         if !status.is_success() {
-            return Err(Self::map_http_error(status, &body));
+            return Err(Self::map_http_error(status, &body).with_retry_after(retry_after));
         }
 
         let resp: GoogleResponse = serde_json::from_str(&body)
@@ -576,11 +585,12 @@ impl Model for GoogleModel {
             .map_err(Self::map_reqwest_error)?;
 
         let status = response.status();
+        let retry_after = retry_after_secs(response.headers());
 
         // For streaming, check the status code first.
         if !status.is_success() {
             let body = response.text().await.map_err(Self::map_reqwest_error)?;
-            return Err(Self::map_http_error(status, &body));
+            return Err(Self::map_http_error(status, &body).with_retry_after(retry_after));
         }
 
         let byte_stream = response.bytes_stream();
@@ -594,6 +604,8 @@ pub(crate) struct SseStream {
     buffer: Vec<u8>,
     pending_function_calls: Vec<StreamingFunctionCall>,
     finished: bool,
+    usage: Option<Usage>,
+    truncated: bool,
 }
 
 impl SseStream {
@@ -605,31 +617,37 @@ impl SseStream {
             buffer: Vec::new(),
             pending_function_calls: Vec::new(),
             finished: false,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    /// Terminal chunk: flushes pending function calls and attaches usage.
+    fn final_chunk(&mut self) -> ModelStreamChunk {
+        let tool_calls = if self.pending_function_calls.is_empty() {
+            None
+        } else {
+            Some(self.flush_function_calls())
+        };
+        ModelStreamChunk {
+            tool_calls,
+            finished: true,
+            usage: self.usage.take(),
+            truncated: self.truncated,
+            ..Default::default()
         }
     }
 
     /// Parse an SSE `data:` line into a [`ModelStreamChunk`].
+    ///
+    /// The terminal (`finished`) chunk is only emitted at end of stream so
+    /// that trailing usage metadata is not lost.
     fn process_data_line(&mut self, data: &str) -> Option<Result<ModelStreamChunk, ModelError>> {
         let trimmed = data.trim();
 
         if trimmed == "[DONE]" || trimmed.is_empty() {
             self.finished = true;
-            // Flush any accumulated function calls
-            if !self.pending_function_calls.is_empty() {
-                let function_calls = self.flush_function_calls();
-                return Some(Ok(ModelStreamChunk {
-                    delta: String::new(),
-                    tool_calls: Some(function_calls),
-                    thinking: None,
-                    finished: true,
-                }));
-            }
-            return Some(Ok(ModelStreamChunk {
-                delta: String::new(),
-                tool_calls: None,
-                thinking: None,
-                finished: true,
-            }));
+            return Some(Ok(self.final_chunk()));
         }
 
         // Parse the JSON chunk
@@ -638,11 +656,27 @@ impl SseStream {
             Err(_) => return None, // skip unparseable lines
         };
 
+        if let Some(u) = chunk.usage_metadata {
+            let total = if u.total_token_count > 0 {
+                u.total_token_count
+            } else {
+                u.prompt_token_count + u.candidates_token_count
+            };
+            self.usage = Some(Usage {
+                prompt_tokens: u.prompt_token_count,
+                completion_tokens: u.candidates_token_count,
+                total_tokens: total,
+            });
+        }
+
         let candidate = chunk.candidates.and_then(|c| c.into_iter().next());
 
         if let Some(candidate) = candidate {
             let finish_reason = candidate.finish_reason.clone();
             let finished = finish_reason.is_some();
+            if finish_reason.as_deref() == Some("MAX_TOKENS") {
+                self.truncated = true;
+            }
 
             if let Some(content) = candidate.content {
                 let mut text_delta = String::new();
@@ -693,15 +727,14 @@ impl SseStream {
                     output_tool_calls = Some(self.flush_function_calls());
                 }
 
-                if text_delta.is_empty() && output_tool_calls.is_none() && !finished {
+                if text_delta.is_empty() && output_tool_calls.is_none() {
                     return None;
                 }
 
                 return Some(Ok(ModelStreamChunk {
                     delta: text_delta,
                     tool_calls: output_tool_calls,
-                    thinking: None,
-                    finished,
+                    ..Default::default()
                 }));
             }
         }
@@ -772,7 +805,9 @@ impl Stream for SseStream {
                     continue;
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
-                    return std::task::Poll::Ready(Some(Err(ModelError::Streaming(e.to_string()))));
+                    return std::task::Poll::Ready(Some(Err(ModelError::StreamInterrupted(
+                        e.to_string(),
+                    ))));
                 }
                 std::task::Poll::Ready(None) => {
                     // Stream ended
@@ -796,21 +831,7 @@ impl Stream for SseStream {
                         }
                     }
                     // Flush pending function calls
-                    if !this.pending_function_calls.is_empty() {
-                        let function_calls = this.flush_function_calls();
-                        return std::task::Poll::Ready(Some(Ok(ModelStreamChunk {
-                            delta: String::new(),
-                            tool_calls: Some(function_calls),
-                            thinking: None,
-                            finished: true,
-                        })));
-                    }
-                    return std::task::Poll::Ready(Some(Ok(ModelStreamChunk {
-                        delta: String::new(),
-                        tool_calls: None,
-                        thinking: None,
-                        finished: true,
-                    })));
+                    return std::task::Poll::Ready(Some(Ok(this.final_chunk())));
                 }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }

@@ -4,7 +4,11 @@
 //! retried with exponential backoff. Permanent errors are never retried.
 
 use crate::model::ModelError;
+use rand::Rng;
 use std::time::Duration;
+
+/// Upper bound applied to provider `Retry-After` hints.
+pub const MAX_RETRY_AFTER_SECS: u64 = 60;
 
 /// Decision about whether to retry a model error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,22 +57,37 @@ impl RetryPolicy {
 
     /// Compute the backoff delay for a given attempt number (0-indexed).
     ///
-    /// Uses exponential backoff: `base_backoff_ms * 2^attempt`, capped at
-    /// `max_backoff_ms`. If the error carries a `retry_after_sec` value, that
-    /// is used instead (it is authoritative).
+    /// A provider `Retry-After` hint (non-zero `retry_after_sec`) is
+    /// authoritative and used as-is, clamped to [`MAX_RETRY_AFTER_SECS`].
+    /// Otherwise uses exponential backoff with equal jitter: half of
+    /// `base_backoff_ms * 2^attempt` (capped at `max_backoff_ms`) plus a random
+    /// amount up to the other half, to avoid synchronized retries.
     pub fn backoff_for_attempt(&self, attempt: usize, error: Option<&ModelError>) -> Duration {
-        // Honor Retry-After / retry-after hint from the provider when present.
         if let Some(
             ModelError::RateLimited { retry_after_sec }
             | ModelError::ServiceUnavailable { retry_after_sec },
         ) = error
+            && *retry_after_sec > 0
         {
-            return Duration::from_secs(*retry_after_sec);
+            return Duration::from_secs((*retry_after_sec).min(MAX_RETRY_AFTER_SECS));
         }
 
-        let backoff = self.base_backoff_ms * 2u64.saturating_pow(attempt as u32);
-        let ms = backoff.min(self.max_backoff_ms);
-        Duration::from_millis(ms)
+        let ceiling = self.exponential_ms(attempt);
+        let half = ceiling / 2;
+        let jitter = if half == 0 {
+            0
+        } else {
+            rand::thread_rng().gen_range(0..=half)
+        };
+        Duration::from_millis(half + jitter)
+    }
+
+    /// Un-jittered exponential delay in ms for the given attempt.
+    fn exponential_ms(&self, attempt: usize) -> u64 {
+        let attempt = attempt.min(32) as u32;
+        self.base_backoff_ms
+            .saturating_mul(2u64.saturating_pow(attempt))
+            .min(self.max_backoff_ms)
     }
 }
 
@@ -139,6 +158,15 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_interrupted_is_retryable() {
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            policy.classify(&ModelError::StreamInterrupted("reset".into())),
+            RetryDecision::Retry
+        );
+    }
+
+    #[test]
     fn test_is_retryable() {
         assert!(ModelError::RateLimited { retry_after_sec: 1 }.is_retryable());
         assert!(ModelError::ServiceUnavailable { retry_after_sec: 1 }.is_retryable());
@@ -158,14 +186,38 @@ mod tests {
     }
 
     #[test]
-    fn test_backoff_exponential_growth() {
+    fn test_backoff_retry_after_is_clamped() {
         let policy = RetryPolicy::default();
-        let d0 = policy.backoff_for_attempt(0, None);
-        let d1 = policy.backoff_for_attempt(1, None);
-        let d2 = policy.backoff_for_attempt(2, None);
-        assert_eq!(d0, Duration::from_millis(500));
-        assert_eq!(d1, Duration::from_millis(1000));
-        assert_eq!(d2, Duration::from_millis(2000));
+        let err = ModelError::RateLimited {
+            retry_after_sec: 3600,
+        };
+        assert_eq!(
+            policy.backoff_for_attempt(0, Some(&err)),
+            Duration::from_secs(MAX_RETRY_AFTER_SECS)
+        );
+    }
+
+    #[test]
+    fn test_backoff_zero_retry_after_falls_back_to_exponential() {
+        let policy = RetryPolicy::default();
+        let err = ModelError::RateLimited { retry_after_sec: 0 };
+        for _ in 0..50 {
+            let d = policy.backoff_for_attempt(0, Some(&err));
+            assert!(d >= Duration::from_millis(250), "{d:?} should not be ~zero");
+            assert!(d <= Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn test_backoff_exponential_growth_with_jitter() {
+        let policy = RetryPolicy::default();
+        for (attempt, ceiling) in [(0usize, 500u64), (1, 1000), (2, 2000)] {
+            for _ in 0..50 {
+                let d = policy.backoff_for_attempt(attempt, None);
+                assert!(d >= Duration::from_millis(ceiling / 2), "{d:?}");
+                assert!(d <= Duration::from_millis(ceiling), "{d:?}");
+            }
+        }
     }
 
     #[test]
@@ -175,7 +227,12 @@ mod tests {
             max_backoff_ms: 1500,
             ..Default::default()
         };
-        let d = policy.backoff_for_attempt(10, None);
-        assert_eq!(d, Duration::from_millis(1500));
+        for _ in 0..50 {
+            let d = policy.backoff_for_attempt(10, None);
+            assert!(d <= Duration::from_millis(1500), "{d:?}");
+            assert!(d >= Duration::from_millis(750), "{d:?}");
+        }
+        // Huge attempt counts must not overflow.
+        assert!(policy.backoff_for_attempt(usize::MAX, None) <= Duration::from_millis(1500));
     }
 }

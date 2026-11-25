@@ -9,7 +9,7 @@ use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage,
+    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
 };
 use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
@@ -155,9 +155,10 @@ struct ChatCompletionChunk {
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    /// Sent on a trailing chunk (usually with empty `choices`).
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
-
-/// A choice in a streaming chunk.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct ChunkChoice {
@@ -293,6 +294,10 @@ impl OpenRouterModel {
         match status {
             StatusCode::UNAUTHORIZED => ModelError::AuthFailed,
             StatusCode::NOT_FOUND => ModelError::ModelNotFound(error_message),
+            StatusCode::PAYLOAD_TOO_LARGE => ModelError::ContextLengthExceeded(error_message),
+            StatusCode::BAD_REQUEST if is_context_overflow_message(&error_message) => {
+                ModelError::ContextLengthExceeded(error_message)
+            }
             StatusCode::UNPROCESSABLE_ENTITY => ModelError::InvalidRequest(error_message),
             StatusCode::TOO_MANY_REQUESTS => ModelError::RateLimited { retry_after_sec: 0 },
             StatusCode::SERVICE_UNAVAILABLE => {
@@ -414,7 +419,8 @@ impl OpenRouterModel {
             .map(|t| !t.is_empty())
             .unwrap_or(false)
         {
-            Some("required".to_string())
+            // The model must be free to answer in plain text to finish a task.
+            Some("auto".to_string())
         } else {
             None
         };
@@ -462,10 +468,11 @@ impl Model for OpenRouterModel {
             .map_err(Self::map_reqwest_error)?;
 
         let status = response.status();
+        let retry_after = retry_after_secs(response.headers());
         let body = response.text().await.map_err(Self::map_reqwest_error)?;
 
         if !status.is_success() {
-            return Err(Self::map_http_error(status, &body));
+            return Err(Self::map_http_error(status, &body).with_retry_after(retry_after));
         }
 
         let resp: ChatCompletionResponse = serde_json::from_str(&body)
@@ -496,12 +503,13 @@ impl Model for OpenRouterModel {
             .map_err(Self::map_reqwest_error)?;
 
         let status = response.status();
+        let retry_after = retry_after_secs(response.headers());
 
         // For streaming, check the status code first. Error responses come
         // as a regular JSON body with non-2xx status.
         if !status.is_success() {
             let body = response.text().await.map_err(Self::map_reqwest_error)?;
-            return Err(Self::map_http_error(status, &body));
+            return Err(Self::map_http_error(status, &body).with_retry_after(retry_after));
         }
 
         let byte_stream = response.bytes_stream();
@@ -518,6 +526,8 @@ pub(crate) struct SseStream {
     buffer: Vec<u8>,
     pending_tool_calls: Vec<StreamingToolCall>,
     finished: bool,
+    usage: Option<Usage>,
+    truncated: bool,
 }
 
 impl SseStream {
@@ -529,33 +539,39 @@ impl SseStream {
             buffer: Vec::new(),
             pending_tool_calls: Vec::new(),
             finished: false,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    /// Terminal chunk: flushes pending tool calls and attaches usage.
+    fn final_chunk(&mut self) -> ModelStreamChunk {
+        let tool_calls = if self.pending_tool_calls.is_empty() {
+            None
+        } else {
+            Some(self.flush_tool_calls())
+        };
+        ModelStreamChunk {
+            tool_calls,
+            finished: true,
+            usage: self.usage.take(),
+            truncated: self.truncated,
+            ..Default::default()
         }
     }
 
     /// Parse an SSE `data:` line into a [`ModelStreamChunk`], accumulating
     /// tool call deltas across chunks.
+    ///
+    /// The terminal (`finished`) chunk is only emitted on `[DONE]` or end of
+    /// stream so that a trailing usage-only chunk is not lost.
     fn process_data_line(&mut self, data: &str) -> Option<Result<ModelStreamChunk, ModelError>> {
         let trimmed = data.trim();
 
         // [DONE] signals end of stream
         if trimmed == "[DONE]" {
             self.finished = true;
-            // Flush any accumulated tool calls as a final chunk
-            if !self.pending_tool_calls.is_empty() {
-                let tool_calls = self.flush_tool_calls();
-                return Some(Ok(ModelStreamChunk {
-                    delta: String::new(),
-                    tool_calls: Some(tool_calls),
-                    thinking: None,
-                    finished: true,
-                }));
-            }
-            return Some(Ok(ModelStreamChunk {
-                delta: String::new(),
-                tool_calls: None,
-                thinking: None,
-                finished: true,
-            }));
+            return Some(Ok(self.final_chunk()));
         }
 
         // Parse the JSON chunk
@@ -564,9 +580,20 @@ impl SseStream {
             Err(_) => return None, // skip unparseable lines
         };
 
+        if let Some(u) = chunk.usage {
+            self.usage = Some(Usage {
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            });
+        }
+
         let choice = chunk.choices.into_iter().next();
         let delta = choice.as_ref().map(|c| c.delta.clone()).unwrap_or_default();
         let finish_reason = choice.as_ref().and_then(|c| c.finish_reason.clone());
+        if finish_reason.as_deref() == Some("length") {
+            self.truncated = true;
+        }
 
         let mut content_delta = String::new();
         let mut tool_call_chunks: Vec<ChunkToolCall> = Vec::new();
@@ -609,8 +636,8 @@ impl SseStream {
             }
         }
 
-        // If we have accumulated tool calls and there's a finish reason,
-        // flush them as a completed chunk
+        // Once the choice finishes, flush accumulated tool calls (the
+        // terminal chunk follows on [DONE] / end of stream).
         let finished = finish_reason.is_some();
         let mut output_tool_calls: Option<Vec<ToolCall>> = None;
 
@@ -618,15 +645,14 @@ impl SseStream {
             output_tool_calls = Some(self.flush_tool_calls());
         }
 
-        if content_delta.is_empty() && output_tool_calls.is_none() && !finished {
+        if content_delta.is_empty() && output_tool_calls.is_none() {
             return None; // nothing to emit
         }
 
         Some(Ok(ModelStreamChunk {
             delta: content_delta,
             tool_calls: output_tool_calls,
-            thinking: None,
-            finished,
+            ..Default::default()
         }))
     }
 
@@ -698,7 +724,9 @@ impl Stream for SseStream {
                     continue;
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
-                    return std::task::Poll::Ready(Some(Err(ModelError::Streaming(e.to_string()))));
+                    return std::task::Poll::Ready(Some(Err(ModelError::StreamInterrupted(
+                        e.to_string(),
+                    ))));
                 }
                 std::task::Poll::Ready(None) => {
                     // Stream ended without [DONE]
@@ -722,21 +750,7 @@ impl Stream for SseStream {
                         }
                     }
                     // Flush pending tool calls
-                    if !this.pending_tool_calls.is_empty() {
-                        let tool_calls = this.flush_tool_calls();
-                        return std::task::Poll::Ready(Some(Ok(ModelStreamChunk {
-                            delta: String::new(),
-                            tool_calls: Some(tool_calls),
-                            thinking: None,
-                            finished: true,
-                        })));
-                    }
-                    return std::task::Poll::Ready(Some(Ok(ModelStreamChunk {
-                        delta: String::new(),
-                        tool_calls: None,
-                        thinking: None,
-                        finished: true,
-                    })));
+                    return std::task::Poll::Ready(Some(Ok(this.final_chunk())));
                 }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             }
@@ -1033,7 +1047,7 @@ mod tests {
         let tools = request.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].r#type, "function");
-        assert_eq!(request.tool_choice, Some("required".to_string()));
+        assert_eq!(request.tool_choice, Some("auto".to_string()));
     }
 
     #[test]
