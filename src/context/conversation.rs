@@ -1,17 +1,32 @@
 //! Conversation context management.
 //!
 //! Handles the system prompt, skills directory concatenation,
-//! message history, token counting, cost estimation, hard context cap enforcement,
-//! tiered prompts, selective file inclusion, and thinking channel handling.
+//! message history, token accounting (calibrated against provider usage),
+//! cost estimation, hard context cap enforcement, tiered prompts,
+//! tool-result pruning, and thinking channel handling.
+//!
+//! The history sent to the model is append-only between compactions so the
+//! request prefix stays byte-stable (provider prompt caches rely on this).
 
-use crate::context::cap::{ContextCap, ContextCapError, ContextWarning};
-use crate::context::selective::{IncludedFile, SelectiveContextConfig};
+use crate::context::cap::{ContextCap, ContextCapError};
+use crate::context::selective::SelectiveContextConfig;
 use crate::context::tier::TierConfig;
 use crate::context::tokens::{CostEstimate, TokenCounter};
-use crate::events::Message;
+use crate::context::warnings::WarningLevel;
+use crate::events::{Message, MessageRole};
 use crate::model::{ModelCapabilities, ModelTier};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+/// Prefix of the placeholder that replaces a pruned tool result.
+pub const PRUNED_TOOL_OUTPUT_PREFIX: &str = "[tool output cleared";
+
+/// Tool results smaller than this (in estimated tokens) are not worth pruning.
+const MIN_PRUNABLE_TOOL_TOKENS: usize = 60;
+
+/// Bounds for the estimate-to-reality correction factor.
+const MIN_CALIBRATION_RATIO: f64 = 0.25;
+const MAX_CALIBRATION_RATIO: f64 = 4.0;
 
 /// Errors related to conversation context.
 #[derive(Debug, Error)]
@@ -41,6 +56,15 @@ pub enum SystemPromptSource {
     File(PathBuf),
 }
 
+/// Outcome of pruning old tool results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Number of tool results replaced by a placeholder.
+    pub messages_pruned: usize,
+    /// Estimated tokens freed.
+    pub tokens_saved: usize,
+}
+
 /// A conversation with context management.
 #[derive(Debug, Clone)]
 pub struct Conversation {
@@ -58,9 +82,15 @@ pub struct Conversation {
     tier_config: TierConfig,
     /// Selective context configuration.
     selective_config: SelectiveContextConfig,
-    /// Included relevant files for context.
-    included_files: Vec<IncludedFile>,
-    /// Total estimated tokens in context (system + messages + files).
+    /// Estimated tokens of the tool schemas sent with every request.
+    tool_overhead_tokens: usize,
+    /// Correction factor (provider-reported / heuristic) applied to estimates.
+    calibration_ratio: f64,
+    /// Provider-reported token count and the message count it covered.
+    anchor: Option<(usize, usize)>,
+    /// Bumped whenever the history is rewritten (compaction, clear).
+    generation: u64,
+    /// Total estimated tokens in context (system + tools + messages).
     estimated_tokens: usize,
     /// Current cost estimate.
     cost_estimate: CostEstimate,
@@ -82,7 +112,10 @@ impl Conversation {
             capabilities,
             tier_config,
             selective_config,
-            included_files: Vec::new(),
+            tool_overhead_tokens: 0,
+            calibration_ratio: 1.0,
+            anchor: None,
+            generation: 0,
             estimated_tokens: system_tokens,
             cost_estimate: CostEstimate::default(),
         }
@@ -140,11 +173,6 @@ impl Conversation {
         &self.selective_config
     }
 
-    /// Get the included files.
-    pub fn included_files(&self) -> &[IncludedFile] {
-        &self.included_files
-    }
-
     /// Get the current estimated token count.
     pub fn estimated_tokens(&self) -> usize {
         self.estimated_tokens
@@ -156,8 +184,8 @@ impl Conversation {
     }
 
     /// Get the context warning level.
-    pub fn warning_level(&self) -> ContextWarning {
-        ContextWarning::from_tokens(&self.cap, self.estimated_tokens)
+    pub fn warning_level(&self) -> WarningLevel {
+        WarningLevel::from_tokens(&self.cap, self.estimated_tokens)
     }
 
     /// Get remaining tokens before cap.
@@ -165,10 +193,40 @@ impl Conversation {
         self.cap.remaining(self.estimated_tokens)
     }
 
+    /// Counter that increments whenever the history is rewritten.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Current estimate-correction factor (1.0 until the first provider usage report).
+    pub fn calibration_ratio(&self) -> f64 {
+        self.calibration_ratio
+    }
+
+    /// Tell the conversation how many tokens the tool schemas add to each request.
+    pub fn set_tool_overhead(&mut self, tokens: usize) {
+        self.tool_overhead_tokens = tokens;
+        self.recalculate_tokens();
+    }
+
+    fn scaled(&self, tokens: usize) -> usize {
+        (tokens as f64 * self.calibration_ratio).ceil() as usize
+    }
+
+    fn message_tokens(&self, msg: &Message) -> usize {
+        self.scaled(self.token_counter.count_event_message(msg))
+    }
+
+    fn fixed_tokens_raw(&self) -> usize {
+        self.token_counter
+            .count_message("system", &self.system_prompt)
+            + self.tool_overhead_tokens
+    }
+
     /// Add a user message.
     pub fn add_user_message(&mut self, content: String) -> Result<(), ConversationError> {
         let msg = Message {
-            role: crate::events::MessageRole::User,
+            role: MessageRole::User,
             content,
             tool_calls: None,
             tool_call_id: None,
@@ -186,7 +244,7 @@ impl Conversation {
         thinking: Option<String>,
     ) -> Result<(), ConversationError> {
         let msg = Message {
-            role: crate::events::MessageRole::Assistant,
+            role: MessageRole::Assistant,
             content,
             tool_calls,
             tool_call_id: None,
@@ -203,7 +261,7 @@ impl Conversation {
         tool_call_id: String,
     ) -> Result<(), ConversationError> {
         let msg = Message {
-            role: crate::events::MessageRole::Tool,
+            role: MessageRole::Tool,
             content,
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
@@ -215,9 +273,7 @@ impl Conversation {
 
     /// Add a message with cap enforcement.
     fn add_message(&mut self, msg: Message) -> Result<(), ConversationError> {
-        let msg_tokens = self
-            .token_counter
-            .count_message(&msg.role.to_string(), &msg.content);
+        let msg_tokens = self.message_tokens(&msg);
 
         // Check if adding this message would exceed the cap
         self.cap.enforce(self.estimated_tokens, msg_tokens)?;
@@ -233,9 +289,7 @@ impl Conversation {
         msg: Message,
         cost: CostEstimate,
     ) -> Result<(), ConversationError> {
-        let msg_tokens = self
-            .token_counter
-            .count_message(&msg.role.to_string(), &msg.content);
+        let msg_tokens = self.message_tokens(&msg);
         self.cap
             .enforce_with_cost(self.estimated_tokens, msg_tokens, &cost)?;
         self.estimated_tokens += msg_tokens;
@@ -250,9 +304,9 @@ impl Conversation {
     /// Clear history but keep system prompt.
     pub fn clear_history(&mut self) {
         self.messages.clear();
-        self.estimated_tokens = self
-            .token_counter
-            .count_message("system", &self.system_prompt);
+        self.anchor = None;
+        self.generation += 1;
+        self.recalculate_tokens();
         self.cost_estimate = CostEstimate::default();
     }
 
@@ -261,36 +315,117 @@ impl Conversation {
         self.messages.len()
     }
 
-    /// Set included files for selective context.
-    pub fn set_included_files(&mut self, files: Vec<IncludedFile>) {
-        self.included_files = files;
-        self.recalculate_tokens();
+    /// Recalculate total estimated tokens (system + tools + messages).
+    ///
+    /// When a provider-reported count covers a prefix of the history, only the
+    /// messages added since are estimated; otherwise everything is estimated
+    /// and scaled by the calibration ratio.
+    pub fn recalculate_tokens(&mut self) {
+        self.estimated_tokens = match self.anchor {
+            Some((tokens, count)) if count <= self.messages.len() => {
+                tokens
+                    + self.messages[count..]
+                        .iter()
+                        .map(|m| self.message_tokens(m))
+                        .sum::<usize>()
+            }
+            _ => {
+                let raw: usize = self.fixed_tokens_raw()
+                    + self
+                        .messages
+                        .iter()
+                        .map(|m| self.token_counter.count_event_message(m))
+                        .sum::<usize>();
+                self.scaled(raw)
+            }
+        };
     }
 
-    /// Recalculate total estimated tokens (system + messages + files).
-    pub fn recalculate_tokens(&mut self) {
-        let system_tokens = self
-            .token_counter
-            .count_message("system", &self.system_prompt);
-        let message_tokens: usize = self
-            .messages
-            .iter()
-            .map(|m| {
-                self.token_counter
-                    .count_message(&m.role.to_string(), &m.content)
-            })
-            .sum();
-        let file_tokens: usize = self.included_files.iter().map(|f| f.tokens).sum();
-        self.estimated_tokens = system_tokens + message_tokens + file_tokens;
+    /// Record provider-reported usage for the request that produced the last
+    /// assistant message. Call right after that message was added.
+    ///
+    /// `prompt_tokens` must include cached tokens. Anchors the estimate on
+    /// the real count and updates the correction factor used for later
+    /// estimates (including after the history is rewritten).
+    pub fn record_usage(&mut self, prompt_tokens: usize, completion_tokens: usize) {
+        if prompt_tokens == 0 {
+            return;
+        }
+        let actual = prompt_tokens + completion_tokens;
+        let raw: usize = self.fixed_tokens_raw()
+            + self
+                .messages
+                .iter()
+                .map(|m| self.token_counter.count_event_message(m))
+                .sum::<usize>();
+        if raw > 0 {
+            self.calibration_ratio =
+                (actual as f64 / raw as f64).clamp(MIN_CALIBRATION_RATIO, MAX_CALIBRATION_RATIO);
+        }
+        self.anchor = Some((actual, self.messages.len()));
+        self.estimated_tokens = actual;
     }
 
     /// Replace message history (used for compaction).
-    pub fn replace_messages(&mut self, messages: Vec<crate::events::Message>) {
+    pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        self.anchor = None;
+        self.generation += 1;
         self.recalculate_tokens();
     }
 
-    /// Get context usage breakdown for status display.
+    /// Replace the content of old tool results with a short placeholder.
+    ///
+    /// The most recent `protect_tokens` worth of tool output is left intact.
+    /// Nothing is changed unless at least `min_savings` tokens would be freed.
+    /// Message order and tool-call pairing are preserved.
+    pub fn prune_tool_results(
+        &mut self,
+        protect_tokens: usize,
+        min_savings: usize,
+    ) -> Option<PruneStats> {
+        let mut protected = 0usize;
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for (i, msg) in self.messages.iter().enumerate().rev() {
+            if msg.role != MessageRole::Tool || msg.content.starts_with(PRUNED_TOOL_OUTPUT_PREFIX) {
+                continue;
+            }
+            let tokens = self.token_counter.count_event_message(msg);
+            if protected < protect_tokens {
+                protected += tokens;
+                continue;
+            }
+            if tokens >= MIN_PRUNABLE_TOOL_TOKENS {
+                candidates.push((i, tokens));
+            }
+        }
+
+        let placeholder_tokens = |bytes: usize| {
+            self.token_counter
+                .count_message("tool", &pruned_placeholder(bytes))
+        };
+        let saved: usize = candidates
+            .iter()
+            .map(|&(i, t)| t.saturating_sub(placeholder_tokens(self.messages[i].content.len())))
+            .sum();
+        let saved = self.scaled(saved);
+        if candidates.is_empty() || saved < min_savings.max(1) {
+            return None;
+        }
+
+        for &(i, _) in &candidates {
+            let bytes = self.messages[i].content.len();
+            self.messages[i].content = pruned_placeholder(bytes);
+        }
+        self.anchor = None;
+        self.recalculate_tokens();
+        Some(PruneStats {
+            messages_pruned: candidates.len(),
+            tokens_saved: saved,
+        })
+    }
+
+    /// Token usage breakdown for status display: (system, history, tool schemas).
     pub fn context_breakdown(&self) -> (usize, usize, usize) {
         let system_tokens = self
             .token_counter
@@ -298,20 +433,18 @@ impl Conversation {
         let history_tokens: usize = self
             .messages
             .iter()
-            .map(|m| {
-                self.token_counter
-                    .count_message(&m.role.to_string(), &m.content)
-            })
+            .map(|m| self.token_counter.count_event_message(m))
             .sum();
-        let file_tokens: usize = self.included_files.iter().map(|f| f.tokens).sum();
-        (system_tokens, history_tokens, file_tokens)
+        (system_tokens, history_tokens, self.tool_overhead_tokens)
     }
 
-    /// Get messages for model, applying history turn cap and thinking channel rules.
+    /// Get messages for the model, applying thinking channel rules.
+    ///
+    /// The whole history is sent; compaction is the only thing that drops
+    /// messages, which keeps the request prefix stable for prompt caching.
     pub fn to_model_messages(&self) -> Vec<crate::model::ModelMessage> {
-        let mut result = Vec::with_capacity(self.messages.len() + 1 + self.included_files.len());
+        let mut result = Vec::with_capacity(self.messages.len() + 1);
 
-        // System prompt first
         result.push(crate::model::ModelMessage {
             role: crate::model::ModelRole::System,
             content: self.system_prompt.clone(),
@@ -320,37 +453,13 @@ impl Conversation {
             thinking: None,
         });
 
-        // Add included files as context (after system prompt)
-        if !self.included_files.is_empty() {
-            let file_context = crate::context::selective::build_file_context(&self.included_files);
-            if !file_context.is_empty() {
-                result.push(crate::model::ModelMessage {
-                    role: crate::model::ModelRole::System,
-                    content: file_context,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    thinking: None,
-                });
-            }
-        }
-
-        // Apply history turn cap per tier
-        let max_turns = self.tier_config.max_history_turns;
-        let messages_to_include = if self.messages.len() > max_turns * 2 {
-            // Each turn = user + assistant pair, so max_turns * 2 messages
-            &self.messages[self.messages.len() - max_turns * 2..]
-        } else {
-            &self.messages[..]
-        };
-
-        // Then conversation history
-        for msg in messages_to_include {
-            let model_msg = crate::model::ModelMessage {
+        for msg in &self.messages {
+            result.push(crate::model::ModelMessage {
                 role: match msg.role {
-                    crate::events::MessageRole::User => crate::model::ModelRole::User,
-                    crate::events::MessageRole::Assistant => crate::model::ModelRole::Assistant,
-                    crate::events::MessageRole::Tool => crate::model::ModelRole::Tool,
-                    crate::events::MessageRole::System => crate::model::ModelRole::System,
+                    MessageRole::User => crate::model::ModelRole::User,
+                    MessageRole::Assistant => crate::model::ModelRole::Assistant,
+                    MessageRole::Tool => crate::model::ModelRole::Tool,
+                    MessageRole::System => crate::model::ModelRole::System,
                 },
                 content: msg.content.clone(),
                 tool_calls: msg.tool_calls.clone(),
@@ -361,9 +470,7 @@ impl Conversation {
                 } else {
                     None
                 },
-            };
-
-            result.push(model_msg);
+            });
         }
 
         result
@@ -383,6 +490,12 @@ impl Conversation {
     pub fn generation_params(&self) -> crate::model::GenerationParams {
         self.tier_config.generation_params.clone()
     }
+}
+
+fn pruned_placeholder(bytes: usize) -> String {
+    format!(
+        "{PRUNED_TOOL_OUTPUT_PREFIX} to save context ({bytes} bytes); re-run the tool if you still need it]"
+    )
 }
 
 /// Load and concatenate skills from a directory.
@@ -533,6 +646,17 @@ mod tests {
     }
 
     #[test]
+    fn test_history_is_never_windowed() {
+        let mut conv = Conversation::from_tier(ModelTier::Small, 100_000);
+        for i in 0..40 {
+            conv.add_user_message(format!("question {i}")).unwrap();
+            conv.add_assistant_message(format!("answer {i}"), None, None)
+                .unwrap();
+        }
+        assert_eq!(conv.to_model_messages().len(), 81);
+    }
+
+    #[test]
     fn test_context_cap_enforcement() {
         let mut conv = Conversation::from_tier(ModelTier::Small, 100); // Very small cap
         // Fill up to near capacity
@@ -595,5 +719,99 @@ mod tests {
                 .count_message("system", conv.system_prompt())
         );
         assert!(conv.estimated_tokens() < tokens_before);
+    }
+
+    #[test]
+    fn test_record_usage_anchors_and_calibrates() {
+        let mut conv = Conversation::from_tier(ModelTier::Frontier, 100_000);
+        conv.add_user_message("hello world".into()).unwrap();
+        conv.add_assistant_message("hi".into(), None, None).unwrap();
+
+        conv.record_usage(9_000, 100);
+        assert_eq!(conv.estimated_tokens(), 9_100);
+        assert!(conv.calibration_ratio() > 1.0);
+
+        // Only the new message is estimated on top of the real count.
+        let before = conv.estimated_tokens();
+        conv.add_user_message("x".repeat(400)).unwrap();
+        let added = conv.estimated_tokens() - before;
+        assert!(added >= 100, "added={added}");
+        assert!(conv.estimated_tokens() < before + 2_000);
+    }
+
+    #[test]
+    fn test_record_usage_ignores_missing_usage() {
+        let mut conv = Conversation::from_tier(ModelTier::Frontier, 100_000);
+        conv.add_user_message("hello".into()).unwrap();
+        let before = conv.estimated_tokens();
+        conv.record_usage(0, 0);
+        assert_eq!(conv.estimated_tokens(), before);
+        assert_eq!(conv.calibration_ratio(), 1.0);
+    }
+
+    #[test]
+    fn test_calibration_survives_history_rewrite() {
+        let mut conv = Conversation::from_tier(ModelTier::Frontier, 100_000);
+        conv.add_user_message("hello world".into()).unwrap();
+        conv.record_usage(9_000, 100);
+        let ratio = conv.calibration_ratio();
+        let gen_before = conv.generation();
+        conv.replace_messages(Vec::new());
+        assert_eq!(conv.calibration_ratio(), ratio);
+        assert_eq!(conv.generation(), gen_before + 1);
+        assert!(conv.estimated_tokens() > conv.token_counter.count("x"));
+    }
+
+    fn conv_with_tool_results(sizes: &[usize]) -> Conversation {
+        let mut conv = Conversation::from_tier(ModelTier::Frontier, 1_000_000);
+        for (i, size) in sizes.iter().enumerate() {
+            conv.add_assistant_message(
+                String::new(),
+                Some(vec![crate::events::ToolCall {
+                    id: format!("c{i}"),
+                    name: "run".into(),
+                    args: serde_json::json!({"cmd": "x"}),
+                    status: crate::events::ToolCallStatus::Pending,
+                }]),
+                None,
+            )
+            .unwrap();
+            conv.add_tool_message("o".repeat(*size), format!("c{i}"))
+                .unwrap();
+        }
+        conv
+    }
+
+    #[test]
+    fn test_prune_keeps_recent_and_preserves_pairing() {
+        let mut conv = conv_with_tool_results(&[4_000, 4_000, 4_000, 4_000]);
+        let count = conv.message_count();
+        let before = conv.estimated_tokens();
+
+        let stats = conv.prune_tool_results(500, 100).unwrap();
+        assert_eq!(stats.messages_pruned, 3);
+        assert_eq!(conv.message_count(), count);
+        assert!(conv.estimated_tokens() < before);
+
+        let tools: Vec<_> = conv
+            .messages()
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert!(
+            tools[..3]
+                .iter()
+                .all(|m| m.content.starts_with(PRUNED_TOOL_OUTPUT_PREFIX))
+        );
+        assert_eq!(tools[3].content.len(), 4_000);
+        assert_eq!(tools[0].tool_call_id.as_deref(), Some("c0"));
+    }
+
+    #[test]
+    fn test_prune_is_idempotent_and_respects_min_savings() {
+        let mut conv = conv_with_tool_results(&[4_000, 4_000, 4_000]);
+        assert!(conv.prune_tool_results(1_500, 1_000_000).is_none());
+        assert!(conv.prune_tool_results(1_500, 100).is_some());
+        assert!(conv.prune_tool_results(1_500, 1).is_none());
     }
 }

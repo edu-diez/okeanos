@@ -131,29 +131,6 @@ impl ContextCap {
     }
 }
 
-/// Warning levels for context usage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextWarning {
-    /// Below warning threshold.
-    Ok,
-    /// At or above warning threshold but below cap.
-    Warning,
-    /// At or above cap.
-    Critical,
-}
-
-impl ContextWarning {
-    pub fn from_tokens(cap: &ContextCap, current_tokens: usize) -> Self {
-        if current_tokens >= cap.max_tokens {
-            ContextWarning::Critical
-        } else if current_tokens >= cap.warning_token_count() {
-            ContextWarning::Warning
-        } else {
-            ContextWarning::Ok
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,27 +203,5 @@ mod tests {
         let err = cap.enforce(500, 600).unwrap_err();
         assert_eq!(err.estimated, 1100);
         assert_eq!(err.cap, 1000);
-    }
-
-    #[test]
-    fn test_context_warning_levels() {
-        let cap = ContextCap::new(1000);
-        assert_eq!(ContextWarning::from_tokens(&cap, 500), ContextWarning::Ok);
-        assert_eq!(
-            ContextWarning::from_tokens(&cap, 850),
-            ContextWarning::Warning
-        );
-        assert_eq!(
-            ContextWarning::from_tokens(&cap, 950),
-            ContextWarning::Warning
-        );
-        assert_eq!(
-            ContextWarning::from_tokens(&cap, 1000),
-            ContextWarning::Critical
-        );
-        assert_eq!(
-            ContextWarning::from_tokens(&cap, 1100),
-            ContextWarning::Critical
-        );
     }
 }

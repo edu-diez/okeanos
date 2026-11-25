@@ -158,6 +158,51 @@ impl Model for ActiveModel {
             ActiveModel::Google(m) => m.require_capability(capability),
         }
     }
+
+    async fn compact_native(
+        &self,
+        request: okeanos::context::compaction::NativeCompactionRequest,
+    ) -> Result<Option<okeanos::context::compaction::NativeCompactionResponse>, ModelError> {
+        match self {
+            ActiveModel::Anthropic(m) => m.compact_native(request).await,
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Build the dedicated compaction-summary model when `compaction.summarizer_model`
+/// names a model other than the main one. Requires a configured provider key.
+fn build_summarizer(config: &Config) -> Option<Arc<dyn Model>> {
+    let name = config.compaction.as_ref()?.summarizer_model.clone()?;
+    if name.is_empty() || config.model.as_ref().and_then(|m| m.name.as_deref()) == Some(&name) {
+        return None;
+    }
+    let provider = config.provider.as_ref()?;
+    let api_key = provider.api_key.as_deref().filter(|k| !k.is_empty())?;
+    let kind = provider.kind.as_deref().unwrap_or("openai-compatible");
+    let base_url = provider.base_url.as_deref().unwrap_or(match kind {
+        "anthropic" => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
+        "openai" => okeanos::model::OPENAI_DEFAULT_BASE_URL,
+        "google" => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
+        _ => okeanos::model::DEFAULT_BASE_URL,
+    });
+    let client = reqwest::Client::new();
+    let caps = config.to_model_capabilities(None);
+    let model = match kind {
+        "anthropic" => ActiveModel::Anthropic(AnthropicModel::new(
+            client, base_url, api_key, &name, caps, None,
+        )),
+        "openai" => ActiveModel::OpenAI(OpenAIModel::new(
+            client, base_url, api_key, &name, caps, None,
+        )),
+        "google" => ActiveModel::Google(GoogleModel::new(
+            client, base_url, api_key, &name, caps, None,
+        )),
+        _ => ActiveModel::OpenRouter(OpenRouterModel::new(
+            client, base_url, api_key, &name, caps, None,
+        )),
+    };
+    Some(Arc::new(model))
 }
 
 async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
@@ -899,7 +944,14 @@ async fn run_interactive_tui(
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
+        .with_compaction(okeanos::context::CompactionConfig::from_section(
+            config.compaction.as_ref(),
+        ))
         .with_agent_registry(agent_registry.clone());
+
+    if let Some(summarizer) = build_summarizer(config) {
+        loop_ = loop_.with_summarizer_model(summarizer);
+    }
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -1581,7 +1633,14 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
+        .with_compaction(okeanos::context::CompactionConfig::from_section(
+            config.compaction.as_ref(),
+        ))
         .with_agent_registry(agent_registry.clone());
+
+    if let Some(summarizer) = build_summarizer(config) {
+        loop_ = loop_.with_summarizer_model(summarizer);
+    }
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -2297,7 +2356,14 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
+        .with_compaction(okeanos::context::CompactionConfig::from_section(
+            config.compaction.as_ref(),
+        ))
         .with_agent_registry(agent_registry.clone());
+
+    if let Some(summarizer) = build_summarizer(config) {
+        loop_ = loop_.with_summarizer_model(summarizer);
+    }
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -2872,7 +2938,14 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
+        .with_compaction(okeanos::context::CompactionConfig::from_section(
+            config.compaction.as_ref(),
+        ))
         .with_agent_registry(agent_registry.clone());
+
+    if let Some(summarizer) = build_summarizer(config) {
+        loop_ = loop_.with_summarizer_model(summarizer);
+    }
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);

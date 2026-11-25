@@ -119,6 +119,8 @@ impl Default for ReactConfig {
 /// The ReAct loop harness.
 pub struct ReactLoop<M: Model> {
     model: Arc<M>,
+    /// Optional cheaper model used to write compaction summaries.
+    summarizer: Option<Arc<dyn Model>>,
     conversation: Conversation,
     tools: ToolRegistry,
     config: ReactConfig,
@@ -137,6 +139,8 @@ pub struct ReactLoop<M: Model> {
     snapshot_store: Option<Arc<Mutex<SnapshotStore>>>,
     /// Optional compaction manager for context compaction.
     compaction_manager: Option<CompactionManager>,
+    /// Summary being computed in the background, if any.
+    pending_compaction: Option<PendingCompaction>,
     /// Optional tool result cache for idempotent tools (read, grep).
     tool_cache: Option<ToolResultCache>,
     /// Event index counter for snapshot metadata.
@@ -173,6 +177,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// A summary being computed off the main loop, with the plan it was made for.
+struct PendingCompaction {
+    plan: crate::context::CompactionPlan,
+    handle: tokio::task::JoinHandle<Result<String, crate::context::CompactionError>>,
+}
+
 fn tool_result_from_exec(
     tool_call: &ToolCall,
     exec: crate::tool::tool_trait::ToolExecutionResult,
@@ -201,8 +211,19 @@ impl<M: Model + 'static> ReactLoop<M> {
         config: ReactConfig,
         event_tx: EventSender,
     ) -> Self {
+        let mut conversation = conversation;
+        let specs = tools.specs();
+        let tool_overhead = if model.capabilities().tool_calling {
+            serde_json::to_string(&specs).map_or(0, |s| s.len() / 4)
+        } else if specs.is_empty() {
+            0
+        } else {
+            TextToolParser::generate_system_prompt_snippet(&specs).len() / 4
+        };
+        conversation.set_tool_overhead(tool_overhead);
         Self {
             model,
+            summarizer: None,
             conversation,
             tools,
             config,
@@ -217,6 +238,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             cost_tracker: None,
             snapshot_store: None,
             compaction_manager: None,
+            pending_compaction: None,
             tool_cache: None,
             event_index: 0,
             project_root: None,
@@ -361,6 +383,12 @@ impl<M: Model + 'static> ReactLoop<M> {
         self
     }
 
+    /// Use a different (typically cheaper) model to write compaction summaries.
+    pub fn with_summarizer_model(mut self, model: Arc<dyn Model>) -> Self {
+        self.summarizer = Some(model);
+        self
+    }
+
     /// Set the tool result cache for idempotent tool calls (read, grep).
     pub fn with_tool_cache(mut self, config: CacheConfig) -> Self {
         self.tool_cache = Some(ToolResultCache::new(config));
@@ -405,50 +433,75 @@ impl<M: Model + 'static> ReactLoop<M> {
     /// This uses the conversation's selective context configuration (based on model tier)
     /// to scan the project for files matching symbols/terms from the user prompt and
     /// recent conversation history. The included files are added to the conversation context.
-    async fn run_selective_context(&mut self, prompt: &str) -> Result<(), ReactError> {
-        let Some(project_root) = &self.project_root else {
-            return Ok(()); // No project root configured, skip selective context
+    /// Expand the prompt with file context.
+    ///
+    /// Files mentioned as `@path` are always appended to the user message;
+    /// keyword scanning of the project only runs when `auto_scan` is enabled.
+    /// Context goes into the user message (not the system prompt) so the
+    /// cached prefix stays stable.
+    async fn expand_prompt(&mut self, prompt: &str) -> String {
+        let Some(project_root) = self.project_root.clone() else {
+            return prompt.to_string();
         };
+        let config = self.conversation.selective_config().clone();
+        let counter = crate::context::tokens::TokenCounter;
 
-        // Build search terms from prompt + recent conversation
-        let search_terms = self.build_search_terms(prompt);
-        if search_terms.is_empty() {
-            return Ok(());
+        let mut files =
+            crate::context::selective::expand_mentions(&project_root, prompt, &config, &counter);
+
+        if config.auto_scan {
+            let terms = self.build_search_terms(prompt);
+            if !terms.is_empty() {
+                let cfg = config.clone();
+                let root = project_root.clone();
+                let scanned = tokio::task::spawn_blocking(move || {
+                    crate::context::selective::find_relevant_files(
+                        &root,
+                        &terms,
+                        &cfg,
+                        &crate::context::tokens::TokenCounter,
+                    )
+                })
+                .await;
+                match scanned {
+                    Ok(Ok(found)) => {
+                        for f in found {
+                            if files.len() < config.max_files
+                                && !files.iter().any(|x| x.path == f.path)
+                            {
+                                files.push(f);
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        self.emit_log(
+                            LogLevel::Debug,
+                            format!("Selective context scan failed: {e}"),
+                        )
+                        .await;
+                    }
+                    Err(_) => {}
+                }
+            }
         }
 
-        // Get selective context config from conversation
-        let selective_config = self.conversation.selective_config().clone();
-        let token_counter = crate::context::tokens::TokenCounter;
-
-        // Find relevant files
-        let included_files = crate::context::selective::find_relevant_files(
-            project_root,
-            &search_terms,
-            &selective_config,
-            &token_counter,
-        )?;
-
-        if !included_files.is_empty() {
-            self.conversation.set_included_files(included_files);
-            // Emit log about files included
-            let count = self.conversation.included_files().len();
-            let total_tokens: usize = self
-                .conversation
-                .included_files()
-                .iter()
-                .map(|f| f.tokens)
-                .sum();
-            self.emit_log(
-                crate::events::LogLevel::Debug,
-                format!(
-                    "Selective context: included {} files ({} tokens)",
-                    count, total_tokens
-                ),
-            )
-            .await;
+        if files.is_empty() {
+            return prompt.to_string();
         }
-
-        Ok(())
+        let total_tokens: usize = files.iter().map(|f| f.tokens).sum();
+        self.emit_log(
+            LogLevel::Debug,
+            format!(
+                "Selective context: included {} files ({} tokens)",
+                files.len(),
+                total_tokens
+            ),
+        )
+        .await;
+        format!(
+            "{prompt}{}",
+            crate::context::selective::build_file_context(&files)
+        )
     }
 
     /// Build search terms from the current prompt and recent conversation history.
@@ -516,47 +569,193 @@ impl<M: Model + 'static> ReactLoop<M> {
     pub async fn compact_context(
         &mut self,
     ) -> Result<Option<crate::context::compaction::CompactionResult>, ReactError> {
-        if let Some(compaction_manager) = &mut self.compaction_manager {
-            let result = compaction_manager
-                .maybe_compact(
-                    &*self.model,
-                    &mut self.conversation,
-                    CompactionTrigger::Manual,
-                )
-                .await
-                .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?;
+        self.compact_with(CompactionTrigger::Manual).await
+    }
 
-            if let Some(ref result) = result {
-                // Emit compaction event
-                let compaction_event = CompactionEvent {
-                    trigger: CompactionTrigger::Manual,
-                    strategy: result.strategy_used.clone(),
-                    tokens_before: result.tokens_before,
-                    tokens_after: result.tokens_after,
-                    messages_removed: result.messages_removed,
-                    turns_summarized: result.turns_summarized,
-                    native_provider: result.native_provider.clone(),
-                    summary: result.summary.clone(),
-                    ts: current_timestamp(),
-                };
-                self.emit_compaction(compaction_event).await;
-            }
-
-            Ok(result)
-        } else {
-            Ok(None)
+    /// Hand live state (project root, todos) to the compaction manager so the
+    /// summary can carry it across the cut.
+    fn sync_compaction_state(&mut self) {
+        let todos = self.get_todo_list().map(|list| {
+            list.list()
+                .iter()
+                .map(|t| format!("- [{}] {}", if t.done { "x" } else { " " }, t.title))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        let root = self.project_root.clone();
+        if let Some(cm) = &mut self.compaction_manager {
+            cm.set_project_root(root);
+            cm.set_todos(todos);
         }
+    }
+
+    /// Force compaction now with the given trigger and emit the event.
+    async fn compact_with(
+        &mut self,
+        trigger: CompactionTrigger,
+    ) -> Result<Option<crate::context::compaction::CompactionResult>, ReactError> {
+        self.pending_compaction = None;
+        self.sync_compaction_state();
+        let Some(compaction_manager) = &mut self.compaction_manager else {
+            return Ok(None);
+        };
+        let summarizer: &dyn Model = match &self.summarizer {
+            Some(s) => &**s,
+            None => &*self.model,
+        };
+        let result = compaction_manager
+            .compact_now(summarizer, &mut self.conversation, trigger)
+            .await
+            .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?;
+        if let Some(result) = &result {
+            self.emit_compaction_result(trigger, result).await;
+        }
+        Ok(result)
+    }
+
+    async fn emit_compaction_result(
+        &mut self,
+        trigger: CompactionTrigger,
+        result: &crate::context::compaction::CompactionResult,
+    ) {
+        if let Some(w) = &result.warning {
+            self.emit_log(LogLevel::Warn, format!("Compaction: {w}"))
+                .await;
+        }
+        let compaction_event = CompactionEvent {
+            trigger,
+            strategy: result.strategy_used.clone(),
+            tokens_before: result.tokens_before,
+            tokens_after: result.tokens_after,
+            messages_removed: result.messages_removed,
+            turns_summarized: result.turns_summarized,
+            native_provider: result.native_provider.clone(),
+            summary: result.summary.clone(),
+            ts: current_timestamp(),
+        };
+        self.emit_compaction(compaction_event).await;
+    }
+
+    /// Start summarizing in the background when the context is close to the
+    /// trigger, so the summary is ready by the time it is needed.
+    fn maybe_start_background_compaction(&mut self) {
+        if self.pending_compaction.is_some() {
+            return;
+        }
+        let Some(cm) = &self.compaction_manager else {
+            return;
+        };
+        let Some(plan) = cm.plan_background(&self.conversation, self.model.model_id()) else {
+            return;
+        };
+        let model: Arc<dyn Model> = match &self.summarizer {
+            Some(s) => Arc::clone(s),
+            None => Arc::clone(&self.model) as Arc<dyn Model>,
+        };
+        let task_plan = plan.clone();
+        let handle =
+            tokio::spawn(async move { crate::context::summarize_plan(&*model, &task_plan).await });
+        self.pending_compaction = Some(PendingCompaction { plan, handle });
+    }
+
+    /// Compact if needed: prefer a finished background summary, then fall back
+    /// to compacting synchronously. Failures are logged, not fatal; the hard
+    /// cap and overflow recovery remain as backstops.
+    async fn auto_compact(&mut self) {
+        self.sync_compaction_state();
+        let Some(cm) = &self.compaction_manager else {
+            return;
+        };
+        let trigger_tokens = cm.trigger_tokens(&self.conversation);
+        let over = self.conversation.estimated_tokens() >= trigger_tokens;
+        if !over {
+            return;
+        }
+
+        if let Some(PendingCompaction { plan, handle }) = self.pending_compaction.take() {
+            let applied = match handle.await {
+                Ok(Ok(body)) => self.compaction_manager.as_mut().map(|cm| {
+                    cm.apply_plan(
+                        &mut self.conversation,
+                        plan,
+                        body,
+                        crate::events::CompactionStrategy::Agentic,
+                        CompactionTrigger::Auto,
+                    )
+                }),
+                _ => None,
+            };
+            if let Some(Ok(result)) = applied {
+                self.emit_compaction_result(CompactionTrigger::Auto, &result)
+                    .await;
+                return;
+            }
+            // Stale or failed: fall through to the synchronous path.
+        }
+
+        let Some(cm) = &mut self.compaction_manager else {
+            return;
+        };
+        let summarizer: &dyn Model = match &self.summarizer {
+            Some(s) => &**s,
+            None => &*self.model,
+        };
+        match cm
+            .maybe_compact(summarizer, &mut self.conversation, CompactionTrigger::Auto)
+            .await
+        {
+            Ok(Some(result)) => {
+                self.emit_compaction_result(CompactionTrigger::Auto, &result)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.emit_log(LogLevel::Warn, format!("Auto-compaction failed: {e}"))
+                    .await;
+            }
+        }
+    }
+
+    /// Add a tool result to the conversation. If it does not fit under the
+    /// hard cap, compact and retry, then truncate as a last resort.
+    async fn add_tool_result_message(
+        &mut self,
+        output: String,
+        id: String,
+    ) -> Result<(), ReactError> {
+        let Err(first) = self
+            .conversation
+            .add_tool_message(output.clone(), id.clone())
+        else {
+            return Ok(());
+        };
+        if self.compaction_manager.is_some() {
+            let _ = self.compact_with(CompactionTrigger::OverflowRecovery).await;
+            if self
+                .conversation
+                .add_tool_message(output.clone(), id.clone())
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        // Keep roughly half of the remaining room (4 bytes per token).
+        let keep = (self.conversation.remaining_tokens() * 2).min(output.len());
+        if keep < 200 {
+            return Err(first.into());
+        }
+        let (clipped, _) = crate::tool::builtin::truncate_output(&output, keep);
+        self.conversation.add_tool_message(clipped, id)?;
+        Ok(())
     }
 
     /// Run the ReAct loop until completion or termination.
     pub async fn run(&mut self, initial_prompt: String) -> Result<String, ReactError> {
-        // Add initial user message
+        // Expand @file mentions (and optional scan) into the user message
+        let initial_prompt = self.expand_prompt(&initial_prompt).await;
         self.conversation
-            .add_user_message(initial_prompt.clone())
+            .add_user_message(initial_prompt)
             .context("failed to add initial prompt")?;
-
-        // Run selective context inclusion for the initial prompt
-        self.run_selective_context(&initial_prompt).await?;
 
         // Emit initial status
         self.emit_status().await;
@@ -614,6 +813,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                     self.iteration += 1;
                     // Take snapshot at loop boundary
                     self.take_boundary_snapshot().await?;
+                    self.maybe_start_background_compaction();
                     continue;
                 }
                 LoopDecision::Complete(result) => {
@@ -643,13 +843,11 @@ impl<M: Model + 'static> ReactLoop<M> {
         prompt: String,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
-        // Add user message to conversation
+        // Expand @file mentions (and optional scan) into the user message
+        let prompt = self.expand_prompt(&prompt).await;
         self.conversation
-            .add_user_message(prompt.clone())
+            .add_user_message(prompt)
             .context("failed to add user prompt")?;
-
-        // Run selective context inclusion to find relevant files
-        self.run_selective_context(&prompt).await?;
 
         // Emit status update
         self.emit_status().await;
@@ -668,9 +866,11 @@ impl<M: Model + 'static> ReactLoop<M> {
                 LoopDecision::Continue => {
                     self.iteration += 1;
                     self.take_boundary_snapshot().await?;
+                    self.maybe_start_background_compaction();
                 }
                 decision @ LoopDecision::Complete(_) => {
                     self.take_snapshot("Session complete").await?;
+                    self.maybe_start_background_compaction();
                     return Ok(decision);
                 }
                 decision @ LoopDecision::Stop(_) => return Ok(decision),
@@ -692,7 +892,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             });
         }
 
-        if self.conversation.warning_level() == crate::context::cap::ContextWarning::Warning {
+        if self.conversation.warning_level() != crate::context::WarningLevel::Ok {
             self.emit_log(
                 crate::events::LogLevel::Warn,
                 format!(
@@ -707,29 +907,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             .await;
         }
 
-        if let Some(compaction_manager) = &mut self.compaction_manager
-            && let Some(result) = compaction_manager
-                .maybe_compact(
-                    &*self.model,
-                    &mut self.conversation,
-                    CompactionTrigger::Auto,
-                )
-                .await
-                .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?
-        {
-            let compaction_event = CompactionEvent {
-                trigger: CompactionTrigger::Auto,
-                strategy: result.strategy_used.clone(),
-                tokens_before: result.tokens_before,
-                tokens_after: result.tokens_after,
-                messages_removed: result.messages_removed,
-                turns_summarized: result.turns_summarized,
-                native_provider: result.native_provider.clone(),
-                summary: result.summary.clone(),
-                ts: current_timestamp(),
-            };
-            self.emit_compaction(compaction_event).await;
-        }
+        self.auto_compact().await;
         Ok(())
     }
 
@@ -761,6 +939,12 @@ impl<M: Model + 'static> ReactLoop<M> {
                 response.thinking.clone(),
             )
             .context("failed to add assistant message")?;
+
+        // Anchor token estimates on what the provider actually counted.
+        if let Some(usage) = &response.usage {
+            self.conversation
+                .record_usage(usage.prompt_tokens, usage.completion_tokens);
+        }
 
         // Emit assistant message event
         self.emit_message(Message {
@@ -1202,7 +1386,10 @@ impl<M: Model + 'static> ReactLoop<M> {
                 format!("Context length exceeded; compacting and retrying: {error}"),
             )
             .await;
-            if matches!(self.compact_context().await, Ok(Some(_))) {
+            if matches!(
+                self.compact_with(CompactionTrigger::OverflowRecovery).await,
+                Ok(Some(_))
+            ) {
                 *messages = self.build_model_messages();
                 return Ok(true);
             }
@@ -1595,9 +1782,8 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Add a tool result to the conversation and emit its event.
     async fn record_tool_result(&mut self, result: ToolResult) -> Result<(), ReactError> {
-        self.conversation
-            .add_tool_message(result.output.clone(), result.id.clone())
-            .context("failed to add tool result")?;
+        self.add_tool_result_message(result.output.clone(), result.id.clone())
+            .await?;
         self.emit_tool_result(result).await;
         Ok(())
     }
@@ -1929,9 +2115,11 @@ impl<M: Model + 'static> ReactLoop<M> {
                     }
 
                     // Inject the sub-agent result into the parent conversation
-                    self.conversation
-                        .add_tool_message(result.result.output.clone(), result.result.id.clone())
-                        .context("failed to add sub-agent result to conversation")?;
+                    self.add_tool_result_message(
+                        result.result.output.clone(),
+                        result.result.id.clone(),
+                    )
+                    .await?;
 
                     // Emit tool result event for the sub-agent
                     self.emit_tool_result(result.result).await;

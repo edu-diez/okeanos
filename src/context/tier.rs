@@ -15,8 +15,6 @@ pub struct TierConfig {
     pub allowed_tools: HashSet<String>,
     /// Default generation parameters for this tier.
     pub generation_params: GenerationParams,
-    /// Maximum history turns to retain in context.
-    pub max_history_turns: usize,
     /// Selective context configuration.
     pub selective_context: SelectiveContextConfig,
     /// Whether to include thinking channel in context (replayed for frontier, not for small).
@@ -51,7 +49,6 @@ impl TierConfig {
                 stop_sequences: None,
                 top_p: Some(0.9),
             },
-            max_history_turns: 5,
             selective_context: SelectiveContextConfig {
                 max_files: 5,
                 max_tokens_per_file: 1000,
@@ -82,7 +79,6 @@ impl TierConfig {
                 stop_sequences: None,
                 top_p: Some(0.95),
             },
-            max_history_turns: 10,
             selective_context: SelectiveContextConfig {
                 max_files: 10,
                 max_tokens_per_file: 2000,
@@ -113,7 +109,6 @@ impl TierConfig {
                 stop_sequences: None,
                 top_p: Some(0.95),
             },
-            max_history_turns: 20,
             selective_context: SelectiveContextConfig {
                 max_files: 20,
                 max_tokens_per_file: 3000,
@@ -202,7 +197,6 @@ mod tests {
         assert!(!config.allows_tool("grep"));
         assert_eq!(config.generation_params.temperature, Some(0.2));
         assert_eq!(config.generation_params.max_tokens, Some(2048));
-        assert_eq!(config.max_history_turns, 5);
         assert!(!config.replay_thinking);
     }
 
@@ -219,7 +213,6 @@ mod tests {
         assert!(config.allows_tool("grep"));
         assert_eq!(config.generation_params.temperature, Some(0.5));
         assert_eq!(config.generation_params.max_tokens, Some(4096));
-        assert_eq!(config.max_history_turns, 10);
         assert!(!config.replay_thinking);
     }
 
@@ -236,7 +229,6 @@ mod tests {
         assert!(config.allows_tool("grep"));
         assert_eq!(config.generation_params.temperature, Some(0.7));
         assert_eq!(config.generation_params.max_tokens, Some(8192));
-        assert_eq!(config.max_history_turns, 20);
         assert!(config.replay_thinking);
     }
 

@@ -4,6 +4,9 @@
 //! with native tool calling, streaming via SSE, error mapping to
 //! [`ModelError`] variants, and cost estimation.
 
+use crate::context::compaction::{
+    CompactionCheckpoint, NativeCompactionRequest, NativeCompactionResponse,
+};
 use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
@@ -121,6 +124,15 @@ struct AnthropicUsage {
     cache_read_input_tokens: Option<usize>,
 }
 
+impl AnthropicUsage {
+    /// Total prompt size: Anthropic reports cached tokens separately from `input_tokens`.
+    fn total_input(&self) -> usize {
+        self.input_tokens
+            + self.cache_creation_input_tokens.unwrap_or(0)
+            + self.cache_read_input_tokens.unwrap_or(0)
+    }
+}
+
 /// Anthropic API error response.
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
@@ -207,7 +219,12 @@ pub struct AnthropicModel {
     model_id: String,
     capabilities: ModelCapabilities,
     pricing: Option<ModelPricing>,
+    /// Set once the endpoint rejects on-demand compaction so we stop retrying it.
+    native_compaction_unsupported: std::sync::atomic::AtomicBool,
 }
+
+/// Beta header for Anthropic's on-demand (server-side) compaction.
+const COMPACTION_BETA: &str = "compact-2026-09-04";
 
 impl AnthropicModel {
     /// Create a new Anthropic model provider.
@@ -226,7 +243,58 @@ impl AnthropicModel {
             model_id: model_id.to_string(),
             capabilities,
             pricing,
+            native_compaction_unsupported: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Build the on-demand compaction request body: the conversation as-is plus
+    /// `compaction: {type: summarize}`. Fields the API rejects on this call are removed.
+    fn compaction_body(&self, request: &NativeCompactionRequest) -> Value {
+        let params = GenerationParams {
+            max_tokens: Some(8192),
+            ..Default::default()
+        };
+        let tools = (!request.tools.is_empty()).then_some(request.tools.as_slice());
+        let mut messages = Vec::with_capacity(request.messages.len() + 1);
+        if !request.system_prompt.is_empty() {
+            messages.push(ModelMessage {
+                role: ModelRole::System,
+                content: request.system_prompt.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                thinking: None,
+            });
+        }
+        messages.extend(request.messages.iter().cloned());
+        let mut body = Self::request_body(&self.build_request(&messages, &params, tools, false));
+        if let Some(obj) = body.as_object_mut() {
+            for key in [
+                "stream",
+                "tool_choice",
+                "stop_sequences",
+                "temperature",
+                "top_p",
+            ] {
+                obj.remove(key);
+            }
+            obj.insert(
+                "compaction".into(),
+                serde_json::json!({"type": "summarize"}),
+            );
+        }
+        body
+    }
+
+    /// Extract the readable summary from a compaction response.
+    fn parse_compaction_summary(body: &Value) -> Option<String> {
+        body.get("content")?
+            .as_array()?
+            .iter()
+            .find(|b| b.get("type").and_then(Value::as_str) == Some("compaction"))?
+            .get("content")?
+            .as_str()
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
     }
 
     /// Returns the per-model pricing, if available.
@@ -296,7 +364,10 @@ impl AnthropicModel {
         for msg in messages {
             match msg.role {
                 ModelRole::System => {
-                    system_prompt = Some(msg.content.clone());
+                    system_prompt = Some(match system_prompt.take() {
+                        Some(prev) => format!("{prev}\n\n{}", msg.content),
+                        None => msg.content.clone(),
+                    });
                 }
                 ModelRole::User => {
                     anthropic_messages.push(AnthropicMessage {
@@ -405,9 +476,9 @@ impl AnthropicModel {
         }
 
         let usage = Some(Usage {
-            prompt_tokens: resp.usage.input_tokens,
+            prompt_tokens: resp.usage.total_input(),
             completion_tokens: resp.usage.output_tokens,
-            total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
+            total_tokens: resp.usage.total_input() + resp.usage.output_tokens,
         });
 
         ModelResponse {
@@ -472,6 +543,41 @@ impl AnthropicModel {
             tool_choice,
         }
     }
+
+    /// Serialize the request with prompt-cache breakpoints on the stable prefix
+    /// (system prompt, tool list) and on the newest message.
+    fn request_body(request: &AnthropicRequest) -> Value {
+        let mut body = serde_json::to_value(request).unwrap_or(Value::Null);
+        let ephemeral = || serde_json::json!({"type": "ephemeral"});
+
+        if let Some(Value::String(text)) = body.get("system").cloned() {
+            body["system"] = serde_json::json!([
+                {"type": "text", "text": text, "cache_control": ephemeral()}
+            ]);
+        }
+        if let Some(tool) = body
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+            .and_then(|t| t.last_mut())
+        {
+            tool["cache_control"] = ephemeral();
+        }
+        if let Some(block) = body
+            .get_mut("messages")
+            .and_then(Value::as_array_mut)
+            .and_then(|m| m.last_mut())
+            .and_then(|m| m.get_mut("content"))
+            .and_then(Value::as_array_mut)
+            .and_then(|c| c.last_mut())
+        {
+            // Thinking blocks cannot carry cache_control.
+            let ty = block.get("type").and_then(Value::as_str).unwrap_or("");
+            if !ty.contains("thinking") {
+                block["cache_control"] = ephemeral();
+            }
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -482,6 +588,74 @@ impl Model for AnthropicModel {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    async fn compact_native(
+        &self,
+        request: NativeCompactionRequest,
+    ) -> Result<Option<NativeCompactionResponse>, ModelError> {
+        use std::sync::atomic::Ordering;
+        if self.native_compaction_unsupported.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+
+        let body = self.compaction_body(&request);
+        let response = self
+            .client
+            .post(self.messages_url())
+            .header(header::AUTHORIZATION, self.bearer_auth())
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("anthropic-version", self.anthropic_version())
+            .header("anthropic-beta", COMPACTION_BETA)
+            .json(&body)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = response.status();
+        let text = response.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            // 4xx other than rate limiting means this model/endpoint lacks the beta.
+            if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS {
+                self.native_compaction_unsupported
+                    .store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+            return Err(Self::map_http_error(status, &text));
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            return Ok(None);
+        };
+        let Some(summary) = Self::parse_compaction_summary(&value) else {
+            return Ok(None);
+        };
+        let tokens_used = value
+            .pointer("/usage/iterations")
+            .and_then(Value::as_array)
+            .map(|its| {
+                its.iter()
+                    .map(|i| {
+                        i.get("input_tokens").and_then(Value::as_u64).unwrap_or(0)
+                            + i.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+                    })
+                    .sum::<u64>() as usize
+            })
+            .unwrap_or(0);
+
+        Ok(Some(NativeCompactionResponse {
+            checkpoint: CompactionCheckpoint::ClientSummary {
+                summary_message: ModelMessage {
+                    role: ModelRole::User,
+                    content: summary.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    thinking: None,
+                },
+            },
+            summary_text: summary,
+            tokens_used,
+        }))
     }
 
     async fn complete(
@@ -498,7 +672,7 @@ impl Model for AnthropicModel {
             .header(header::AUTHORIZATION, self.bearer_auth())
             .header(header::CONTENT_TYPE, "application/json")
             .header("anthropic-version", self.anthropic_version())
-            .json(&request)
+            .json(&Self::request_body(&request))
             .send()
             .await
             .map_err(Self::map_reqwest_error)?;
@@ -534,7 +708,7 @@ impl Model for AnthropicModel {
             .header(header::AUTHORIZATION, self.bearer_auth())
             .header(header::CONTENT_TYPE, "application/json")
             .header("anthropic-version", self.anthropic_version())
-            .json(&request)
+            .json(&Self::request_body(&request))
             .send()
             .await
             .map_err(Self::map_reqwest_error)?;
@@ -602,7 +776,7 @@ impl SseStream {
             "message_start" => {
                 self.message_started = true;
                 if let Some(msg) = chunk.message {
-                    self.input_tokens = msg.usage.input_tokens;
+                    self.input_tokens = msg.usage.total_input();
                     self.output_tokens = msg.usage.output_tokens;
                 }
                 None // Don't emit chunk for message_start
@@ -684,7 +858,7 @@ impl SseStream {
             "message_delta" => {
                 if let Some(usage) = chunk.usage {
                     if usage.input_tokens > 0 {
-                        self.input_tokens = usage.input_tokens;
+                        self.input_tokens = self.input_tokens.max(usage.total_input());
                     }
                     self.output_tokens = usage.output_tokens;
                 }
@@ -847,6 +1021,107 @@ mod tests {
     use super::*;
     use crate::model::model_trait::ModelTier;
 
+    #[test]
+    fn test_system_messages_are_joined() {
+        let msg = |role, content: &str| ModelMessage {
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: None,
+        };
+        let msgs = vec![
+            msg(ModelRole::System, "a"),
+            msg(ModelRole::System, "b"),
+            msg(ModelRole::User, "hi"),
+        ];
+        let (system, out) = AnthropicModel::to_anthropic_messages(&msgs);
+        assert_eq!(system.as_deref(), Some("a\n\nb"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_request_body_marks_cache_breakpoints() {
+        let model = AnthropicModel::new(
+            reqwest::Client::new(),
+            "https://api.anthropic.com",
+            "k",
+            "claude",
+            test_capabilities(),
+            None,
+        );
+        let msg = |role, content: &str| ModelMessage {
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: None,
+        };
+        let msgs = vec![msg(ModelRole::System, "sys"), msg(ModelRole::User, "hi")];
+        let tools = vec![ToolSpec::new(
+            "t",
+            "d",
+            serde_json::json!({"type": "object"}),
+        )];
+        let req = model.build_request(&msgs, &GenerationParams::default(), Some(&tools), false);
+        let body = AnthropicModel::request_body(&req);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn test_compaction_body_and_summary_parsing() {
+        let model = AnthropicModel::new(
+            reqwest::Client::new(),
+            "https://api.anthropic.com",
+            "k",
+            "claude",
+            test_capabilities(),
+            None,
+        );
+        let request = NativeCompactionRequest {
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: "hi".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                thinking: None,
+            }],
+            system_prompt: String::new(),
+            tools: Vec::new(),
+            keep_recent_tokens: 0,
+            trigger: crate::events::CompactionTrigger::Manual,
+        };
+        let body = model.compaction_body(&request);
+        assert_eq!(body["compaction"]["type"], "summarize");
+        assert!(body.get("stream").is_none() && body.get("tool_choice").is_none());
+
+        let resp = serde_json::json!({
+            "content": [{"type": "compaction", "content": "the summary", "signature": "sig"}],
+            "stop_reason": "compaction"
+        });
+        assert_eq!(
+            AnthropicModel::parse_compaction_summary(&resp).as_deref(),
+            Some("the summary")
+        );
+        let empty = serde_json::json!({"content": [{"type": "text", "text": "x"}]});
+        assert!(AnthropicModel::parse_compaction_summary(&empty).is_none());
+    }
+
+    #[test]
+    fn test_usage_total_includes_cache_tokens() {
+        let u = AnthropicUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: Some(20),
+            cache_read_input_tokens: Some(30),
+        };
+        assert_eq!(u.total_input(), 60);
+    }
     fn test_capabilities() -> ModelCapabilities {
         ModelCapabilities {
             tool_calling: true,

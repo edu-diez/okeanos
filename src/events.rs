@@ -236,7 +236,7 @@ pub struct CompactionEvent {
 }
 
 /// Trigger that initiated compaction.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     /// Automatic compaction at threshold.
@@ -259,9 +259,9 @@ pub enum CompactionStrategy {
     Agentic,
     /// Native provider compaction (OpenAI Responses, Anthropic).
     Native,
+    /// Old tool outputs cleared; nothing was summarized.
+    Prune,
 }
-
-/// Action taken on the configuration modal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigModalAction {

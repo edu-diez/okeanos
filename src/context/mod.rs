@@ -12,17 +12,19 @@ pub mod tier;
 pub mod tokens;
 pub mod warnings;
 
-pub use cap::{ContextCap, ContextCapError, ContextWarning};
+pub use cap::{ContextCap, ContextCapError};
 pub use compaction::{
     CompactionBudget, CompactionConfig, CompactionError, CompactionManager,
-    CompactionModelOverride, CompactionObserver, CompactionProvidersConfig, CompactionResult,
-    CompactionStrategyConfig, FileOperationSummary, NativeCompactionRequest,
-    NativeCompactionResponse, NoopCompactionObserver,
+    CompactionModelOverride, CompactionObserver, CompactionPlan, CompactionProvidersConfig,
+    CompactionResult, CompactionStrategyConfig, FileOperationSummary, NativeCompactionRequest,
+    NativeCompactionResponse, NoopCompactionObserver, summarize_plan,
 };
-pub use conversation::{Conversation, ConversationError, build_system_prompt, load_skills};
+pub use conversation::{
+    Conversation, ConversationError, PruneStats, build_system_prompt, load_skills,
+};
 pub use selective::{
     IncludedFile, SelectiveContextConfig, SelectiveContextError, build_file_context,
-    find_relevant_files,
+    expand_mentions, find_relevant_files,
 };
 pub use tier::{TierConfig, tool_subsets};
 pub use tokens::{

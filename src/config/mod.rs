@@ -372,9 +372,20 @@ pub struct CompactionSection {
     /// Per-provider native compaction settings
     #[serde(default)]
     pub providers: CompactionProvidersSection,
-    /// Per-model strategy overrides
+    /// Per-model strategy overrides (keyed by model id, or by tier name)
     #[serde(default)]
     pub model_overrides: std::collections::HashMap<String, CompactionModelOverride>,
+    /// Tokens kept free for the next response; compaction triggers at `max - reserve`
+    /// unless `trigger_ratio` is set (default: 16384, capped at a quarter of the window)
+    pub reserve_tokens: Option<usize>,
+    /// Clear old tool outputs before summarizing (default: true)
+    pub prune_tool_results: Option<bool>,
+    /// Most-recent tool output tokens that pruning never touches (default: 40000)
+    pub prune_protect_tokens: Option<usize>,
+    /// Pruning only happens when it frees at least this many tokens (default: 10000)
+    pub prune_min_savings_tokens: Option<usize>,
+    /// Pre-compute summaries in the background before the limit is hit (default: true)
+    pub background: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

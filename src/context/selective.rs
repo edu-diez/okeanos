@@ -21,11 +21,15 @@ pub struct SelectiveContextConfig {
     pub exclude_patterns: Vec<String>,
     /// Whether to follow symlinks.
     pub follow_symlinks: bool,
+    /// Scan the project for files matching the prompt's terms. Off by default:
+    /// it is slow on large trees and guesses; explicit `@path` mentions are always expanded.
+    pub auto_scan: bool,
 }
 
 impl Default for SelectiveContextConfig {
     fn default() -> Self {
         Self {
+            auto_scan: false,
             max_files: 10,
             max_tokens_per_file: 2000,
             include_patterns: vec![
@@ -254,7 +258,7 @@ pub fn find_relevant_files(
     let mut file_scores: std::collections::HashMap<PathBuf, (f64, Vec<String>)> =
         std::collections::HashMap::new();
 
-    // Walk the project directory
+    // Walk the project directory (exclusions are applied while walking)
     walk_dir(
         project_root,
         project_root,
@@ -263,48 +267,29 @@ pub fn find_relevant_files(
         &mut file_scores,
     )?;
 
-    // Convert scored files to IncludedFile
+    // Deterministic ranking: score desc, then path
+    let mut ranked: Vec<(PathBuf, f64, Vec<String>)> = file_scores
+        .into_iter()
+        .map(|(p, (s, r))| (p, s, r))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    // Only the top files are read a second time
     let mut results = Vec::new();
-
-    for (path, (score, reasons)) in file_scores {
-        // Check exclude patterns
+    for (path, score, reasons) in ranked {
+        if results.len() >= config.max_files {
+            break;
+        }
         let rel_path = path.strip_prefix(project_root).unwrap_or(&path);
-        let rel_str = rel_path.to_string_lossy();
-
-        let excluded = config
-            .exclude_patterns
-            .iter()
-            .any(|pat| glob_match(pat, &rel_str));
-
-        if excluded {
+        let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
-        }
-
-        // Check include patterns
-        let included = config
-            .include_patterns
-            .iter()
-            .any(|pat| glob_match(pat, &rel_str));
-
-        if !included {
-            continue;
-        }
-
-        // Read file content
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| SelectiveContextError::IoRead {
-                path: path.clone(),
-                source: e,
-            })?;
-
-        // Truncate to max tokens
-        let tokens = token_counter.count(&content);
-        let truncated_content = if tokens > config.max_tokens_per_file {
-            truncate_to_tokens(&content, config.max_tokens_per_file, token_counter)
-        } else {
-            content
         };
-
+        let truncated_content =
+            truncate_to_tokens(&content, config.max_tokens_per_file, token_counter);
         let final_tokens = token_counter.count(&truncated_content);
 
         results.push(IncludedFile {
@@ -312,21 +297,79 @@ pub fn find_relevant_files(
             content: truncated_content,
             tokens: final_tokens,
             score,
-            match_reasons: reasons.into_iter().take(5).collect(), // Limit reasons
+            match_reasons: reasons.into_iter().take(5).collect(),
         });
     }
 
-    // Sort by score descending
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Limit to max_files
-    results.truncate(config.max_files);
-
     Ok(results)
+}
+
+/// Extract `@path` mentions from a prompt (e.g. `look at @src/main.rs`).
+pub fn extract_mentions(prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, _) in prompt.match_indices('@') {
+        // Must start a token, so emails and `a@b` are ignored
+        if prompt[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace() && !"([\"'`".contains(c))
+        {
+            continue;
+        }
+        let rest = &prompt[i + 1..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\'' | '`' | ','))
+            .unwrap_or(rest.len());
+        let token = rest[..end].trim_end_matches(['.', ':', ';', '?', '!']);
+        if token.is_empty() || !(token.contains('/') || token.contains('\\') || token.contains('.'))
+        {
+            continue;
+        }
+        if !out.iter().any(|t| t == token) {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+/// Read files explicitly mentioned with `@path` in the prompt.
+///
+/// Paths are resolved under `project_root`; anything that escapes it, is not a
+/// regular file, or is not valid UTF-8 is skipped.
+pub fn expand_mentions(
+    project_root: &Path,
+    prompt: &str,
+    config: &SelectiveContextConfig,
+    token_counter: &TokenCounter,
+) -> Vec<IncludedFile> {
+    let Ok(root) = project_root.canonicalize() else {
+        return Vec::new();
+    };
+    let mut results = Vec::new();
+    for mention in extract_mentions(prompt) {
+        if results.len() >= config.max_files {
+            break;
+        }
+        let Ok(full) = root.join(&mention).canonicalize() else {
+            continue;
+        };
+        if !full.starts_with(&root) || !full.is_file() {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        let content = truncate_to_tokens(&content, config.max_tokens_per_file, token_counter);
+        let tokens = token_counter.count(&content);
+        results.push(IncludedFile {
+            path: full.strip_prefix(&root).unwrap_or(&full).to_path_buf(),
+            content,
+            tokens,
+            score: 1.0,
+            match_reasons: vec![format!("mentioned: @{mention}")],
+        });
+    }
+    results
 }
 
 /// Recursively walk directory and score files.
@@ -353,7 +396,11 @@ fn walk_dir(
 
         // Check exclude patterns early
         let rel_path = path.strip_prefix(root).unwrap_or(&path);
-        let rel_str = rel_path.to_string_lossy();
+        let mut rel_str = rel_path.to_string_lossy().replace('\\', "/");
+        let is_dir = path.is_dir();
+        if is_dir {
+            rel_str.push('/');
+        }
 
         let excluded = config
             .exclude_patterns
@@ -364,7 +411,7 @@ fn walk_dir(
             continue;
         }
 
-        if path.is_dir() {
+        if is_dir {
             // Check if we should follow symlinks
             if !config.follow_symlinks && is_symlink(&path) {
                 continue;
@@ -382,11 +429,10 @@ fn walk_dir(
             }
 
             // Read and score file
-            let content =
-                std::fs::read_to_string(&path).map_err(|e| SelectiveContextError::IoRead {
-                    path: path.clone(),
-                    source: e,
-                })?;
+            // Binary or unreadable files are simply not candidates
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
 
             let mut score = 0.0;
             let mut reasons = Vec::new();
@@ -444,19 +490,22 @@ fn truncate_to_tokens(content: &str, max_tokens: usize, _token_counter: &TokenCo
         return content.to_string();
     }
 
-    // Take head and tail
-    let head_chars = max_chars / 2;
-    let tail_chars = max_chars - head_chars;
-
-    let head = &content[..head_chars.min(content.len())];
-    let tail_start = content.len().saturating_sub(tail_chars);
-    let tail = &content[tail_start..];
+    // Take head and tail, snapped to UTF-8 boundaries
+    let mut head_end = (max_chars / 2).min(content.len());
+    while !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = content.len().saturating_sub(max_chars - max_chars / 2);
+    while !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let tail_start = tail_start.max(head_end);
 
     format!(
-        "{}...[truncated {} chars]...{}",
-        head,
-        content.len() - head_chars - tail_chars,
-        tail
+        "{}...[truncated {} bytes]...{}",
+        &content[..head_end],
+        tail_start - head_end,
+        &content[tail_start..]
     )
 }
 
@@ -570,6 +619,7 @@ mod tests {
             include_patterns: vec!["*.rs".to_string()],
             exclude_patterns: vec!["target/".to_string()],
             follow_symlinks: false,
+            auto_scan: true,
         };
 
         let counter = TokenCounter;
@@ -589,6 +639,50 @@ mod tests {
                 .iter()
                 .any(|f| f.path.to_string_lossy().contains("target"))
         );
+    }
+
+    #[test]
+    fn test_truncate_is_utf8_safe() {
+        let counter = TokenCounter;
+        let text = "é".repeat(5000);
+        let out = truncate_to_tokens(&text, 100, &counter);
+        assert!(out.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_extract_mentions() {
+        let m = extract_mentions("fix @src/main.rs, and (@lib.rs). mail a@b.com @user");
+        assert_eq!(m, vec!["src/main.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn test_expand_mentions_stays_in_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("proj");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("a.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("secret.txt"), "nope").unwrap();
+
+        let config = SelectiveContextConfig::default();
+        let files = expand_mentions(
+            &root,
+            "see @src/a.rs and @../secret.txt",
+            &config,
+            &TokenCounter,
+        );
+        assert_eq!(files.len(), 1);
+        assert!(files[0].content.contains("fn a()"));
+    }
+
+    #[test]
+    fn test_scan_excludes_dirs_with_windows_separators() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target").join("x.rs"), "fn login() {}").unwrap();
+        let config = SelectiveContextConfig::default();
+        let files = find_relevant_files(root, "login function", &config, &TokenCounter).unwrap();
+        assert!(files.is_empty());
     }
 
     #[test]

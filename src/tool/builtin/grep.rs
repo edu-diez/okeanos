@@ -3,7 +3,7 @@
 //! Category: Read (no approval required).
 //! Output is truncated to MAX_OUTPUT_BYTES with head/tail overflow indicator.
 
-use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output};
+use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output_with_spill};
 use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
 use async_trait::async_trait;
 use regex::Regex;
@@ -78,7 +78,7 @@ impl Tool for GrepTool {
             results.join("\n")
         };
 
-        let (output, truncated) = truncate_output(&output, MAX_OUTPUT_BYTES);
+        let (output, truncated) = truncate_output_with_spill(&output, MAX_OUTPUT_BYTES);
 
         Ok(ToolExecutionResult {
             output,

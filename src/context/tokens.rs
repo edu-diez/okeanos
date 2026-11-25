@@ -31,6 +31,18 @@ impl TokenCounter {
         role_tokens + self.count(content)
     }
 
+    /// Estimate tokens for a full conversation message, including the tool-call
+    /// names and arguments that are sent to the provider alongside the content.
+    pub fn count_event_message(&self, msg: &crate::events::Message) -> usize {
+        let mut tokens = self.count_message(&msg.role.to_string(), &msg.content);
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                tokens += self.count(&call.name) + self.count(&call.args.to_string());
+            }
+        }
+        tokens
+    }
+
     /// Estimate tokens for a list of messages.
     pub fn count_messages(&self, messages: &[(String, String)]) -> usize {
         messages

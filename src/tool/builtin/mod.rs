@@ -60,9 +60,57 @@ pub fn truncate_output(output: &str, max_bytes: usize) -> (String, bool) {
     )
 }
 
+/// Like [`truncate_output`], but when truncation occurs the full output is
+/// saved to a temp file and its path is appended so the model can `grep` it
+/// instead of re-running the command. Spill failures are silently ignored.
+pub fn truncate_output_with_spill(output: &str, max_bytes: usize) -> (String, bool) {
+    let (mut text, truncated) = truncate_output(output, max_bytes);
+    if truncated && let Some(path) = spill_output(output) {
+        text.push_str(&format!(
+            "\n[full output saved to {}; use grep on it to search]",
+            path.display()
+        ));
+    }
+    (text, truncated)
+}
+
+fn spill_output(output: &str) -> Option<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = std::env::temp_dir().join("okeanos").join("tool-output");
+    std::fs::create_dir_all(&dir).ok()?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{}-{nanos}-{n}.txt", std::process::id()));
+    std::fs::write(&path, output).ok()?;
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_spill_saves_full_output_and_notes_path() {
+        let input = "x".repeat(500);
+        let (result, truncated) = truncate_output_with_spill(&input, 100);
+        assert!(truncated);
+        let path = result
+            .split("saved to ")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), input);
+        let _ = std::fs::remove_file(path);
+
+        let (small, truncated) = truncate_output_with_spill("hi", 100);
+        assert!(!truncated);
+        assert_eq!(small, "hi");
+    }
 
     #[test]
     fn test_truncate_output_under_limit() {

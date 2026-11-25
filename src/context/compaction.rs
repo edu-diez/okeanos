@@ -1,28 +1,59 @@
-//! Context compaction / summarization for long sessions.
+//! Context compaction for long sessions.
 //!
-//! Provides two strategies:
-//! - **Basic**: Deterministic truncation with dropped-work summaries (tool signatures, file ops).
-//! - **Agentic**: LLM-based structured summarization with file operation tracking.
-//! - **Native**: Delegation to provider compaction endpoints (OpenAI Responses, Anthropic).
+//! Pipeline, cheapest first:
+//! 1. **Prune**: clear old tool outputs (no model call, no information about
+//!    decisions is lost, only raw output that can be re-fetched).
+//! 2. **Native**: provider-side compaction, if the model offers it.
+//! 3. **Agentic**: LLM summary that updates the previous summary iteratively.
+//! 4. **Basic**: deterministic summary (user requests, files, tool activity).
+//!
+//! Compaction replaces everything before a cut point with one summary message
+//! and keeps the recent tail verbatim. The cut never separates a tool result
+//! from the assistant message that requested it.
+//!
+//! Work is split into `plan` (owned snapshot), `summarize_plan` (async, no
+//! borrows on the conversation) and `apply_plan`, so a summary can be
+//! computed in the background while the conversation keeps going.
 
 use crate::context::tokens::TokenCounter;
 use crate::context::{Conversation, ConversationError};
-use crate::events::{CompactionEvent, CompactionStrategy, CompactionTrigger};
+use crate::events::{CompactionEvent, CompactionStrategy, CompactionTrigger, Message, MessageRole};
 use crate::model::{Model, ModelCapabilities, ModelError, ModelMessage, ModelRole, ModelTier};
 use crate::session::header::current_timestamp;
+use crate::tool::builtin::truncate_output;
 use crate::tool::tool_trait::ToolSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use thiserror::Error;
+
+/// Opening tag of the summary message that replaces compacted history.
+pub const SUMMARY_OPEN: &str = "<context_summary>";
+const SUMMARY_CLOSE: &str = "</context_summary>";
+/// Separates the model-written (or deterministic) body from the sections that
+/// are regenerated on every compaction (todos, recent files).
+const LIVE_STATE_DELIM: &str = "<!-- live-state -->";
+
+const MAX_USER_REQUESTS: usize = 12;
+const MAX_REINJECTED_FILE_CHARS: usize = 4000;
+const MIN_WINDOW_FOR_REINJECT: usize = 32_768;
+const TOOL_RESULT_RENDER_CHARS: usize = 1500;
+const MESSAGE_RENDER_CHARS: usize = 6000;
+const TOOL_ARGS_RENDER_CHARS: usize = 400;
 
 /// Compaction configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CompactionConfig {
     /// Enable compaction.
     pub enabled: bool,
-    /// Trigger ratio: compact when context reaches this fraction of the cap (default: 0.75).
-    pub trigger_ratio: f32,
-    /// Target ratio: compact down to this fraction of the cap (default: 0.5).
+    /// Compact when context reaches this fraction of the window. When unset,
+    /// compaction triggers at `window - reserve_tokens`.
+    pub trigger_ratio: Option<f32>,
+    /// Tokens kept free for the next response (default: 16384; capped at a
+    /// quarter of the window).
+    pub reserve_tokens: usize,
+    /// Target ratio: compact down to this fraction of the window (default: 0.5).
     pub target_ratio: f32,
     /// Number of recent tokens to preserve verbatim (default: 15000).
     pub preserve_recent_tokens: usize,
@@ -32,22 +63,100 @@ pub struct CompactionConfig {
     pub summarizer_model: Option<String>,
     /// Per-provider native compaction settings.
     pub providers: CompactionProvidersConfig,
-    /// Per-model strategy overrides.
+    /// Per-model strategy overrides (keyed by model id, falling back to tier name).
     pub model_overrides: HashMap<String, CompactionModelOverride>,
+    /// Clear old tool outputs before summarizing.
+    pub prune_tool_results: bool,
+    /// Most recent tool-output tokens that pruning never touches.
+    pub prune_protect_tokens: usize,
+    /// Pruning only happens if it frees at least this many tokens.
+    pub prune_min_savings_tokens: usize,
+    /// Pre-compute agentic summaries in the background.
+    pub background: bool,
+    /// Number of recently touched files whose current contents are re-injected
+    /// after compaction.
+    pub recent_file_reinject: usize,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            trigger_ratio: 0.75,
+            trigger_ratio: None,
+            reserve_tokens: 16_384,
             target_ratio: 0.5,
-            preserve_recent_tokens: 15000,
+            preserve_recent_tokens: 15_000,
             strategy: CompactionStrategyConfig::Auto,
             summarizer_model: None,
             providers: CompactionProvidersConfig::default(),
             model_overrides: HashMap::new(),
+            prune_tool_results: true,
+            prune_protect_tokens: 40_000,
+            prune_min_savings_tokens: 10_000,
+            background: true,
+            recent_file_reinject: 3,
         }
+    }
+}
+
+impl CompactionConfig {
+    /// Build the runtime config from the (optional) `[compaction]` config section.
+    pub fn from_section(section: Option<&crate::config::CompactionSection>) -> Self {
+        let mut c = Self::default();
+        let Some(s) = section else {
+            return c;
+        };
+        if let Some(v) = s.enabled {
+            c.enabled = v;
+        }
+        c.trigger_ratio = s.trigger_ratio;
+        if let Some(v) = s.target_ratio {
+            c.target_ratio = v;
+        }
+        if let Some(v) = s.preserve_recent_tokens {
+            c.preserve_recent_tokens = v;
+        }
+        if let Some(v) = s.reserve_tokens {
+            c.reserve_tokens = v;
+        }
+        if let Some(v) = s.strategy.as_deref().and_then(|s| s.parse().ok()) {
+            c.strategy = v;
+        }
+        c.summarizer_model = s.summarizer_model.clone();
+        if let Some(v) = s.prune_tool_results {
+            c.prune_tool_results = v;
+        }
+        if let Some(v) = s.prune_protect_tokens {
+            c.prune_protect_tokens = v;
+        }
+        if let Some(v) = s.prune_min_savings_tokens {
+            c.prune_min_savings_tokens = v;
+        }
+        if let Some(v) = s.background {
+            c.background = v;
+        }
+        if let Some(v) = s.providers.openai_responses.native_enabled {
+            c.providers.openai_responses.native_enabled = v;
+        }
+        if let Some(v) = &s.providers.openai_responses.native_version {
+            c.providers.openai_responses.native_version = v.clone();
+        }
+        if let Some(v) = s.providers.anthropic.native_enabled {
+            c.providers.anthropic.native_enabled = v;
+        }
+        if let Some(v) = &s.providers.anthropic.compaction_type {
+            c.providers.anthropic.compaction_type = v.clone();
+        }
+        for (name, o) in &s.model_overrides {
+            c.model_overrides.insert(
+                name.clone(),
+                CompactionModelOverride {
+                    strategy: o.strategy.as_deref().and_then(|s| s.parse().ok()),
+                    preserve_recent_tokens: o.preserve_recent_tokens,
+                },
+            );
+        }
+        c
     }
 }
 
@@ -55,7 +164,7 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CompactionStrategyConfig {
-    /// Deterministic: keep head + tail, insert dropped-work summaries.
+    /// Deterministic summary: user requests, files, tool activity.
     Basic,
     /// LLM summarization with structured prompt.
     Agentic,
@@ -135,19 +244,33 @@ pub struct CompactionBudget {
     pub target_tokens: usize,
     /// Tokens to preserve in recent conversation (tail).
     pub preserve_recent_tokens: usize,
+    /// Recent tool-output tokens that pruning leaves alone.
+    pub prune_protect_tokens: usize,
+    /// Minimum savings for pruning to be worthwhile.
+    pub prune_min_savings: usize,
 }
 
 impl CompactionBudget {
     /// Create a budget from conversation cap and config.
+    ///
+    /// Every figure is clamped against the window so small-context models get
+    /// proportionate values instead of the large-model defaults.
     pub fn from_conversation(conv: &Conversation, config: &CompactionConfig) -> Self {
         let max_tokens = conv.cap().max_tokens;
-        let trigger_tokens = (max_tokens as f32 * config.trigger_ratio) as usize;
-        let target_tokens = (max_tokens as f32 * config.target_ratio) as usize;
+        let reserve = config.reserve_tokens.min(max_tokens / 4);
+        let trigger_tokens = match config.trigger_ratio {
+            Some(r) => (max_tokens as f32 * r) as usize,
+            None => max_tokens - reserve,
+        };
+        let target_tokens =
+            ((max_tokens as f32 * config.target_ratio) as usize).min(trigger_tokens * 9 / 10);
         Self {
             max_tokens,
             trigger_tokens,
             target_tokens,
-            preserve_recent_tokens: config.preserve_recent_tokens,
+            preserve_recent_tokens: config.preserve_recent_tokens.min(target_tokens / 2),
+            prune_protect_tokens: config.prune_protect_tokens.min(max_tokens / 4),
+            prune_min_savings: config.prune_min_savings_tokens.min(max_tokens / 16),
         }
     }
 
@@ -174,6 +297,8 @@ pub struct CompactionResult {
     pub summary: String,
     /// Whether native provider compaction was used.
     pub native_provider: Option<String>,
+    /// Set when a preferred strategy failed and a fallback was used.
+    pub warning: Option<String>,
 }
 
 /// Errors from compaction operations.
@@ -226,7 +351,7 @@ pub enum CompactionCheckpoint {
     ClientSummary { summary_message: ModelMessage },
 }
 
-/// Extract file operations from conversation messages.
+/// File operations seen in the conversation, ordered least to most recent.
 #[derive(Debug, Clone, Default)]
 pub struct FileOperationSummary {
     pub read_files: Vec<String>,
@@ -236,20 +361,22 @@ pub struct FileOperationSummary {
 impl FileOperationSummary {
     pub fn merge(&mut self, other: &FileOperationSummary) {
         for f in &other.read_files {
-            if !self.read_files.contains(f) {
-                self.read_files.push(f.clone());
-            }
+            touch(&mut self.read_files, f);
         }
         for f in &other.modified_files {
-            if !self.modified_files.contains(f) {
-                self.modified_files.push(f.clone());
-            }
+            touch(&mut self.modified_files, f);
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.read_files.is_empty() && self.modified_files.is_empty()
     }
+}
+
+/// Move `path` to the most-recent end of `list`.
+fn touch(list: &mut Vec<String>, path: &str) {
+    list.retain(|p| p != path);
+    list.push(path.to_string());
 }
 
 /// Trait for observing compaction events (extension point for M23/M27).
@@ -271,11 +398,39 @@ impl CompactionObserver for NoopCompactionObserver {
     }
 }
 
+/// Owned snapshot of everything needed to compute a summary without
+/// borrowing the conversation.
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    /// Index of the first message that is kept verbatim.
+    pub cut_index: usize,
+    /// Conversation generation the plan was made against.
+    pub generation: u64,
+    /// Messages that will be replaced by the summary.
+    pub head: Vec<Message>,
+    /// Body of the previous summary, if the head starts with one.
+    pub previous_summary: Option<String>,
+    /// Cumulative file operations including those in `head`.
+    pub file_ops: FileOperationSummary,
+    /// Cumulative user requests including those in `head`.
+    pub user_requests: Vec<String>,
+    /// Character budget for the summarizer input.
+    pub max_chars: usize,
+    /// Output token budget for the summary.
+    pub max_output_tokens: usize,
+}
+
 /// Main compaction manager.
 pub struct CompactionManager {
     config: CompactionConfig,
     token_counter: TokenCounter,
     observers: Vec<Box<dyn CompactionObserver>>,
+    /// File operations across all compactions so far.
+    file_ops: FileOperationSummary,
+    /// User requests across all compactions so far (most recent last).
+    user_requests: Vec<String>,
+    project_root: Option<PathBuf>,
+    todos: Option<String>,
 }
 
 impl CompactionManager {
@@ -285,6 +440,10 @@ impl CompactionManager {
             config,
             token_counter: TokenCounter,
             observers: Vec::new(),
+            file_ops: FileOperationSummary::default(),
+            user_requests: Vec::new(),
+            project_root: None,
+            todos: None,
         }
     }
 
@@ -293,25 +452,44 @@ impl CompactionManager {
         &self.config
     }
 
+    /// Root used to resolve relative paths when re-injecting recent files.
+    pub fn set_project_root(&mut self, root: Option<PathBuf>) {
+        self.project_root = root;
+    }
+
+    /// Current todo list (pre-formatted) to carry across compaction.
+    pub fn set_todos(&mut self, todos: Option<String>) {
+        self.todos = todos.filter(|t| !t.trim().is_empty());
+    }
+
     /// Register a compaction observer.
     pub fn register_observer(&mut self, observer: Box<dyn CompactionObserver>) {
         self.observers.push(observer);
     }
 
-    /// Resolve the effective strategy for a given model.
-    fn resolve_strategy(&self, capabilities: &ModelCapabilities) -> CompactionStrategyConfig {
-        // Check model-specific override
-        if let Some(override_) = self
+    /// Token count at which automatic compaction triggers.
+    pub fn trigger_tokens(&self, conversation: &Conversation) -> usize {
+        CompactionBudget::from_conversation(conversation, &self.config).trigger_tokens
+    }
+
+    /// Resolve the effective strategy: model-id override, then tier override,
+    /// then the configured strategy (with `auto` resolved by tier).
+    pub fn resolve_strategy(
+        &self,
+        model_id: &str,
+        capabilities: &ModelCapabilities,
+    ) -> CompactionStrategyConfig {
+        let overridden = self
             .config
             .model_overrides
-            .get(&capabilities.tier.to_string())
-            && let Some(s) = override_.strategy
-        {
-            return s;
-        }
-        // Check by model_id if available
-        // Note: capabilities doesn't have model_id, but we can check tier
-        match self.config.strategy {
+            .get(model_id)
+            .or_else(|| {
+                self.config
+                    .model_overrides
+                    .get(&capabilities.tier.to_string())
+            })
+            .and_then(|o| o.strategy);
+        match overridden.unwrap_or(self.config.strategy) {
             CompactionStrategyConfig::Auto => {
                 if capabilities.tier == ModelTier::Small {
                     CompactionStrategyConfig::Basic
@@ -323,478 +501,326 @@ impl CompactionManager {
         }
     }
 
-    /// Check if compaction is needed and perform it.
-    pub async fn maybe_compact<M: Model>(
+    fn budget(&self, conversation: &Conversation, model_id: &str) -> CompactionBudget {
+        let mut budget = CompactionBudget::from_conversation(conversation, &self.config);
+        let tier = conversation.capabilities().tier.to_string();
+        if let Some(p) = self
+            .config
+            .model_overrides
+            .get(model_id)
+            .or_else(|| self.config.model_overrides.get(&tier))
+            .and_then(|o| o.preserve_recent_tokens)
+        {
+            budget.preserve_recent_tokens = p.min(budget.target_tokens / 2);
+        }
+        budget
+    }
+
+    /// Compact if the conversation has reached the trigger threshold.
+    pub async fn maybe_compact<M: Model + ?Sized>(
         &mut self,
         model: &M,
         conversation: &mut Conversation,
         trigger: CompactionTrigger,
+    ) -> Result<Option<CompactionResult>, CompactionError> {
+        self.run(model, conversation, trigger, false).await
+    }
+
+    /// Compact regardless of the current token count (manual `/compact`,
+    /// overflow recovery).
+    pub async fn compact_now<M: Model + ?Sized>(
+        &mut self,
+        model: &M,
+        conversation: &mut Conversation,
+        trigger: CompactionTrigger,
+    ) -> Result<Option<CompactionResult>, CompactionError> {
+        self.run(model, conversation, trigger, true).await
+    }
+
+    async fn run<M: Model + ?Sized>(
+        &mut self,
+        model: &M,
+        conversation: &mut Conversation,
+        trigger: CompactionTrigger,
+        force: bool,
     ) -> Result<Option<CompactionResult>, CompactionError> {
         if !self.config.enabled {
             return Ok(None);
         }
-
-        let budget = CompactionBudget::from_conversation(conversation, &self.config);
-        if !budget.needs_compaction(conversation.estimated_tokens()) {
+        let budget = self.budget(conversation, model.model_id());
+        let tokens_before = conversation.estimated_tokens();
+        if !force && !budget.needs_compaction(tokens_before) {
             return Ok(None);
         }
 
-        let result = self.compact(model, conversation, trigger, &budget).await?;
+        // 1. Prune old tool output.
+        let mut prune_result = None;
+        if self.config.prune_tool_results
+            && let Some(stats) = conversation
+                .prune_tool_results(budget.prune_protect_tokens, budget.prune_min_savings)
+        {
+            let result = CompactionResult {
+                strategy_used: CompactionStrategy::Prune,
+                tokens_before,
+                tokens_after: conversation.estimated_tokens(),
+                messages_removed: 0,
+                turns_summarized: 0,
+                summary: format!(
+                    "Cleared {} old tool outputs (~{} tokens)",
+                    stats.messages_pruned, stats.tokens_saved
+                ),
+                native_provider: None,
+                warning: None,
+            };
+            if !force && !budget.needs_compaction(result.tokens_after) {
+                self.notify_observers(&result, trigger);
+                return Ok(Some(result));
+            }
+            prune_result = Some(result);
+        }
+
+        let Some(plan) = self.plan_with(conversation, &budget) else {
+            if let Some(r) = &prune_result {
+                self.notify_observers(r, trigger);
+            }
+            return Ok(prune_result);
+        };
+
+        // 2. Provider-native compaction (client-summary checkpoints only).
+        if let Some(body) = self
+            .try_native_compaction(model, &plan, &budget, trigger)
+            .await
+        {
+            let mut result = self.apply_plan(
+                conversation,
+                plan,
+                body,
+                CompactionStrategy::Native,
+                trigger,
+            )?;
+            result.tokens_before = tokens_before;
+            result.native_provider = Some(model.model_id().to_string());
+            return Ok(Some(result));
+        }
+
+        // 3./4. Agentic summary, falling back to deterministic.
+        let mut warning = None;
+        let (body, strategy) =
+            match self.resolve_strategy(model.model_id(), conversation.capabilities()) {
+                CompactionStrategyConfig::Basic => (basic_body(&plan), CompactionStrategy::Basic),
+                _ => match summarize_plan(model, &plan).await {
+                    Ok(body) => (body, CompactionStrategy::Agentic),
+                    Err(e) => {
+                        warning = Some(format!("agentic summary failed ({e}); used basic summary"));
+                        (basic_body(&plan), CompactionStrategy::Basic)
+                    }
+                },
+            };
+        let mut result = self.apply_plan(conversation, plan, body, strategy, trigger)?;
+        result.tokens_before = tokens_before;
+        result.warning = warning;
         Ok(Some(result))
     }
 
-    /// Perform compaction with the resolved strategy.
-    async fn compact<M: Model>(
-        &mut self,
-        model: &M,
-        conversation: &mut Conversation,
-        trigger: CompactionTrigger,
-        budget: &CompactionBudget,
-    ) -> Result<CompactionResult, CompactionError> {
-        let _tokens_before = conversation.estimated_tokens();
-        let strategy_config = self.resolve_strategy(conversation.capabilities());
+    /// Plan a compaction for the current conversation, if there is anything to compact.
+    pub fn plan(&self, conversation: &Conversation, model_id: &str) -> Option<CompactionPlan> {
+        self.plan_with(conversation, &self.budget(conversation, model_id))
+    }
 
-        // Try native compaction first if available and appropriate
-        if matches!(
-            trigger,
-            CompactionTrigger::Auto | CompactionTrigger::OverflowRecovery
-        ) && let Some(native_result) = self
-            .try_native_compaction(model, conversation, budget)
-            .await?
-        {
-            self.notify_observers(&native_result);
-            return Ok(native_result);
+    /// Plan a background summary when the conversation is approaching (but has
+    /// not reached) the trigger and the resolved strategy is agentic.
+    pub fn plan_background(
+        &self,
+        conversation: &Conversation,
+        model_id: &str,
+    ) -> Option<CompactionPlan> {
+        if !self.config.enabled || !self.config.background {
+            return None;
         }
+        if self.resolve_strategy(model_id, conversation.capabilities())
+            != CompactionStrategyConfig::Agentic
+        {
+            return None;
+        }
+        let budget = self.budget(conversation, model_id);
+        let tokens = conversation.estimated_tokens();
+        if tokens >= budget.trigger_tokens || tokens < budget.trigger_tokens * 85 / 100 {
+            return None;
+        }
+        self.plan_with(conversation, &budget)
+    }
 
-        // Fallback to client-side compaction
-        let result = match strategy_config {
-            CompactionStrategyConfig::Basic => {
-                self.basic_compaction(conversation, budget, trigger).await?
+    fn plan_with(
+        &self,
+        conversation: &Conversation,
+        budget: &CompactionBudget,
+    ) -> Option<CompactionPlan> {
+        let messages = conversation.messages();
+        let cut = find_cut(
+            messages,
+            budget.preserve_recent_tokens,
+            conversation.calibration_ratio(),
+            &self.token_counter,
+        )?;
+        let head = messages[..cut].to_vec();
+
+        let mut file_ops = self.file_ops.clone();
+        file_ops.merge(&extract_file_ops(&head));
+        let mut user_requests = self.user_requests.clone();
+        for m in &head {
+            if m.role == MessageRole::User && !is_summary_message(m) {
+                user_requests.push(clip(m.content.trim(), 400));
             }
-            CompactionStrategyConfig::Agentic => {
-                self.agentic_compaction(model, conversation, budget, trigger)
-                    .await?
-            }
-            CompactionStrategyConfig::Auto => unreachable!("Auto should be resolved"),
+        }
+        let excess = user_requests.len().saturating_sub(MAX_USER_REQUESTS);
+        user_requests.drain(..excess);
+
+        let max_output = conversation.capabilities().max_output.clamp(1024, 8192);
+        Some(CompactionPlan {
+            cut_index: cut,
+            generation: conversation.generation(),
+            previous_summary: head.first().and_then(previous_summary_body),
+            head,
+            file_ops,
+            user_requests,
+            max_chars: budget.max_tokens * 3,
+            max_output_tokens: max_output,
+        })
+    }
+
+    /// Replace the plan's head with a summary message, keeping the tail.
+    ///
+    /// Fails if the conversation was rewritten since the plan was made.
+    pub fn apply_plan(
+        &mut self,
+        conversation: &mut Conversation,
+        plan: CompactionPlan,
+        body: String,
+        strategy: CompactionStrategy,
+        trigger: CompactionTrigger,
+    ) -> Result<CompactionResult, CompactionError> {
+        if conversation.generation() != plan.generation
+            || plan.cut_index > conversation.message_count()
+        {
+            return Err(CompactionError::Failed(
+                "conversation changed while compacting".into(),
+            ));
+        }
+        let tokens_before = conversation.estimated_tokens();
+        self.file_ops = plan.file_ops;
+        self.user_requests = plan.user_requests;
+
+        let live = self.live_state(conversation);
+        let mut new_messages = vec![Message {
+            role: MessageRole::User,
+            content: format_summary_message(&body, &live),
+            tool_calls: None,
+            tool_call_id: None,
+            ts: current_timestamp(),
+            thinking: None,
+        }];
+        new_messages.extend(conversation.messages()[plan.cut_index..].iter().cloned());
+        conversation.replace_messages(new_messages);
+
+        let result = CompactionResult {
+            strategy_used: strategy,
+            tokens_before,
+            tokens_after: conversation.estimated_tokens(),
+            messages_removed: plan.cut_index,
+            turns_summarized: plan
+                .head
+                .iter()
+                .filter(|m| m.role == MessageRole::User && !is_summary_message(m))
+                .count(),
+            summary: body,
+            native_provider: None,
+            warning: None,
         };
-
-        self.notify_observers(&result);
+        self.notify_observers(&result, trigger);
         Ok(result)
     }
 
-    /// Try native provider compaction.
-    async fn try_native_compaction<M: Model>(
-        &self,
-        _model: &M,
-        _conversation: &Conversation,
-        _budget: &CompactionBudget,
-    ) -> Result<Option<CompactionResult>, CompactionError> {
-        // Check if model supports native compaction
-        // We can't directly check native compaction support from ModelCapabilities yet
-        // This will be extended when providers implement the optional method
-        // For now, return None to use client-side compaction
-        Ok(None)
-    }
+    /// Sections regenerated from live state on every compaction.
+    fn live_state(&self, conversation: &Conversation) -> String {
+        let mut out = String::new();
+        if let Some(todos) = &self.todos {
+            out.push_str("## Todos\n");
+            out.push_str(todos.trim());
+            out.push_str("\n\n");
+        }
 
-    /// Basic deterministic compaction (Cline-inspired).
-    /// Keeps head (system prompt, skills, todos) + tail (recent turns),
-    /// inserts dropped-work summaries for the folded middle region.
-    async fn basic_compaction(
-        &self,
-        conversation: &mut Conversation,
-        budget: &CompactionBudget,
-        _trigger: CompactionTrigger,
-    ) -> Result<CompactionResult, CompactionError> {
-        let original_messages = conversation.messages().to_vec();
-        let original_count = original_messages.len();
-        let tokens_before = conversation.estimated_tokens();
-
-        // Calculate how many tokens we need to remove
-        let target_tokens = budget.target_tokens.min(budget.trigger_tokens);
-        let system_tokens = self
-            .token_counter
-            .count_message("system", conversation.system_prompt());
-        let file_tokens: usize = conversation.included_files().iter().map(|f| f.tokens).sum();
-        let available_for_history = target_tokens.saturating_sub(system_tokens + file_tokens);
-
-        // We need to keep: system prompt + skills + recent tokens (tail)
-        // Fold the middle region
-        let preserve_recent = budget.preserve_recent_tokens.min(available_for_history);
-
-        // Walk backwards from the end to find cut point
-        let mut tail_tokens = 0;
-        let mut cut_index = original_count;
-        for (i, msg) in original_messages.iter().enumerate().rev() {
-            let msg_tokens = self
-                .token_counter
-                .count_message(&msg.role.to_string(), &msg.content);
-            if tail_tokens + msg_tokens > preserve_recent {
-                break;
+        let n = self.config.recent_file_reinject;
+        if n > 0 && conversation.cap().max_tokens >= MIN_WINDOW_FOR_REINJECT {
+            let mut recent: Vec<&String> = Vec::new();
+            for p in self
+                .file_ops
+                .modified_files
+                .iter()
+                .rev()
+                .chain(self.file_ops.read_files.iter().rev())
+            {
+                if !recent.contains(&p) {
+                    recent.push(p);
+                }
             }
-            tail_tokens += msg_tokens;
-            cut_index = i;
+            let mut section = String::new();
+            let mut count = 0;
+            for path in recent {
+                if count >= n {
+                    break;
+                }
+                let full = match &self.project_root {
+                    Some(root) => root.join(path),
+                    None => PathBuf::from(path),
+                };
+                let Ok(content) = std::fs::read_to_string(&full) else {
+                    continue;
+                };
+                section.push_str(&format!(
+                    "### {path}\n```\n{}\n```\n",
+                    truncate_output(&content, MAX_REINJECTED_FILE_CHARS).0
+                ));
+                count += 1;
+            }
+            if !section.is_empty() {
+                out.push_str("## Recently touched files (current contents)\n");
+                out.push_str(&section);
+            }
         }
-
-        // If we can't cut (everything fits in preserve_recent), just return
-        if cut_index == 0 || cut_index >= original_count {
-            return Ok(CompactionResult {
-                strategy_used: CompactionStrategy::Basic,
-                tokens_before,
-                tokens_after: tokens_before,
-                messages_removed: 0,
-                turns_summarized: 0,
-                summary: "No compaction needed".to_string(),
-                native_provider: None,
-            });
-        }
-
-        // Extract file operations from the folded region
-        let file_ops = self.extract_file_ops(&original_messages[..cut_index]);
-
-        // Build dropped-work summary message
-        let dropped_summary =
-            self.build_dropped_work_summary(&original_messages[..cut_index], &file_ops, cut_index);
-
-        // Build new message list: dropped summary + tail
-        let mut new_messages = Vec::new();
-
-        // Add the dropped-work summary as a system message at the start of history
-        new_messages.push(crate::events::Message {
-            role: crate::events::MessageRole::System,
-            content: dropped_summary,
-            tool_calls: None,
-            tool_call_id: None,
-            ts: current_timestamp(),
-            thinking: None,
-        });
-
-        // Add the preserved tail messages
-        for msg in &original_messages[cut_index..] {
-            new_messages.push(msg.clone());
-        }
-
-        // Apply the new messages to the conversation
-        conversation.replace_messages(new_messages);
-        let tokens_after = conversation.estimated_tokens();
-
-        Ok(CompactionResult {
-            strategy_used: CompactionStrategy::Basic,
-            tokens_before,
-            tokens_after,
-            messages_removed: cut_index,
-            turns_summarized: cut_index / 2, // Approximate user-assistant pairs
-            summary: format!(
-                "Basic compaction: folded {} messages, preserved {} recent tokens",
-                cut_index, tail_tokens
-            ),
-            native_provider: None,
-        })
+        out
     }
 
-    /// Agentic LLM-based compaction (OpenCode/Codex-inspired).
-    /// Uses a (potentially cheaper) model to generate a structured summary.
-    async fn agentic_compaction<M: Model>(
+    /// Ask the provider to compact. Only checkpoints that can be replayed as
+    /// plain messages are accepted; provider-specific blobs are ignored.
+    async fn try_native_compaction<M: Model + ?Sized>(
         &self,
         model: &M,
-        conversation: &mut Conversation,
+        plan: &CompactionPlan,
         budget: &CompactionBudget,
-        _trigger: CompactionTrigger,
-    ) -> Result<CompactionResult, CompactionError> {
-        // Check if we have a summarizer model configured
-        let _summarizer_model_id = self
-            .config
-            .summarizer_model
-            .as_deref()
-            .ok_or(CompactionError::SummarizerNotConfigured)?;
-
-        // For now, we'll use the same model (in practice, you'd create a separate Model instance)
-        // This requires the summarizer to be accessible. We'll simulate by using the current model.
-
-        let original_messages = conversation.messages().to_vec();
-        let original_count = original_messages.len();
-        let tokens_before = conversation.estimated_tokens();
-
-        // Find cut index at preserve_recent_tokens boundary
-        let mut tail_tokens = 0;
-        let mut cut_index = original_count;
-        for (i, msg) in original_messages.iter().enumerate().rev() {
-            let msg_tokens = self
-                .token_counter
-                .count_message(&msg.role.to_string(), &msg.content);
-            if tail_tokens + msg_tokens > budget.preserve_recent_tokens {
-                break;
-            }
-            tail_tokens += msg_tokens;
-            cut_index = i;
-        }
-
-        if cut_index == 0 {
-            return Ok(CompactionResult {
-                strategy_used: CompactionStrategy::Agentic,
-                tokens_before,
-                tokens_after: tokens_before,
-                messages_removed: 0,
-                turns_summarized: 0,
-                summary: "No compaction needed".to_string(),
-                native_provider: None,
-            });
-        }
-
-        // Extract messages to summarize
-        let messages_to_summarize = &original_messages[..cut_index];
-
-        // Extract file operations
-        let file_ops = self.extract_file_ops(messages_to_summarize);
-
-        // Build summary request
-        let summary_request = self.build_summary_request(
-            messages_to_summarize,
-            &file_ops,
-            conversation.system_prompt(),
-        );
-
-        // Call the model to generate summary
-        // Note: In practice, you'd want a separate summarizer model instance.
-        // For now, we use the same model with a special prompt.
-        let summary_messages = vec![
-            ModelMessage {
-                role: ModelRole::System,
-                content: SUMMARIZER_SYSTEM_PROMPT.to_string(),
-                tool_calls: None,
-                tool_call_id: None,
-                thinking: None,
-            },
-            ModelMessage {
-                role: ModelRole::User,
-                content: summary_request,
-                tool_calls: None,
-                tool_call_id: None,
-                thinking: None,
-            },
-        ];
-
-        let generation_params = crate::model::GenerationParams {
-            temperature: Some(0.3),
-            max_tokens: Some(8192),
-            stop_sequences: None,
-            top_p: Some(0.9),
+        trigger: CompactionTrigger,
+    ) -> Option<String> {
+        let request = NativeCompactionRequest {
+            messages: plan.head.iter().map(to_model_message).collect(),
+            system_prompt: String::new(),
+            tools: Vec::new(),
+            keep_recent_tokens: budget.preserve_recent_tokens,
+            trigger,
         };
-
-        let response = model
-            .complete(&summary_messages, &generation_params, None)
-            .await
-            .map_err(CompactionError::Model)?;
-
-        let summary_text = response.content.trim().to_string();
-        if summary_text.is_empty() {
-            return Err(CompactionError::Failed(
-                "Summarizer returned empty summary".into(),
-            ));
+        match model.compact_native(request).await {
+            Ok(Some(NativeCompactionResponse {
+                checkpoint: CompactionCheckpoint::ClientSummary { summary_message },
+                ..
+            })) if !summary_message.content.trim().is_empty() => Some(summary_message.content),
+            _ => None,
         }
-
-        // Ensure Files section is present
-        let summary_text = self.ensure_files_section(&summary_text, &file_ops);
-
-        // Build summary message
-        let summary_message = crate::events::Message {
-            role: crate::events::MessageRole::System,
-            content: format!("Context summary:\n\n{}", summary_text),
-            tool_calls: None,
-            tool_call_id: None,
-            ts: current_timestamp(),
-            thinking: None,
-        };
-
-        // Build new message list: summary message + tail
-        let mut new_messages = Vec::new();
-        new_messages.push(summary_message);
-        for msg in &original_messages[cut_index..] {
-            new_messages.push(msg.clone());
-        }
-
-        // Apply the new messages to the conversation
-        conversation.replace_messages(new_messages);
-        let tokens_after = conversation.estimated_tokens();
-
-        Ok(CompactionResult {
-            strategy_used: CompactionStrategy::Agentic,
-            tokens_before,
-            tokens_after,
-            messages_removed: cut_index,
-            turns_summarized: cut_index / 2,
-            summary: summary_text,
-            native_provider: None,
-        })
     }
 
-    /// Extract file operations from a slice of messages.
-    fn extract_file_ops(&self, messages: &[crate::events::Message]) -> FileOperationSummary {
-        let mut ops = FileOperationSummary::default();
-        for msg in messages {
-            // Check tool calls for file operations
-            if let Some(tool_calls) = &msg.tool_calls {
-                for tc in tool_calls {
-                    match tc.name.as_str() {
-                        "read" => {
-                            if let Some(path) = tc.args.get("path").and_then(|v| v.as_str())
-                                && !ops.read_files.contains(&path.to_string())
-                            {
-                                ops.read_files.push(path.to_string());
-                            }
-                        }
-                        "write" | "edit" | "delete" => {
-                            if let Some(path) = tc.args.get("path").and_then(|v| v.as_str())
-                                && !ops.modified_files.contains(&path.to_string())
-                            {
-                                ops.modified_files.push(path.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    fn notify_observers(&self, result: &CompactionResult, trigger: CompactionTrigger) {
+        if self.observers.is_empty() {
+            return;
         }
-        ops
-    }
-
-    /// Build a dropped-work summary for basic compaction.
-    fn build_dropped_work_summary(
-        &self,
-        folded_messages: &[crate::events::Message],
-        file_ops: &FileOperationSummary,
-        _cut_index: usize,
-    ) -> String {
-        let mut parts = Vec::new();
-
-        parts.push(format!(
-            "<SYSTEM_NOTICE>\nEarlier context was compacted. Summary of {} messages (approx. {} turns) before the current conversation:\n",
-            folded_messages.len(),
-            folded_messages.len() / 2
-        ));
-
-        if !file_ops.read_files.is_empty() {
-            parts.push(format!("Files read: {}", file_ops.read_files.join(", ")));
-        }
-        if !file_ops.modified_files.is_empty() {
-            parts.push(format!(
-                "Files modified: {}",
-                file_ops.modified_files.join(", ")
-            ));
-        }
-
-        // Count tool calls
-        let mut tool_counts = HashMap::new();
-        for msg in folded_messages {
-            if let Some(tool_calls) = &msg.tool_calls {
-                for tc in tool_calls {
-                    *tool_counts.entry(tc.name.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        if !tool_counts.is_empty() {
-            let tool_summary: Vec<String> = tool_counts
-                .into_iter()
-                .map(|(name, count)| format!("{name} x{count}"))
-                .collect();
-            parts.push(format!("Tool calls: {}", tool_summary.join(", ")));
-        }
-
-        parts.push(
-            "Conversation from this point onward continues verbatim below.</SYSTEM_NOTICE>"
-                .to_string(),
-        );
-
-        parts.join("\n")
-    }
-
-    /// Build summary request for agentic compaction.
-    fn build_summary_request(
-        &self,
-        messages: &[crate::events::Message],
-        file_ops: &FileOperationSummary,
-        _system_prompt: &str,
-    ) -> String {
-        let mut parts = vec![
-            "Summarize this coding session for continuation. Be concise and factual.".to_string(),
-            "".to_string(),
-            "## Goal".to_string(),
-            "One sentence: what is being built or fixed.".to_string(),
-            "".to_string(),
-            "## State".to_string(),
-            "- Done: completed steps".to_string(),
-            "- In Progress: current work".to_string(),
-            "- Blocked: blockers or open questions".to_string(),
-            "".to_string(),
-            "## Highlights".to_string(),
-            "Key technical choices or notable findings (omit if none).".to_string(),
-            "".to_string(),
-            "## Next".to_string(),
-            "Immediate next steps.".to_string(),
-            "".to_string(),
-            "## Files".to_string(),
-            format!(
-                "Read: {}",
-                if file_ops.read_files.is_empty() {
-                    "none".to_string()
-                } else {
-                    file_ops.read_files.join(", ")
-                }
-            ),
-            format!(
-                "Edited: {}",
-                if file_ops.modified_files.is_empty() {
-                    "none".to_string()
-                } else {
-                    file_ops.modified_files.join(", ")
-                }
-            ),
-            "".to_string(),
-            "Conversation:".to_string(),
-        ];
-
-        // Serialize conversation
-        for msg in messages {
-            let role = match msg.role {
-                crate::events::MessageRole::User => "User",
-                crate::events::MessageRole::Assistant => "Assistant",
-                crate::events::MessageRole::Tool => "Tool",
-                crate::events::MessageRole::System => "System",
-            };
-            parts.push(format!("[{}]: {}", role, msg.content));
-        }
-
-        parts.join("\n")
-    }
-
-    /// Ensure Files section is present in summary.
-    fn ensure_files_section(&self, summary: &str, file_ops: &FileOperationSummary) -> String {
-        if summary.contains("## Files") {
-            return summary.to_string();
-        }
-
-        let read_str = if file_ops.read_files.is_empty() {
-            "none".to_string()
-        } else {
-            file_ops.read_files.join(", ")
-        };
-        let mod_str = if file_ops.modified_files.is_empty() {
-            "none".to_string()
-        } else {
-            file_ops.modified_files.join(", ")
-        };
-
-        format!(
-            "{}\n\n## Files\nRead: {}\nEdited: {}",
-            summary.trim(),
-            read_str,
-            mod_str
-        )
-    }
-
-    /// Notify all observers of compaction event.
-    fn notify_observers(&self, result: &CompactionResult) {
         let event = CompactionEvent {
-            trigger: CompactionTrigger::Auto, // Will be overridden by caller
+            trigger,
             strategy: result.strategy_used.clone(),
             tokens_before: result.tokens_before,
             tokens_after: result.tokens_after,
@@ -807,6 +833,306 @@ impl CompactionManager {
         for observer in &self.observers {
             observer.on_compaction(&event);
         }
+    }
+}
+
+/// Choose the first message of the verbatim tail.
+///
+/// Returns `None` if there is nothing worth summarizing. The cut is moved so
+/// that a tool result is never separated from the assistant message that
+/// requested it.
+fn find_cut(
+    messages: &[Message],
+    preserve_tokens: usize,
+    ratio: f64,
+    counter: &TokenCounter,
+) -> Option<usize> {
+    let n = messages.len();
+    if n < 2 {
+        return None;
+    }
+
+    let mut tail = 0usize;
+    let mut cut = n;
+    for (i, m) in messages.iter().enumerate().rev() {
+        let t = (counter.count_event_message(m) as f64 * ratio).ceil() as usize;
+        // The tail always keeps at least the newest message.
+        if tail + t > preserve_tokens && cut < n {
+            break;
+        }
+        tail += t;
+        cut = i;
+    }
+
+    let mut c = cut;
+    while c > 0 && messages[c].role == MessageRole::Tool {
+        c -= 1;
+    }
+    if c == 0 {
+        // The tail would start at the very beginning; summarize forward instead.
+        c = cut;
+        while c < n && messages[c].role == MessageRole::Tool {
+            c += 1;
+        }
+        if c >= n {
+            return None;
+        }
+    }
+    if c == 0 || (c == 1 && is_summary_message(&messages[0])) {
+        return None;
+    }
+    Some(c)
+}
+
+fn is_summary_message(m: &Message) -> bool {
+    m.role == MessageRole::User && m.content.starts_with(SUMMARY_OPEN)
+}
+
+fn previous_summary_body(m: &Message) -> Option<String> {
+    if !is_summary_message(m) {
+        return None;
+    }
+    let inner = m
+        .content
+        .strip_prefix(SUMMARY_OPEN)?
+        .trim_end()
+        .trim_end_matches(SUMMARY_CLOSE);
+    let body = inner.split(LIVE_STATE_DELIM).next().unwrap_or(inner).trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+fn format_summary_message(body: &str, live: &str) -> String {
+    let mut s = format!("{SUMMARY_OPEN}\n{}\n", body.trim());
+    if !live.trim().is_empty() {
+        s.push_str(LIVE_STATE_DELIM);
+        s.push('\n');
+        s.push_str(live.trim_end());
+        s.push('\n');
+    }
+    s.push_str(SUMMARY_CLOSE);
+    s
+}
+
+fn to_model_message(m: &Message) -> ModelMessage {
+    ModelMessage {
+        role: match m.role {
+            MessageRole::User => ModelRole::User,
+            MessageRole::Assistant => ModelRole::Assistant,
+            MessageRole::Tool => ModelRole::Tool,
+            MessageRole::System => ModelRole::System,
+        },
+        content: m.content.clone(),
+        tool_calls: m.tool_calls.clone(),
+        tool_call_id: m.tool_call_id.clone(),
+        thinking: None,
+    }
+}
+
+/// Extract file operations from a slice of messages (oldest first).
+fn extract_file_ops(messages: &[Message]) -> FileOperationSummary {
+    let mut ops = FileOperationSummary::default();
+    for msg in messages {
+        let Some(tool_calls) = &msg.tool_calls else {
+            continue;
+        };
+        for tc in tool_calls {
+            let Some(path) = tc.args.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match tc.name.as_str() {
+                "read" => touch(&mut ops.read_files, path),
+                "write" | "edit" | "delete" => touch(&mut ops.modified_files, path),
+                _ => {}
+            }
+        }
+    }
+    ops
+}
+
+/// Truncate to at most `max` bytes on a char boundary.
+fn clip(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[+{} bytes]", &s[..end], s.len() - end)
+}
+
+fn list_or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "none".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+/// Deterministic summary used by the basic strategy and as the fallback.
+fn basic_body(plan: &CompactionPlan) -> String {
+    let mut parts = vec![format!(
+        "Earlier context ({} messages) was compacted. Work continues below.",
+        plan.cut_index
+    )];
+
+    if !plan.user_requests.is_empty() {
+        let list: Vec<String> = plan
+            .user_requests
+            .iter()
+            .map(|r| format!("- {r}"))
+            .collect();
+        parts.push(format!(
+            "## User requests (oldest first)\n{}",
+            list.join("\n")
+        ));
+    }
+
+    parts.push(format!(
+        "## Files\nRead: {}\nEdited: {}",
+        list_or_none(&plan.file_ops.read_files),
+        list_or_none(&plan.file_ops.modified_files)
+    ));
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for tc in plan
+        .head
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+    {
+        *counts.entry(tc.name.as_str()).or_insert(0) += 1;
+    }
+    if !counts.is_empty() {
+        let mut items: Vec<_> = counts.into_iter().collect();
+        items.sort();
+        let list: Vec<String> = items.iter().map(|(n, c)| format!("{n} x{c}")).collect();
+        parts.push(format!("## Tool activity\n{}", list.join(", ")));
+    }
+
+    parts.join("\n\n")
+}
+
+fn render_message(m: &Message) -> String {
+    let (label, limit) = match m.role {
+        MessageRole::User => ("User", MESSAGE_RENDER_CHARS),
+        MessageRole::Assistant => ("Assistant", MESSAGE_RENDER_CHARS),
+        MessageRole::Tool => ("Tool result", TOOL_RESULT_RENDER_CHARS),
+        MessageRole::System => ("System", MESSAGE_RENDER_CHARS),
+    };
+    let mut out = format!("[{label}]: {}", clip(&m.content, limit));
+    for tc in m.tool_calls.iter().flatten() {
+        out.push_str(&format!(
+            "\n  -> {}({})",
+            tc.name,
+            clip(&tc.args.to_string(), TOOL_ARGS_RENDER_CHARS)
+        ));
+    }
+    out
+}
+
+/// Render messages for the summarizer, dropping the oldest to fit `max_chars`.
+fn render_messages(messages: &[Message], max_chars: usize) -> String {
+    let parts: Vec<String> = messages.iter().map(render_message).collect();
+    let mut total: usize = parts.iter().map(|p| p.len() + 1).sum();
+    let mut skip = 0;
+    while total > max_chars && skip + 1 < parts.len() {
+        total -= parts[skip].len() + 1;
+        skip += 1;
+    }
+    let mut out = String::new();
+    if skip > 0 {
+        out.push_str(&format!("[{skip} earlier messages omitted]\n"));
+    }
+    out.push_str(&parts[skip..].join("\n"));
+    out
+}
+
+fn build_summary_request(plan: &CompactionPlan) -> String {
+    let mut parts = Vec::new();
+    match &plan.previous_summary {
+        Some(prev) => {
+            parts.push(
+                "Update the previous summary with the new conversation below. Keep what is still \
+                 relevant, drop what is obsolete, and add new progress. Output the full updated \
+                 summary."
+                    .to_string(),
+            );
+            parts.push(format!("<previous_summary>\n{prev}\n</previous_summary>"));
+        }
+        None => parts.push(
+            "Summarize this coding session so work can continue without the original messages."
+                .to_string(),
+        ),
+    }
+    parts.push(
+        "Use exactly these sections, be concise and factual:\n\
+         ## Goal\nWhat the user wants, in their terms.\n\
+         ## Constraints & preferences\nInstructions or decisions the user gave that must keep applying.\n\
+         ## Progress\n- Done / In progress / Blocked\n\
+         ## Key findings\nTechnical facts, decisions and their reasons, errors seen (omit if none).\n\
+         ## Next steps\nWhat to do next.\n\
+         ## Files\nRead and edited files."
+            .to_string(),
+    );
+    parts.push(format!(
+        "Known file operations:\nRead: {}\nEdited: {}",
+        list_or_none(&plan.file_ops.read_files),
+        list_or_none(&plan.file_ops.modified_files)
+    ));
+    // The summarizer input keeps room for the instructions above.
+    parts.push(format!(
+        "<conversation>\n{}\n</conversation>",
+        render_messages(&plan.head, plan.max_chars)
+    ));
+    parts.join("\n\n")
+}
+
+/// Generate the summary body for a plan with the model.
+///
+/// Free of any borrow on the conversation or manager, so it can run in a
+/// spawned task.
+pub async fn summarize_plan<M: Model + ?Sized>(
+    model: &M,
+    plan: &CompactionPlan,
+) -> Result<String, CompactionError> {
+    let messages = vec![
+        ModelMessage {
+            role: ModelRole::System,
+            content: SUMMARIZER_SYSTEM_PROMPT.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: None,
+        },
+        ModelMessage {
+            role: ModelRole::User,
+            content: build_summary_request(plan),
+            tool_calls: None,
+            tool_call_id: None,
+            thinking: None,
+        },
+    ];
+    let params = crate::model::GenerationParams {
+        temperature: Some(0.3),
+        max_tokens: Some(plan.max_output_tokens),
+        stop_sequences: None,
+        top_p: Some(0.9),
+    };
+    let response = model.complete(&messages, &params, None).await?;
+    let text = response.content.trim().to_string();
+    if text.is_empty() {
+        return Err(CompactionError::Failed(
+            "summarizer returned an empty summary".into(),
+        ));
+    }
+    if text.contains("## Files") {
+        Ok(text)
+    } else {
+        Ok(format!(
+            "{text}\n\n## Files\nRead: {}\nEdited: {}",
+            list_or_none(&plan.file_ops.read_files),
+            list_or_none(&plan.file_ops.modified_files)
+        ))
     }
 }
 
@@ -823,84 +1149,333 @@ ONLY output the structured summary."#;
 mod tests {
     use super::*;
     use crate::context::Conversation;
-    use crate::model::{ModelCapabilities, ModelTier};
+    use crate::context::cap::ContextCap;
+    use crate::events::{ToolCall, ToolCallStatus};
+    use crate::model::MockModel;
 
-    #[test]
-    fn test_compaction_budget() {
-        let cap = crate::context::cap::ContextCap::new(10000);
-        let capabilities = ModelCapabilities {
-            tier: ModelTier::Frontier,
-            max_context: 10000,
+    fn caps(tier: ModelTier, max: usize) -> ModelCapabilities {
+        ModelCapabilities {
+            tier,
+            max_context: max,
             ..Default::default()
-        };
-        let conv = Conversation::new("System prompt".into(), cap, capabilities);
+        }
+    }
 
-        let config = CompactionConfig {
-            trigger_ratio: 0.75,
-            target_ratio: 0.5,
-            preserve_recent_tokens: 15000,
-            ..Default::default()
-        };
+    fn conv(tier: ModelTier, max: usize) -> Conversation {
+        Conversation::new(
+            "System prompt".into(),
+            ContextCap::new(max),
+            caps(tier, max),
+        )
+    }
 
-        let budget = CompactionBudget::from_conversation(&conv, &config);
-        assert_eq!(budget.max_tokens, 10000);
-        assert_eq!(budget.trigger_tokens, 7500);
-        assert_eq!(budget.target_tokens, 5000);
+    fn call(id: &str, name: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: serde_json::json!({ "path": path }),
+            status: ToolCallStatus::Pending,
+        }
+    }
+
+    /// user, then n rounds of (assistant tool call, tool result, 400-char each)
+    fn tool_conv(rounds: usize, max: usize) -> Conversation {
+        let mut c = conv(ModelTier::Frontier, max);
+        c.add_user_message("fix the bug in a.rs".into()).unwrap();
+        for i in 0..rounds {
+            c.add_assistant_message(
+                "x".repeat(400),
+                Some(vec![call(&format!("c{i}"), "read", &format!("f{i}.rs"))]),
+                None,
+            )
+            .unwrap();
+            c.add_tool_message("y".repeat(400), format!("c{i}"))
+                .unwrap();
+        }
+        c
+    }
+
+    fn model() -> MockModel {
+        MockModel::frontier("mock")
     }
 
     #[test]
-    fn test_resolve_strategy_auto() {
+    fn test_compaction_budget_ratio() {
+        let c = conv(ModelTier::Frontier, 10000);
+        let config = CompactionConfig {
+            trigger_ratio: Some(0.75),
+            target_ratio: 0.5,
+            ..Default::default()
+        };
+        let b = CompactionBudget::from_conversation(&c, &config);
+        assert_eq!(b.trigger_tokens, 7500);
+        assert_eq!(b.target_tokens, 5000);
+        assert_eq!(b.preserve_recent_tokens, 2500);
+    }
+
+    #[test]
+    fn test_compaction_budget_reserve_scales_with_window() {
         let config = CompactionConfig::default();
+        let big = CompactionBudget::from_conversation(&conv(ModelTier::Frontier, 200_000), &config);
+        assert_eq!(big.trigger_tokens, 200_000 - 16_384);
+        let small = CompactionBudget::from_conversation(&conv(ModelTier::Small, 4096), &config);
+        assert_eq!(small.trigger_tokens, 3072);
+        assert!(small.preserve_recent_tokens <= small.target_tokens / 2);
+    }
+
+    #[test]
+    fn test_resolve_strategy_auto_and_overrides() {
+        let mut config = CompactionConfig::default();
+        config.model_overrides.insert(
+            "special".into(),
+            CompactionModelOverride {
+                strategy: Some(CompactionStrategyConfig::Basic),
+                preserve_recent_tokens: None,
+            },
+        );
         let manager = CompactionManager::new(config);
-
-        let small_caps = ModelCapabilities {
-            tier: ModelTier::Small,
-            ..Default::default()
-        };
-        let frontier_caps = ModelCapabilities {
-            tier: ModelTier::Frontier,
-            ..Default::default()
-        };
-
+        let small = caps(ModelTier::Small, 4096);
+        let frontier = caps(ModelTier::Frontier, 100_000);
         assert_eq!(
-            manager.resolve_strategy(&small_caps),
+            manager.resolve_strategy("m", &small),
             CompactionStrategyConfig::Basic
         );
         assert_eq!(
-            manager.resolve_strategy(&frontier_caps),
+            manager.resolve_strategy("m", &frontier),
             CompactionStrategyConfig::Agentic
+        );
+        assert_eq!(
+            manager.resolve_strategy("special", &frontier),
+            CompactionStrategyConfig::Basic
         );
     }
 
     #[test]
-    fn test_file_ops_extraction() {
-        let config = CompactionConfig::default();
-        let manager = CompactionManager::new(config);
-
-        let messages = vec![crate::events::Message {
-            role: crate::events::MessageRole::Assistant,
-            content: "".into(),
+    fn test_file_ops_recency_order() {
+        let msgs = vec![Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
             tool_calls: Some(vec![
-                crate::events::ToolCall {
-                    id: "1".into(),
-                    name: "read".into(),
-                    args: serde_json::json!({"path": "/tmp/a.txt"}),
-                    status: crate::events::ToolCallStatus::Pending,
-                },
-                crate::events::ToolCall {
-                    id: "2".into(),
-                    name: "write".into(),
-                    args: serde_json::json!({"path": "/tmp/b.txt", "content": "hello"}),
-                    status: crate::events::ToolCallStatus::Pending,
-                },
+                call("1", "read", "a"),
+                call("2", "write", "b"),
+                call("3", "read", "c"),
+                call("4", "read", "a"),
             ]),
             tool_call_id: None,
             ts: 0,
             thinking: None,
         }];
+        let ops = extract_file_ops(&msgs);
+        assert_eq!(ops.read_files, vec!["c", "a"]);
+        assert_eq!(ops.modified_files, vec!["b"]);
+    }
 
-        let ops = manager.extract_file_ops(&messages);
-        assert_eq!(ops.read_files, vec!["/tmp/a.txt"]);
-        assert_eq!(ops.modified_files, vec!["/tmp/b.txt"]);
+    #[test]
+    fn test_cut_never_orphans_tool_results() {
+        let c = tool_conv(6, 100_000);
+        let counter = TokenCounter;
+        for preserve in [1, 100, 250, 400, 700, 1000] {
+            if let Some(cut) = find_cut(c.messages(), preserve, 1.0, &counter) {
+                assert!(cut > 0);
+                assert_ne!(
+                    c.messages()[cut].role,
+                    MessageRole::Tool,
+                    "preserve={preserve}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cut_none_when_everything_fits() {
+        let c = tool_conv(2, 100_000);
+        assert!(find_cut(c.messages(), 1_000_000, 1.0, &TokenCounter).is_none());
+    }
+
+    #[test]
+    fn test_cut_keeps_newest_message_even_if_huge() {
+        let mut c = conv(ModelTier::Frontier, 100_000);
+        c.add_user_message("first".into()).unwrap();
+        c.add_assistant_message("ok".into(), None, None).unwrap();
+        c.add_user_message("z".repeat(8000)).unwrap();
+        assert_eq!(find_cut(c.messages(), 10, 1.0, &TokenCounter), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_below_trigger_does_nothing_but_force_compacts() {
+        let mut c = tool_conv(6, 100_000);
+        let mut m = CompactionManager::new(CompactionConfig {
+            preserve_recent_tokens: 300,
+            ..Default::default()
+        });
+        let mock = model();
+        mock.push_response(MockModel::text_response("## Goal\nfix\n## Files\nx"));
+
+        assert!(
+            m.maybe_compact(&mock, &mut c, CompactionTrigger::Auto)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let r = m
+            .compact_now(&mock, &mut c, CompactionTrigger::Manual)
+            .await
+            .unwrap()
+            .expect("forced compaction runs");
+        assert_eq!(r.strategy_used, CompactionStrategy::Agentic);
+        assert!(r.messages_removed > 0);
+        assert!(is_summary_message(&c.messages()[0]));
+        assert_eq!(c.messages()[0].role, MessageRole::User);
+        assert_ne!(c.messages()[1].role, MessageRole::Tool);
+    }
+
+    #[tokio::test]
+    async fn test_agentic_failure_falls_back_to_basic() {
+        let mut c = tool_conv(6, 100_000);
+        let mut m = CompactionManager::new(CompactionConfig {
+            preserve_recent_tokens: 300,
+            ..Default::default()
+        });
+        let mock = model();
+        mock.push_response(MockModel::error_response(ModelError::Provider(
+            "boom".into(),
+        )));
+        let r = m
+            .compact_now(&mock, &mut c, CompactionTrigger::Manual)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.strategy_used, CompactionStrategy::Basic);
+        assert!(r.warning.is_some());
+        assert!(c.messages()[0].content.contains("fix the bug in a.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_trigger_prunes_before_summarizing() {
+        let mut c = conv(ModelTier::Frontier, 20_000);
+        c.add_user_message("go".into()).unwrap();
+        for i in 0..10 {
+            c.add_assistant_message(
+                String::new(),
+                Some(vec![call(&format!("c{i}"), "run", "x")]),
+                None,
+            )
+            .unwrap();
+            c.add_tool_message("o".repeat(7000), format!("c{i}"))
+                .unwrap();
+        }
+        let mut m = CompactionManager::new(CompactionConfig {
+            reserve_tokens: 4000,
+            prune_protect_tokens: 2000,
+            prune_min_savings_tokens: 500,
+            ..Default::default()
+        });
+        let mock = model();
+        assert!(c.estimated_tokens() >= m.trigger_tokens(&c));
+        let r = m
+            .maybe_compact(&mock, &mut c, CompactionTrigger::Auto)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.strategy_used, CompactionStrategy::Prune);
+        assert!(r.tokens_after < r.tokens_before);
+        assert_eq!(mock.remaining_responses(), 0);
+    }
+
+    #[test]
+    fn test_iterative_summary_and_stale_plan() {
+        let mut c = tool_conv(6, 100_000);
+        let mut m = CompactionManager::new(CompactionConfig {
+            preserve_recent_tokens: 300,
+            ..Default::default()
+        });
+        let plan = m.plan(&c, "mock").unwrap();
+        assert!(plan.previous_summary.is_none());
+        let stale = plan.clone();
+        let r = m
+            .apply_plan(
+                &mut c,
+                plan,
+                "## Goal\nfirst".into(),
+                CompactionStrategy::Agentic,
+                CompactionTrigger::Auto,
+            )
+            .unwrap();
+        assert!(r.messages_removed > 0);
+
+        // A plan made before the rewrite is rejected.
+        assert!(
+            m.apply_plan(
+                &mut c,
+                stale,
+                "x".into(),
+                CompactionStrategy::Agentic,
+                CompactionTrigger::Auto
+            )
+            .is_err()
+        );
+
+        for i in 10..16 {
+            c.add_assistant_message(
+                "x".repeat(400),
+                Some(vec![call(&format!("n{i}"), "read", "g.rs")]),
+                None,
+            )
+            .unwrap();
+            c.add_tool_message("y".repeat(400), format!("n{i}"))
+                .unwrap();
+        }
+        let plan2 = m.plan(&c, "mock").unwrap();
+        assert_eq!(plan2.previous_summary.as_deref(), Some("## Goal\nfirst"));
+        assert!(plan2.file_ops.read_files.contains(&"f0.rs".to_string()));
+        assert!(build_summary_request(&plan2).contains("<previous_summary>"));
+    }
+
+    #[test]
+    fn test_summary_roundtrip_strips_live_state() {
+        let msg = Message {
+            role: MessageRole::User,
+            content: format_summary_message("body text", "## Todos\n- a"),
+            tool_calls: None,
+            tool_call_id: None,
+            ts: 0,
+            thinking: None,
+        };
+        assert_eq!(previous_summary_body(&msg).as_deref(), Some("body text"));
+    }
+
+    #[test]
+    fn test_summarizer_input_is_bounded() {
+        let msgs: Vec<Message> = (0..50)
+            .map(|i| Message {
+                role: MessageRole::Tool,
+                content: format!("{i}{}", "é".repeat(5000)),
+                tool_calls: None,
+                tool_call_id: Some("c".into()),
+                ts: 0,
+                thinking: None,
+            })
+            .collect();
+        let out = render_messages(&msgs, 10_000);
+        assert!(out.len() < 12_000);
+        assert!(out.contains("earlier messages omitted"));
+    }
+
+    #[test]
+    fn test_from_section_applies_overrides() {
+        let section = crate::config::CompactionSection {
+            trigger_ratio: Some(0.6),
+            reserve_tokens: Some(1000),
+            strategy: Some("basic".into()),
+            background: Some(false),
+            ..Default::default()
+        };
+        let c = CompactionConfig::from_section(Some(&section));
+        assert_eq!(c.trigger_ratio, Some(0.6));
+        assert_eq!(c.reserve_tokens, 1000);
+        assert_eq!(c.strategy, CompactionStrategyConfig::Basic);
+        assert!(!c.background);
+        assert!(CompactionConfig::from_section(None).enabled);
     }
 }
