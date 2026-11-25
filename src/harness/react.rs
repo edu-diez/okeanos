@@ -1163,8 +1163,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             // Providers that don't report usage fall back to an estimate.
             let usage = usage.unwrap_or_else(|| {
                 let counter = crate::context::tokens::TokenCounter;
-                let prompt_tokens: usize =
-                    messages.iter().map(|m| counter.count(&m.content)).sum();
+                let prompt_tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
                 let completion_tokens = counter.count(&content);
                 crate::model::Usage {
                     prompt_tokens,
@@ -1627,7 +1626,10 @@ impl<M: Model + 'static> ReactLoop<M> {
             }
             self.check_expensive_call_confirmation(&call).await?;
             self.check_cost_budget(&call).await?;
-            let tool = self.tools.get(&call.name).expect("checked by is_parallel_safe");
+            let tool = self
+                .tools
+                .get(&call.name)
+                .expect("checked by is_parallel_safe");
             self.emit_tool_call(ToolCall {
                 id: call.id.clone(),
                 name: call.name.clone(),
