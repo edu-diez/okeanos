@@ -108,6 +108,35 @@ impl ToolExecutionResult {
     }
 }
 
+/// Sink for incremental tool output. Cheap to clone; sends never block or fail.
+#[derive(Debug, Clone, Default)]
+pub struct ToolOutputSink(Option<tokio::sync::mpsc::UnboundedSender<String>>);
+
+impl ToolOutputSink {
+    /// A sink that drops everything.
+    pub fn discard() -> Self {
+        Self(None)
+    }
+
+    /// Create a sink and the receiver that yields its chunks.
+    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self(Some(tx)), rx)
+    }
+
+    /// Whether anyone is listening.
+    pub fn is_active(&self) -> bool {
+        self.0.as_ref().is_some_and(|tx| !tx.is_closed())
+    }
+
+    /// Emit a chunk of output.
+    pub fn send(&self, chunk: impl Into<String>) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(chunk.into());
+        }
+    }
+}
+
 /// The Tool trait — all tools implement this.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -119,6 +148,19 @@ pub trait Tool: Send + Sync {
     /// Returns a [`ToolExecutionResult`] containing the output plus
     /// metadata (exit code, timeout, cancellation, truncation).
     async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError>;
+
+    /// Execute the tool, sending incremental output to `output` while it runs.
+    ///
+    /// The default ignores the sink and delegates to [`Tool::execute`]. The returned
+    /// result is still authoritative.
+    async fn execute_streaming(
+        &self,
+        args: Value,
+        output: ToolOutputSink,
+    ) -> Result<ToolExecutionResult, ToolError> {
+        let _ = output;
+        self.execute(args).await
+    }
 
     /// Get the tool as `&dyn Any` for downcasting.
     fn as_any(&self) -> &dyn std::any::Any;

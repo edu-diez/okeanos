@@ -89,7 +89,7 @@ A single static Rust binary that turns a language model into an autonomous codin
 | FR-48 | Workspace confinement (M29): `write`/`edit`/`delete` only modify paths inside the project root plus `permissions.extra_write_roots`; symlinks and `..` are resolved before checking; `.git/**`, `.env`/`.env.*` and the roots themselves are always protected. Reads are unrestricted. |
 | FR-49 | Argument-aware `run` policy (M29): session `allow-always` and allow-list rules for `run` are command-scoped (`run:cargo test` matches `cargo test --all`; subcommand-aware for git/cargo/npm/docker/…); a bare `run` allow-list entry still allows everything. Shells, interpreters, privilege/escalation, delete and network-transfer commands (and risky subcommands such as `git push`) are never covered by a session grant. |
 | FR-50 | Optional OS sandbox for `run` (M30): `permissions.sandbox = none` (default) `\| read-only \| workspace-write`; `permissions.sandbox_network` (default `false`) controls network access. Linux uses `bwrap`, macOS `sandbox-exec`; Windows is unsupported. When enabled but unavailable, `run` fails closed instead of running unsandboxed. `.git` and `.env*` stay read-only under `workspace-write`. |
-| FR-51 | Planned execution-environment roadmap (M31–M33, not yet implemented): incremental output events, background processes, env allowlist mode. See MILESTONES.md. |
+| FR-51 | Planned execution-environment roadmap (M31–M33, not yet implemented): incremental output events (M31, implemented), background processes, env allowlist mode. See MILESTONES.md. |
 ### Non-functional requirements
 
 | ID | Requirement |

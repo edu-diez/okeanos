@@ -15,11 +15,16 @@ use ratatui::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Lines of live output shown under a running tool call.
+const LIVE_TAIL_LINES: usize = 8;
+
 /// Tool panel state.
 #[derive(Debug)]
 pub struct ToolPanel {
     tool_calls: HashMap<String, RenderedToolCall>,
     tool_results: HashMap<String, RenderedToolResult>,
+    /// Live output of still-running calls, keyed by call id.
+    live_output: HashMap<String, String>,
     list_state: ListState,
     theme: Arc<Theme>,
     reduced_motion: bool,
@@ -45,6 +50,7 @@ impl ToolPanel {
         Self {
             tool_calls: HashMap::new(),
             tool_results: HashMap::new(),
+            live_output: HashMap::new(),
             list_state: ListState::default(),
             theme,
             reduced_motion,
@@ -76,7 +82,14 @@ impl ToolPanel {
                     },
                 );
             }
+            Event::ToolOutput(out) => {
+                self.live_output
+                    .entry(out.id.clone())
+                    .or_default()
+                    .push_str(&out.chunk);
+            }
             Event::ToolResult(result) => {
+                self.live_output.remove(&result.id);
                 self.tool_results.insert(
                     result.id.clone(),
                     RenderedToolResult {
@@ -244,6 +257,22 @@ impl ToolPanel {
                     Span::raw("  "),
                     Span::styled(
                         "... (truncated)",
+                        self.theme.style(SemanticRole::CanvasMuted),
+                    ),
+                ]));
+            }
+        }
+
+        // Live output tail while the call is still running
+        if call.call.status == ToolCallStatus::Pending
+            && let Some(live) = self.live_output.get(id)
+        {
+            let all: Vec<&str> = live.lines().collect();
+            for line in &all[all.len().saturating_sub(LIVE_TAIL_LINES)..] {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        (*line).to_string(),
                         self.theme.style(SemanticRole::CanvasMuted),
                     ),
                 ]));

@@ -1571,15 +1571,29 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         let start = Instant::now();
 
-        // Execute the tool, interruptible by shutdown signal.
-        let exec_result = tokio::select! {
-            biased;
-            result = tool.execute(tool_call.args.clone()) => result,
-            _ = shutdown_rx.recv() => {
-                return Err(ReactError::Interrupted);
+        // Execute the tool, streaming its output as events; interruptible by shutdown signal.
+        let (sink, mut output_rx) = crate::tool::tool_trait::ToolOutputSink::channel();
+        let exec = tool.execute_streaming(tool_call.args.clone(), sink);
+        tokio::pin!(exec);
+        let mut seq = 0u64;
+        let exec_result = loop {
+            tokio::select! {
+                biased;
+                Some(chunk) = output_rx.recv() => {
+                    self.emit_tool_output(&tool_call, seq, chunk);
+                    seq += 1;
+                }
+                result = &mut exec => break result,
+                _ = shutdown_rx.recv() => {
+                    return Err(ReactError::Interrupted);
+                }
             }
         }
         .map_err(|e| ReactError::Tool(format!("tool execution failed: {e}")))?;
+        while let Ok(chunk) = output_rx.try_recv() {
+            self.emit_tool_output(&tool_call, seq, chunk);
+            seq += 1;
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         Ok(self
@@ -2283,6 +2297,19 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
     }
 
+    /// Emit a live tool output chunk. Ephemeral: broadcast only, never session-logged.
+    fn emit_tool_output(&self, call: &ToolCall, seq: u64, chunk: String) {
+        let _ = self
+            .event_tx
+            .send(Event::ToolOutput(crate::events::ToolOutput {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                seq,
+                chunk,
+                ts: current_timestamp(),
+            }));
+    }
+
     /// Emit a tool result event.
     async fn emit_tool_result(&mut self, result: ToolResult) {
         let event = Event::ToolResult(result);
@@ -2436,6 +2463,67 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    struct StreamingTool;
+
+    #[async_trait]
+    impl Tool for StreamingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new("stream", "streams", json!({"type": "object"}))
+        }
+
+        async fn execute(&self, _args: Value) -> Result<ToolExecutionResult, ToolError> {
+            Ok(ToolExecutionResult::output("final"))
+        }
+
+        async fn execute_streaming(
+            &self,
+            _args: Value,
+            output: crate::tool::tool_trait::ToolOutputSink,
+        ) -> Result<ToolExecutionResult, ToolError> {
+            output.send("one\n");
+            tokio::task::yield_now().await;
+            output.send("two\n");
+            Ok(ToolExecutionResult::output("final"))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_output_is_emitted_before_the_result() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![call("1", "stream")]),
+            MockModel::text_response("done"),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(StreamingTool);
+        let mut loop_ = make_loop(model, tools);
+        let mut events = loop_.event_tx().subscribe();
+
+        run_one(&mut loop_, "go").await.unwrap();
+
+        let mut chunks = Vec::new();
+        let mut result_seen = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::ToolOutput(out) => {
+                    assert!(!result_seen, "tool_output after tool_result");
+                    assert_eq!(out.id, "1");
+                    assert_eq!(out.seq as usize, chunks.len());
+                    chunks.push(out.chunk);
+                }
+                Event::ToolResult(_) => result_seen = true,
+                _ => {}
+            }
+        }
+        assert_eq!(chunks, vec!["one\n".to_string(), "two\n".to_string()]);
+        assert!(result_seen);
+        assert_eq!(tool_messages(&loop_), vec!["final".to_string()]);
     }
 
     fn call(id: &str, name: &str) -> ToolCall {

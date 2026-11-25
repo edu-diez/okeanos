@@ -1741,6 +1741,12 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
                             Event::ToolCall(call) => {
                                 eprintln!("[TOOL CALL] {} {:?}", call.name, call.args);
                             }
+                            Event::ToolOutput(out) => {
+                                eprint!("[TOOL OUTPUT] {}", out.chunk);
+                                if !out.chunk.ends_with('\n') {
+                                    eprintln!();
+                                }
+                            }
                             Event::ToolResult(result) => {
                                 eprintln!(
                                     "[TOOL RESULT] {} ok={} duration={}ms",

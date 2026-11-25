@@ -144,6 +144,7 @@ The TUI consumes the same event stream that headless/RPC mode emits to stdout. E
 | Message rendered | `message` | `role`, `content`, `ts` |
 | Token streamed | `token` | `delta`, `ts` |
 | Tool call started | `tool_call` | `id`, `name`, `args`, `status: pending` |
+| Tool output chunk (live, while the tool runs) | `tool_output` | `id`, `name`, `seq`, `chunk`, `ts` |
 | Tool result | `tool_result` | `id`, `ok`, `output`, `duration_ms` |
 | Approval requested | `approval_request` | `id`, `tool`, `args` |
 | Approval resolved | `approval` | `id`, `decision` (allow/deny/allow-always) |
@@ -156,6 +157,8 @@ The TUI consumes the same event stream that headless/RPC mode emits to stdout. E
 | Config step changed | `config_modal` | `action: "step"`, `step: 1-5`, `data: {provider_kind?, base_url?, api_key?, model?}` |
 | Config saved | `config_saved` | `path`, `provider_kind`, `model`, `base_url` |
 | Config modal closed | `config_modal` | `action: "close"`, `completed: boolean` |
+
+`tool_output` events are ephemeral: emitted between `tool_call` and `tool_result` (`seq` starts at 0, in arrival order, stdout/stderr merged), capped per call, and not written to the session log. The final `tool_result.output` stays authoritative (head/tail truncated). The TUI appends chunks to the pending tool call's live output; it must not keep a parallel copy once `tool_result` arrives.
 
 Headless mode prints identical JSON to stdout/RPC; screen readers and automation consume the canonical JSON UI. The TUI is a renderer of this stream, not a parallel state machine.
 

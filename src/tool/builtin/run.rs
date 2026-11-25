@@ -19,7 +19,7 @@
 //!   (set `OKEANOS_RUN_INHERIT_ENV=1` to disable scrubbing).
 
 use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output_with_spill};
-use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
+use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolOutputSink, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -36,6 +36,7 @@ const DRAIN_GRACE_MS: u64 = 250; // Max extra read time after the process exits
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 const CAPTURE_PART: usize = 256 * 1024;
+const LIVE_CAP: usize = 256 * 1024; // Max bytes streamed per call
 
 /// Built-in tool for executing local commands.
 #[derive(Debug, Default)]
@@ -79,6 +80,15 @@ impl Tool for RunTool {
     }
 
     async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {
+        self.execute_streaming(args, ToolOutputSink::discard())
+            .await
+    }
+
+    async fn execute_streaming(
+        &self,
+        args: Value,
+        sink: ToolOutputSink,
+    ) -> Result<ToolExecutionResult, ToolError> {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
@@ -141,13 +151,17 @@ impl Tool for RunTool {
         ];
 
         let mut capture = Capture::default();
+        let mut live = LiveOutput::new(sink);
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut rx_open = true;
 
         let status = loop {
             tokio::select! {
                 chunk = rx.recv(), if rx_open => match chunk {
-                    Some(c) => capture.push(&c),
+                    Some(c) => {
+                        live.push(&c);
+                        capture.push(&c);
+                    }
                     None => rx_open = false,
                 },
                 status = child.wait() => break Some(status),
@@ -174,9 +188,11 @@ impl Tool for RunTool {
         if rx_open {
             let drain_deadline = Instant::now() + Duration::from_millis(DRAIN_GRACE_MS);
             while let Ok(Some(c)) = timeout_at(drain_deadline, rx.recv()).await {
+                live.push(&c);
                 capture.push(&c);
             }
         }
+        live.finish();
         for r in &readers {
             r.abort();
         }
@@ -216,6 +232,91 @@ async fn pump(mut stream: impl AsyncRead + Unpin + Send + 'static, tx: mpsc::Sen
             }
         }
     }
+}
+
+/// Streams captured bytes to the output sink as UTF-8 text, up to `LIVE_CAP` bytes.
+struct LiveOutput {
+    sink: ToolOutputSink,
+    pending: Vec<u8>,
+    sent: usize,
+    capped: bool,
+}
+
+impl LiveOutput {
+    fn new(sink: ToolOutputSink) -> Self {
+        Self {
+            sink,
+            pending: Vec::new(),
+            sent: 0,
+            capped: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.capped || !self.sink.is_active() {
+            return;
+        }
+        let text = decode_utf8(&mut self.pending, chunk, false);
+        self.emit(text);
+    }
+
+    fn finish(&mut self) {
+        if self.capped || !self.sink.is_active() {
+            return;
+        }
+        let text = decode_utf8(&mut self.pending, &[], true);
+        self.emit(text);
+    }
+
+    fn emit(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.sent += text.len();
+        self.sink.send(text);
+        if self.sent >= LIVE_CAP {
+            self.capped = true;
+            self.sink
+                .send("\n[live output truncated; the final result has the full head/tail]\n");
+        }
+    }
+}
+
+/// Decode `chunk` appended to `pending`, keeping an incomplete trailing sequence for the next
+/// call (or replacing it when `flush` is set). Invalid bytes become U+FFFD.
+fn decode_utf8(pending: &mut Vec<u8>, chunk: &[u8], flush: bool) -> String {
+    pending.extend_from_slice(chunk);
+    let mut out = String::new();
+    let mut start = 0;
+    loop {
+        match std::str::from_utf8(&pending[start..]) {
+            Ok(s) => {
+                out.push_str(s);
+                start = pending.len();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(&String::from_utf8_lossy(&pending[start..start + valid]));
+                start += valid;
+                match e.error_len() {
+                    Some(n) => {
+                        out.push('\u{FFFD}');
+                        start += n;
+                    }
+                    None => {
+                        if flush {
+                            out.push('\u{FFFD}');
+                            start = pending.len();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    pending.drain(..start);
+    out
 }
 
 /// Bounded output capture: keeps the head and the most recent tail.
@@ -557,6 +658,41 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.output.contains("done"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_decode_utf8_handles_split_sequences() {
+        let bytes = "héllo €".as_bytes();
+        let mut pending = Vec::new();
+        let mut out = String::new();
+        for b in bytes {
+            out.push_str(&decode_utf8(&mut pending, &[*b], false));
+        }
+        out.push_str(&decode_utf8(&mut pending, &[], true));
+        assert_eq!(out, "héllo €");
+
+        let mut pending = Vec::new();
+        let mut out = decode_utf8(&mut pending, &[b'a', 0xFF, b'b', 0xE2, 0x82], false);
+        out.push_str(&decode_utf8(&mut pending, &[], true));
+        assert_eq!(out, "a\u{FFFD}b\u{FFFD}");
+    }
+
+    #[tokio::test]
+    async fn test_run_tool_streams_output_and_keeps_final_result() {
+        let tool = RunTool::new();
+        let (sink, mut rx) = ToolOutputSink::channel();
+        let result = tool
+            .execute_streaming(shell("echo first && echo second"), sink)
+            .await
+            .unwrap();
+        let mut streamed = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            streamed.push_str(&chunk);
+        }
+        assert!(streamed.contains("first") && streamed.contains("second"));
+        assert!(streamed.find("first") < streamed.find("second"));
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("first") && result.output.contains("second"));
     }
 
     #[test]

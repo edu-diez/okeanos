@@ -77,6 +77,18 @@ pub struct ToolResult {
     pub cancelled: bool,
 }
 
+/// A live output chunk from a running tool (ephemeral; not session-logged).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolOutput {
+    /// Id of the tool call this chunk belongs to.
+    pub id: String,
+    pub name: String,
+    /// Chunk sequence number within the call, starting at 0.
+    pub seq: u64,
+    pub chunk: String,
+    pub ts: u64,
+}
+
 /// An approval request for a privileged operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApprovalRequest {
@@ -295,6 +307,7 @@ pub enum Event {
     Token(Token),
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    ToolOutput(ToolOutput),
     ApprovalRequest(ApprovalRequest),
     Approval(Approval),
     Todo(Todo),
@@ -327,6 +340,10 @@ impl Event {
 
     pub fn tool_result(result: ToolResult) -> Self {
         Event::ToolResult(result)
+    }
+
+    pub fn tool_output(output: ToolOutput) -> Self {
+        Event::ToolOutput(output)
     }
 
     pub fn approval_request(req: ApprovalRequest) -> Self {

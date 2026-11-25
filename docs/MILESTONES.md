@@ -997,6 +997,18 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.14.0`
 - ☐ Tag `v0.14.0`
 
+### Milestone 31 — Incremental tool output events
+**Status:** complete — v0.15.0 (tag pending)
+
+**Scope:** `Tool::execute_streaming(args, ToolOutputSink)` (default delegates to `execute`); `run` streams UTF-8-safe chunks as they arrive; the ReAct loop emits ephemeral `tool_output` events (`id`, `name`, `seq`, `chunk`, `ts`) before `tool_result`. TUI tool panel shows live output; headless prints `[TOOL OUTPUT]` to stderr and RPC/WS forward the JSON event. Not session-logged; capped per call (256 KiB, then one notice chunk). Final `tool_result` unchanged.
+- **Out of scope:** background processes (M32), streaming for parallel read-only batches, MCP tool streaming.
+
+**Definition of Done:**
+- ✅ DESIGN.md §7, ARCHITECTURE.md updated first
+- ✅ Unit tests: UTF-8 chunk splitting, `run` emits chunks in order and final result unchanged, ReAct loop emits `tool_output` before `tool_result`, session log skips `tool_output`
+- ✅ `Cargo.toml` bumped to `0.15.0`
+- ☐ Tag `v0.15.0`
+
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
 
@@ -1052,7 +1064,7 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 28 | ✅ Durable & cross-session memory | 2 | M16, M18 |
 | 29 | ✅ Execution environment hardening | 1–2 | M6, M5 |
 | 30 | ✅ OS sandbox (optional) | 3 | M29 |
-| 31 | Incremental tool output events | 1–2 | M29, M12 |
+| 31 | ✅ Incremental tool output events | 1–2 | M29, M12 |
 | 32 | Background processes | 1–2 | M29 |
 | 33 | Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
 
@@ -1104,7 +1116,8 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | … | `0.x.0` | One minor per independent feature milestone |
 | M29 Execution environment hardening | `0.13.0` | ✅ Complete. Minor bump (pre-1.0 convention for user-visible behaviour change): `run` now defaults to a 120 s timeout, scrubs secret env vars and closes stdin; `write`/`edit`/`delete` refuse paths outside the project root/`.git`/`.env*`; `allow-always` on `run` is command-scoped. New optional `permissions.extra_write_roots`. Not a patch bump because behaviour changes; not 1.0 because still pre-stability. |
 | M30 OS sandbox | `0.14.0` | ✅ Complete. Minor bump: additive, opt-in (`permissions.sandbox`, default `none`). |
-| M31–M33 | `0.15.0`+ | Planned, one minor each |
+| M31 Incremental tool output | `0.15.0` | ✅ Complete. Minor bump: additive `tool_output` event; consumers matching `Event` exhaustively must handle it. |
+| M32–M33 | `0.16.0`+ | Planned, one minor each |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 

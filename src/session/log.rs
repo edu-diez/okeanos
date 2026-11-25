@@ -491,6 +491,11 @@ impl SessionManager {
     /// Append an event to the current session log.
     /// Returns true if rotation occurred.
     pub fn log_event(&mut self, event: Event) -> Result<bool, SessionError> {
+        // Live tool output is ephemeral; `tool_result` carries the final output.
+        if matches!(event, Event::ToolOutput(_)) {
+            return Ok(false);
+        }
+
         // Check if we should rotate on compaction boundary (before borrowing session)
         let should_rotate_compaction = matches!(&event, Event::Compaction(_))
             && self

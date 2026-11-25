@@ -15,7 +15,9 @@ pub mod mcp;
 pub use builtin::{DeleteTool, GrepTool, MAX_OUTPUT_BYTES, ReadTool, RunTool, WriteTool};
 pub use cache::{CacheConfig, ToolResultCache};
 pub use todo::{TodoArgs, TodoItem, TodoList, TodoTool};
-pub use tool_trait::{Tool, ToolError, ToolExecutionResult, ToolRegistry, ToolSpec};
+pub use tool_trait::{
+    Tool, ToolError, ToolExecutionResult, ToolOutputSink, ToolRegistry, ToolSpec,
+};
 
 #[cfg(feature = "mcp")]
 pub use mcp::{McpClient, McpClientConfig, McpError, McpServerConfig, McpTool};
