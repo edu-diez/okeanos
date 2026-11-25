@@ -15,8 +15,9 @@
 | **ReAct loop** (`src/harness/react.rs`) | Core control flow: think → call tool → observe → repeat; context-cap enforcement; bounded retries; error-in-context. | `Harness`, `ReactLoop`, `LoopDecision` |
 | **Model abstraction** (`src/model/`) | Provider-agnostic chat completions + streaming; capability negotiation; OpenAI-compatible/OpenRouter at launch; mock provider for tests. | `Model` trait, `ModelCapabilities`, `OpenAICompatible` provider, `MockModel` |
 | **Tool system** (`src/tool/`) | JSON-schema function calling; text-based tool calling for models without native FC; tool registry; execution with permission checks; lenient parse + validate-before-execute; edit format (diff/patch + whole-file fallback); interruptible tool execution. | `Tool` trait, `ToolSpec` (JSON schema), `ToolRegistry`, `TextToolParser`, `EditFormat`, `ToolExecutor` |
-| **Permission layer** (`src/perm/`) | Safe-by-default boundary: allow-list, confirm-before-write/delete/network, local process execution sandboxing. | `Policy`, `Permission`, `ApprovalDecision` |
-| **Tool execution** (`src/tool/execute/`) | Interruptible local process execution; streaming output; configurable timeout; SIGTERM→grace→SIGKILL on cancel; SIGKILL on timeout; drain-after-exit; head/tail output truncation counted vs cap. | `ToolExecutor`, `ProcessHandle`, `StreamBuffer` |
+| **Permission layer** (`src/perm/`) | Safe-by-default boundary: allow-list, confirm-before-write/delete/network, argument-aware `run` rules and command-scoped session grants (M29). OS-level process sandboxing is planned (M30), not implemented. | `Policy`, `Permission`, `ApprovalDecision` |
+| **Tool execution** (`src/tool/execute/`) | Interruptible local process execution; default timeout; merged ordered output with bounded head/tail capture; process-tree kill (Unix process group / Windows Job Object); exit-based completion with bounded drain; scrubbed environment; closed stdin; head/tail output truncation counted vs cap. Currently implemented in `src/tool/builtin/run.rs`; incremental output events are planned (M31). | `ToolExecutor`, `ProcessHandle`, `StreamBuffer` |
+| **Workspace confinement** (`src/tool/workspace.rs`) | Process-wide writable roots (project root + `permissions.extra_write_roots`); canonicalizes through symlinks, rejects `..` escapes, protects `.git` and `.env*`; checked by `write`/`edit`/`delete` before any mutation (M29). | `set_roots`, `guard_write` |
 | **Edit format** (`src/tool/edit/`) | Diff/patch default for frontier; whole-file/str_replace fallback for small models; per-model edit-format hint; preflight-validate patches before applying; never silently truncate or partially apply. | `EditFormat`, `PatchValidator`, `PatchApplier` |
 | **Cost budget** (`src/cost/`) | Opt-in hard session cost cap (USD); per-turn soft warning threshold; fail closed on unknown pricing; refuse new tool calls exceeding cap; let in-flight work finish. | `CostBudget`, `CostTracker` |
 | **Conversation & context** (`src/context/`) | Message history, tiered system prompt + `skills/` concatenation, hard context cap, context-cap error, approximate token counting, cost estimation, selective file inclusion, history-turn capping per tier, context window warnings before cap. | `Conversation`, `ContextCap`, `TokenCounter`, `CostEstimate`, `Tier`, `SelectiveContext`, `ContextWarnings` |
@@ -199,7 +200,7 @@ Key events (extend DESIGN.md §7):
 - **Model capability boundary:** `ModelCapabilities` is declared per-model (TOML override for local models); harness never guesses capabilities for self-hosted models.
 - **Text tool parsing boundary:** Raw model output is parsed into tool invocations leniently, then validated against the tool schema before execution. Invalid calls return structured errors; never execute unvalidated calls.
 - **Tool service boundary:** `Tool` trait + `ToolRegistry`. Built-in tools live in `src/tool/builtin/`; user tools register at runtime. Tool subset selected by model tier.
-- **Permission boundary:** `Policy::check(operation)` gates every write/delete/network/process call. The `run` tool executes local processes here, with allow-list on commands and args.
+- **Permission boundary:** `Policy::check` / `Policy::check_call(tool, spec, args)` gate every write/delete/network/process call. `check_call` is the argument-aware entry point used by the loop: for `run` it matches command rules (`run:<program>[ <subcommand>]`) from the allow-list and session grants. Confinement of file mutations is enforced inside the tools by `tool::workspace`.
 - **Config boundary:** Config is loaded once at startup (global + project layers), validated, then treated as read-only. Secrets are substituted at load time and never logged.
 - **Shutdown boundary:** Signal handler owns SIGINT/SIGTERM; it flushes the session log, drains the ReAct loop, teardowns the TUI, then exits. No subsystem may block shutdown indefinitely.
 - **Transport boundary:** Headless/RPC transports (stdio JSON-RPC, optional HTTP) sit behind `HeadlessDriver`; the TUI has no transport dependency.
@@ -252,9 +253,10 @@ okeanos/
 │   │       ├── read.rs
 │   │       ├── write.rs
 │   │       ├── delete.rs
-│   │       ├── run.rs     # local process at permission boundary
+│   │       ├── run.rs     # local process at permission boundary (M29 hardened)
 │   │       ├── remember.rs # durable memory writer, Write category (M28)
 │   │       └── grep.rs
+│   │   └── workspace.rs   # writable-root confinement for write/edit/delete (M29)
 │   ├── cost/
 │   │   └── budget.rs      # session cost cap, per-turn warnings, fail-closed pricing
 │   ├── perm/
@@ -317,9 +319,9 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 ## Security model
 
 1. **Safe by default:** No write, delete, or network operation executes without policy approval. Read-only operations (read, grep, todo list) run without confirmation.
-2. **Allow-list:** Commands (for `run`), hosts (for model provider), and file paths are checked against an allow-list; defaults deny.
+2. **Allow-list:** Commands (for `run`, as `run:<program>[ <subcommand>]` rules), hosts (for model provider), and tool names are checked against an allow-list; defaults deny. File mutations are confined to the workspace roots (see 12).
 3. **Confirm-before:** write/delete/network require explicit allow (TUI modal or RPC approval). `allow-always` grants are session-scoped and recorded in the session log.
-4. **Permission boundary for processes:** The `run` tool executes local processes inside the permission layer, with command/arg allow-listing and no shell interpolation where avoidable.
+4. **Permission boundary for processes:** The `run` tool executes a program directly (no shell) inside the permission layer. `allow-always` on `run` is scoped to the command and refused for risky commands (shells, interpreters, sudo, rm, curl/ssh, `git push`…). The child gets a closed stdin and a scrubbed environment (secret-looking variables removed). There is **no OS-level sandbox yet** — an approved command runs with the user's full privileges (M30).
 5. **No secrets in logs:** `tracing` events must not log API keys, auth headers, or tool args containing secrets; args are redacted by default in log output.
 6. **Git sandbox:** Snapshots are taken only inside the session's working directory; gix never runs arbitrary git commands outside policy.
 7. **Static binary reduces supply-chain surface:** No libgit2/openssl FFI (gix + rustls), minimizing native dependencies.
@@ -327,6 +329,8 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 9. **Approval bubbling:** Sub-agent approval requests route to parent; parent's decision is the only authority. Sub-agent cannot bypass approval by spawning children (depth limit enforced at spawn).
 10. **Token budget inheritance:** Sub-agent `CostTracker` is a child of parent's tracker; cannot exceed parent's session cap. Global spawn budget (default 64) prevents resource exhaustion.
 11. **Instruction files and memory are untrusted-ish input:** `AGENTS.md`/`CLAUDE.md` and memory files from a cloned repo enter the system prompt, like in other agents; they cannot widen permissions because every tool call still passes `Policy::check`. They are plain files, not a new config source: they carry prose for the model and never change okeanos settings. `remember` is Write-category (approval required), slugs file names, and refuses to write outside the memory directories. Memory is never loaded from outside `<project_root>/.okeanos/memory/` or the user config dir.
+12. **Workspace confinement (M29):** `write`, `edit` and `delete` reject paths outside the project root and `permissions.extra_write_roots` (symlinks/`..` resolved first), and always protect `.git/**`, `.env`/`.env.*` and the roots themselves. Reads are unrestricted. This guards against model mistakes and path tricks; it is not a sandbox against an approved `run` command.
+13. **Process containment (M29):** timeouts and cancellation kill the whole process tree (Unix process group; Windows Job Object via `windows-sys`, a pure-Rust bindings crate). Default timeout 120 s. Output capture is memory-bounded.
 
 ### Durable memory data flow (M28)
 
@@ -339,6 +343,7 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 
 - **Primary crates (Phase 2 recommendation):** ratatui + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC).
 - **No C dependencies** in the primary tree: avoid git2, openssl, rapidjson. Build with `--target x86_64-unknown-linux-musl` for full static.
+- **Platform process-control crates (M29):** `nix` (`signal`, Unix-only target dependency) for process-group signalling and `windows-sys` (Windows-only target dependency, features `Win32_Foundation`/`Security`/`System_IO`/`System_JobObjects`/`System_Threading`) for Job Objects. Both are raw-binding crates with no C code; neither is compiled on the other platform. tokio additionally enables `io-util` and `sync`.
 - **Feature flags:** `rpc` (jsonrpsee HTTP/WebSocket), `mcp` (lazy MCP client, deferred), `mock-provider` (test-only MockModel), `simd-json` (performance opt, deferred).
 - **Config crate rule:** `toml` is added only for config parsing; it sits in the CLI/config layer, never in the harness `lib`.
 - **Layering rule:** `src/lib` (harness) depends only on model/tool/perm/context/session/snapshot/events — never on `ui`, `headless`, or `cli`. UI and headless depend on the harness, not vice versa. Sub-agent delegation (`src/harness/subagent.rs`) is part of the harness lib; it uses `ReactLoop`, `ToolRegistry`, `Policy`, `CostTracker`, `Conversation`, `SnapshotStore` — all harness-internal.

@@ -128,6 +128,7 @@ impl Tool for EditTool {
             .ok_or_else(|| ToolError::InvalidArgs("missing required argument 'path'".into()))?;
 
         let path = Path::new(path);
+        crate::tool::workspace::guard_write(path)?;
 
         // Determine the edit format
         let format = args

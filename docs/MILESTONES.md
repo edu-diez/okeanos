@@ -967,6 +967,33 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.12.0`
 - ✅ Tagged `v0.12.0`
 
+### Milestone 29 — Execution environment hardening
+**Status:** complete — v0.13.0 (tag pending)
+
+**Scope:** Fix correctness/safety gaps found in the execution-environment review (FR-47..FR-49).
+- `run`: default 120 s timeout; merged ordered output; raw-byte capture (lossy UTF-8, no stalls on invalid UTF-8); bounded head/tail capture; exit-based completion with bounded drain (grandchild holding a pipe cannot hang the tool); partial output preserved on timeout (previously lost); process-tree kill on timeout/cancel (Unix process group, Windows Job Object — replaces leader-only kill); stdin closed; secret env vars scrubbed.
+- Workspace confinement for `write`/`edit`/`delete` (`src/tool/workspace.rs`, `permissions.extra_write_roots`); `.git`/`.env*` protected.
+- `Policy::check_call`: command-scoped `run` rules and session grants; risky commands never session-granted.
+- Docs corrected: command/arg allow-listing and path scoping are now real; OS sandbox explicitly marked not implemented.
+- **Out of scope:** OS sandbox, incremental output events, background processes (M30–M32).
+
+**Definition of Done:**
+- ✅ Unit tests: capture bounds, env scrubbing, timeout keeps output + kills tree, stdin closed, non-zero exit; Unix-only: invalid UTF-8, background grandchild; workspace confinement (outside root, `..`, `.git`, `.env`, symlink on Unix); policy rule scoping/risky commands/allow-list rules
+- ✅ `cargo clippy --all-targets -- -D warnings` and `cargo test` (417 passed, Windows)
+- ⚠️ Unix-only code paths (`killpg`, process group) and tests compile-checked by review only — verify in CI on Linux/macOS/musl
+- ✅ `Cargo.toml` bumped to `0.13.0`; `nix` made Unix-only, `windows-sys` added Windows-only
+- ☐ Tag `v0.13.0`
+
+### Execution-environment roadmap (planned, from the M29 review)
+Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
+
+| Milestone | Deliverable | Notes |
+|-----------|-------------|-------|
+| M30 | Optional OS sandbox: `sandbox = none \| read-only \| workspace-write`, network off by default, behind a `Sandbox` trait independent of approvals. Linux: bwrap/Landlock; macOS: `sandbox-exec`; Windows: restricted token/AppContainer. | Minor bump. Must keep musl/static rule (no C deps) — prefer spawning `bwrap`/`sandbox-exec` over linking. |
+| M31 | Incremental output: `Tool` trait gains an output-event channel; `run` streams chunks as `ToolOutput` events (TUI + headless parity per DESIGN.md §7). | AGENTS.md already requires streaming; currently output is returned at completion. Needs DESIGN.md §7 update first. |
+| M32 | Background processes: `run` `background: true` + poll/kill handle; Job Object/process group reuse. | Needed for dev servers/watchers. |
+| M33 | Policy depth: file-based exec-policy rules (allow/ask/deny, prefix/glob), compound-command parsing for shell-style invocations, env allowlist mode, dedicated `Process` tool category (today `run` is categorised `Network`), persistent shell session (optional). | Config schema change → document in ARCHITECTURE config section. |
+
 ---
 
 ## Milestone summary table
@@ -1010,6 +1037,11 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 26 | Markdown rendering | 1–2 | M12 |
 | 27 | ✅ Multi-agent delegation | 5–6 | M16, M13 |
 | 28 | ✅ Durable & cross-session memory | 2 | M16, M18 |
+| 29 | ✅ Execution environment hardening | 1–2 | M6, M5 |
+| 30 | OS sandbox (optional) | 3 | M29 |
+| 31 | Incremental tool output events | 1–2 | M29, M12 |
+| 32 | Background processes | 1–2 | M29 |
+| 33 | Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
 
 ---
 
@@ -1057,6 +1089,8 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M27 Multi-agent delegation | `0.11.0` | ✅ Complete |
 | M28 Durable & cross-session memory | `0.12.0` | ✅ Complete. Minor bump: new feature, additive only (new optional `[memory]` config, new `remember` tool, system prompt gains project instructions). No breaking CLI/config/API change, so not a major/patch bump. |
 | … | `0.x.0` | One minor per independent feature milestone |
+| M29 Execution environment hardening | `0.13.0` | ✅ Complete. Minor bump (pre-1.0 convention for user-visible behaviour change): `run` now defaults to a 120 s timeout, scrubs secret env vars and closes stdin; `write`/`edit`/`delete` refuse paths outside the project root/`.git`/`.env*`; `allow-always` on `run` is command-scoped. New optional `permissions.extra_write_roots`. Not a patch bump because behaviour changes; not 1.0 because still pre-stability. |
+| M30–M33 | `0.14.0`+ | Planned, one minor each |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 

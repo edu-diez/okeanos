@@ -216,6 +216,22 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
         .context("configuration validation failed")?;
     tracing::info!("configuration loaded");
 
+    let mut write_roots = vec![
+        cli.root
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    ];
+    write_roots.extend(
+        config
+            .permissions
+            .as_ref()
+            .and_then(|p| p.extra_write_roots.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|r| std::path::PathBuf::from(shellexpand::tilde(r).as_ref())),
+    );
+    okeanos::tool::workspace::set_roots(write_roots);
+
     match cli.mode() {
         Mode::Interactive => run_interactive(cli, &config, prompt).await,
         Mode::Headless => run_headless(cli, &config, prompt).await,

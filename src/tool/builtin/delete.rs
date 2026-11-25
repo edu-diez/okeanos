@@ -45,6 +45,7 @@ impl Tool for DeleteTool {
             .ok_or_else(|| ToolError::InvalidArgs("missing required argument 'path'".into()))?;
 
         let path = Path::new(path);
+        crate::tool::workspace::guard_write(path)?;
 
         if path.is_dir() {
             std::fs::remove_dir_all(path).map_err(|e| {

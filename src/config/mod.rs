@@ -334,6 +334,8 @@ pub struct ContextSection {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PermissionsSection {
     pub allow_list: Option<Vec<String>>,
+    /// Extra directories (besides the project root) that `write`/`edit`/`delete` may modify.
+    pub extra_write_roots: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

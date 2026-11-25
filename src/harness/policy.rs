@@ -6,7 +6,112 @@
 use crate::events::ApprovalDecision;
 use crate::tool::ToolSpec;
 use crate::tool::tool_trait::ToolCategory;
+use serde_json::Value;
 use std::collections::HashSet;
+
+const RUN_TOOL: &str = "run";
+
+/// Programs where the first non-flag argument selects the actual operation.
+const SUBCOMMAND_PROGRAMS: &[&str] = &[
+    "git", "cargo", "npm", "pnpm", "yarn", "docker", "kubectl", "go", "dotnet", "pip", "uv", "gh",
+    "rustup", "just",
+];
+
+/// Programs that can run arbitrary code, escalate, delete, or move data
+/// off-machine; never covered by a session-wide grant.
+const RISKY_PROGRAMS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "dash",
+    "cmd",
+    "powershell",
+    "pwsh",
+    "env",
+    "sudo",
+    "su",
+    "doas",
+    "xargs",
+    "eval",
+    "nohup",
+    "rm",
+    "rmdir",
+    "del",
+    "rd",
+    "erase",
+    "curl",
+    "wget",
+    "ssh",
+    "scp",
+    "sftp",
+    "rsync",
+    "nc",
+    "ncat",
+    "dd",
+    "mkfs",
+    "chmod",
+    "chown",
+    "python",
+    "python3",
+    "node",
+    "perl",
+    "ruby",
+    "deno",
+    "bun",
+];
+
+const RISKY_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("git", "push"),
+    ("git", "reset"),
+    ("git", "clean"),
+    ("git", "rebase"),
+    ("git", "checkout"),
+    ("git", "restore"),
+    ("git", "rm"),
+    ("npm", "publish"),
+    ("npm", "exec"),
+    ("cargo", "publish"),
+    ("cargo", "install"),
+    ("docker", "run"),
+    ("docker", "exec"),
+    ("gh", "api"),
+    ("pip", "install"),
+];
+
+/// Rule key for a `run` call: the lowercase program name (no directory or
+/// `.exe`), plus the first non-flag argument for subcommand-style programs.
+pub fn run_rule_key(args: &Value) -> Option<String> {
+    let command = args.get("command")?.as_str()?;
+    let base = command.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+    let program = base.strip_suffix(".exe").unwrap_or(&base).to_string();
+    if program.is_empty() {
+        return None;
+    }
+    let mut key = format!("{RUN_TOOL}:{program}");
+    if SUBCOMMAND_PROGRAMS.contains(&program.as_str())
+        && let Some(sub) = args.get("args").and_then(|v| v.as_array()).and_then(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .find(|s| !s.starts_with('-'))
+        })
+    {
+        key.push(' ');
+        key.push_str(&sub.to_ascii_lowercase());
+    }
+    Some(key)
+}
+
+fn is_risky_run(key: &str) -> bool {
+    let rest = key.strip_prefix("run:").unwrap_or(key);
+    let (program, sub) = rest.split_once(' ').unwrap_or((rest, ""));
+    RISKY_PROGRAMS.contains(&program) || RISKY_SUBCOMMANDS.contains(&(program, sub))
+}
+
+fn rule_matches(rule: &str, key: &str) -> bool {
+    rule.starts_with("run:")
+        && (rule == key || key.strip_prefix(rule).is_some_and(|r| r.starts_with(' ')))
+}
 
 /// Policy decision for a tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,9 +163,57 @@ impl Policy {
         }
     }
 
+    /// Argument-aware variant of [`Policy::check`].
+    ///
+    /// For `run`, allow-list entries and session grants are command rules
+    /// (`run:cargo test` matches `cargo test --all`), so approving one command
+    /// never approves arbitrary execution. A bare `run` allow-list entry still
+    /// allows every command.
+    pub fn check_call(&self, tool: &str, spec: &ToolSpec, args: &Value) -> PolicyDecision {
+        if tool == RUN_TOOL
+            && !self.allow_list.contains(tool)
+            && !self.session_allows.contains(tool)
+            && let Some(key) = run_rule_key(args)
+        {
+            let matches = |rule: &String| rule_matches(rule, &key);
+            if self.allow_list.iter().any(matches) || self.session_allows.iter().any(matches) {
+                return PolicyDecision::Allow;
+            }
+            return PolicyDecision::RequireApproval;
+        }
+        self.check(tool, spec)
+    }
+
     /// Grant allow-always for a tool in this session.
     pub fn allow_always(&mut self, tool: &str) {
         self.session_allows.insert(tool.to_string());
+    }
+
+    /// Grant allow-always for a specific call. `run` grants are scoped to the
+    /// command (see [`run_rule_key`]) and refused for risky commands, which
+    /// are asked about every time. Returns whether a grant was recorded.
+    pub fn allow_always_call(&mut self, tool: &str, args: &Value) -> bool {
+        if tool != RUN_TOOL {
+            self.allow_always(tool);
+            return true;
+        }
+        match run_rule_key(args) {
+            Some(key) if !is_risky_run(&key) => {
+                self.session_allows.insert(key);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this specific call is covered by a session grant.
+    pub fn has_session_allow_call(&self, tool: &str, args: &Value) -> bool {
+        if tool == RUN_TOOL
+            && let Some(key) = run_rule_key(args)
+        {
+            return self.session_allows.iter().any(|r| rule_matches(r, &key));
+        }
+        self.has_session_allow(tool)
     }
 
     /// Record an approval decision, persisting allow-always grants.
@@ -162,6 +315,76 @@ mod tests {
         assert_eq!(
             policy.check("fetch", &network_spec),
             PolicyDecision::RequireApproval
+        );
+    }
+
+    #[test]
+    fn test_run_allow_always_is_command_scoped() {
+        let mut policy = Policy::new(vec![]);
+        let spec = ToolSpec::new("run", "d", json!({})).with_category(ToolCategory::Network);
+        let test = json!({"command": "cargo", "args": ["test", "--all"]});
+        let publish = json!({"command": "cargo", "args": ["publish"]});
+        let ls = json!({"command": "C:\\bin\\LS.exe", "args": ["-la"]});
+
+        assert!(policy.allow_always_call("run", &test));
+        assert_eq!(
+            policy.check_call("run", &spec, &test),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.check_call("run", &spec, &publish),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            policy.check_call("run", &spec, &ls),
+            PolicyDecision::RequireApproval
+        );
+        assert!(policy.has_session_allow_call("run", &test));
+        assert!(!policy.has_session_allow_call("run", &publish));
+    }
+
+    #[test]
+    fn test_run_risky_commands_never_granted() {
+        let mut policy = Policy::new(vec![]);
+        let spec = ToolSpec::new("run", "d", json!({})).with_category(ToolCategory::Network);
+        for call in [
+            json!({"command": "sh", "args": ["-c", "x"]}),
+            json!({"command": "rm", "args": ["-rf", "x"]}),
+            json!({"command": "git", "args": ["push"]}),
+        ] {
+            assert!(!policy.allow_always_call("run", &call));
+            assert_eq!(
+                policy.check_call("run", &spec, &call),
+                PolicyDecision::RequireApproval
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_allow_list_rules() {
+        let spec = ToolSpec::new("run", "d", json!({})).with_category(ToolCategory::Network);
+        let policy = Policy::new(vec!["run:cargo".into(), "run:git status".into()]);
+        let check = |c: Value| policy.check_call("run", &spec, &c);
+        assert_eq!(
+            check(json!({"command": "cargo", "args": ["build"]})),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            check(json!({"command": "git", "args": ["status", "-s"]})),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            check(json!({"command": "git", "args": ["push"]})),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            check(json!({"command": "cargofoo"})),
+            PolicyDecision::RequireApproval
+        );
+        let all = Policy::new(vec!["run".into()]);
+        assert_eq!(
+            all.check_call("run", &spec, &json!({"command": "anything"})),
+            PolicyDecision::Allow
         );
     }
 

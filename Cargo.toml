@@ -1,7 +1,7 @@
 [package]
 name = "okeanos"
 description = "Autonomous coding agent harness"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 resolver = "2"
 
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
-tokio = { version = "1.43", features = ["rt", "macros", "time", "signal", "process", "io-std"] }
+tokio = { version = "1.43", features = ["rt", "macros", "time", "signal", "process", "io-std", "io-util", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 thiserror = "1.0"
 anyhow = "1.0"
@@ -31,7 +31,6 @@ chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 bytes = "1"
 uuid = { version = "1.8", features = ["v4", "serde"] }
-nix = { version = "0.28", features = ["signal"] }
 atty = "0.2"
 async-stream = "0.3"
 zstd = "0.13"
@@ -51,6 +50,12 @@ http = { version = "1.2", optional = true }
 rmcp = { version = "3.11", optional = true, features = ["client", "transport-child-process", "schemars"] }
 pulldown-cmark = { version = "0.12", optional = true }
 syntect = { version = "5.0", optional = true, default-features = false, features = ["default-fancy"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["signal"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.15"

@@ -54,6 +54,7 @@ impl Tool for WriteTool {
             .ok_or_else(|| ToolError::InvalidArgs("missing required argument 'content'".into()))?;
 
         let path = Path::new(path);
+        crate::tool::workspace::guard_write(path)?;
         if let Some(parent) = path.parent() {
             fs_create_dir_all(parent).map_err(|e| {
                 ToolError::ExecutionFailed(format!("failed to create directories: {e}"))

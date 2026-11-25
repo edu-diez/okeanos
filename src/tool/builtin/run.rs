@@ -1,26 +1,41 @@
-//! Built-in `run` tool — execute a local process with interruptible, streaming output.
+//! Built-in `run` tool — execute a local process (no shell) with bounded, ordered output.
 //!
-//! Category: Network (requires approval — local process execution is the permission boundary).
+//! Category: Network (requires approval — local process execution is the permission boundary;
+//! `Policy::check_call` scopes session grants and allow-list rules to the command).
 //!
-//! Features:
-//! - Configurable per-invocation timeout (`timeout_secs` argument).
-//! - Output streams incrementally (line by line) as the process produces it.
-//! - On timeout: SIGTERM → grace period → SIGKILL, drain output, return with `timed_out: true`.
-//! - On cancellation (shutdown signal): process killed via `kill_on_drop`.
-//! - Returns `exit_code`, `timed_out`, `cancelled` in the tool result.
-//! - Output is truncated to MAX_OUTPUT_BYTES with head/tail overflow indicator.
+//! Behaviour:
+//! - Default timeout of 120s (`timeout_secs`, 1..=3600) so a hung command never hangs the agent.
+//! - stdout and stderr are merged into one stream in arrival order. Raw bytes are read, so
+//!   non-UTF-8 output is decoded lossily instead of stalling the pipe.
+//! - Capture memory is bounded: the first and last `CAPTURE_PART` bytes are kept, with the
+//!   omitted byte count noted. The result is then truncated to `MAX_OUTPUT_BYTES` with the full
+//!   captured text spilled to a temp file.
+//! - Completion is detected from process exit, not pipe EOF; a grandchild holding the pipe open
+//!   delays the result by at most `DRAIN_GRACE_MS`.
+//! - On timeout the whole process tree is killed (Unix: SIGTERM → grace → SIGKILL on the process
+//!   group; Windows: Job Object) and the output produced so far is returned with
+//!   `timed_out: true`. If the future is dropped (cancellation) the tree is killed as well.
+//! - stdin is closed and secret-looking environment variables are not passed to the child
+//!   (set `OKEANOS_RUN_INHERIT_ENV=1` to disable scrubbing).
 
 use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output_with_spill};
 use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout_at};
 
-const GRACE_PERIOD_MS: u64 = 500; // Grace period between SIGTERM and SIGKILL
+#[cfg(unix)]
+const GRACE_PERIOD_MS: u64 = 500; // Between SIGTERM and SIGKILL
+const DRAIN_GRACE_MS: u64 = 250; // Max extra read time after the process exits
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+const MAX_TIMEOUT_SECS: u64 = 3600;
+const CAPTURE_PART: usize = 256 * 1024;
 
 /// Built-in tool for executing local commands.
 #[derive(Debug, Default)]
@@ -37,7 +52,7 @@ impl Tool for RunTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "run",
-            "Execute a local command with optional timeout.",
+            "Execute a local command (no shell) with a timeout (default 120s). stdin is closed.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -54,7 +69,7 @@ impl Tool for RunTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 3600,
-                        "description": "Maximum seconds to wait before killing the process."
+                        "description": "Maximum seconds to wait before killing the process tree (default 120)."
                     }
                 },
                 "required": ["command"]
@@ -79,20 +94,25 @@ impl Tool for RunTool {
             })
             .unwrap_or_default();
 
-        let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS);
 
         let mut cmd = Command::new(command);
         cmd.args(&args_vec);
+        cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        scrub_env(&mut cmd);
 
-        // If the future is dropped (e.g. due to cancellation), kill the process.
+        // Backstop in case the guard below cannot run.
         cmd.kill_on_drop(true);
 
         #[cfg(unix)]
         {
-            // Place the child in its own process group so we can signal
-            // the entire group on cancellation/timeout.
+            // Own process group so the whole tree can be signalled.
             cmd.process_group(0);
         }
 
@@ -100,7 +120,9 @@ impl Tool for RunTool {
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn '{command}': {e}")))?;
 
-        // Take stdout/stderr so we can read them incrementally.
+        // Kills the whole tree if this future is dropped (cancellation).
+        let mut guard = TreeGuard::new(&child);
+
         let stdout = child
             .stdout
             .take()
@@ -110,76 +132,67 @@ impl Tool for RunTool {
             .take()
             .ok_or_else(|| ToolError::ExecutionFailed("failed to capture stderr".into()))?;
 
-        // Spawn tasks to read stdout and stderr line by line.
-        let stdout_handle = tokio::spawn(read_stream(stdout));
-        let stderr_handle = tokio::spawn(read_stream(stderr));
+        // Both streams feed one channel so output keeps its arrival order.
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let readers = [
+            tokio::spawn(pump(stdout, tx.clone())),
+            tokio::spawn(pump(stderr, tx)),
+        ];
 
-        // Wait for the process to exit, with an optional timeout.
-        let wait_result: Result<std::process::ExitStatus, std::io::Error> =
-            if let Some(secs) = timeout_secs {
-                match timeout(Duration::from_secs(secs), child.wait()).await {
-                    Ok(status) => status,
-                    Err(_elapsed) => {
-                        // Timeout: implement SIGTERM → grace period → SIGKILL sequence.
-                        #[cfg(unix)]
-                        {
-                            use nix::sys::signal::{Signal, kill};
-                            use nix::unistd::Pid;
-                            if let Some(pid) = child.id() {
-                                // Get the process group ID (negative of pid since we set process_group(0))
-                                let pgid = Pid::from_raw(-(pid as i32));
-                                // Send SIGTERM to the process group
-                                let _ = kill(pgid, Signal::SIGTERM);
-                                // Wait for grace period
-                                tokio::time::sleep(Duration::from_millis(GRACE_PERIOD_MS)).await;
-                                // Force SIGKILL if still alive
-                                let _ = kill(pgid, Signal::SIGKILL);
-                            }
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = child.kill().await;
-                        }
-                        let _ = child.wait().await;
-                        // Abort the stream readers — the pipes are now closed.
-                        stdout_handle.abort();
-                        stderr_handle.abort();
-                        let output = drain_output(stdout_handle, stderr_handle).await;
-                        return Ok(ToolExecutionResult {
-                            output,
-                            exit_code: None,
-                            timed_out: true,
-                            cancelled: false,
-                            truncated: false,
-                        });
-                    }
-                }
-            } else {
-                child.wait().await
-            };
+        let mut capture = Capture::default();
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut rx_open = true;
 
-        // Drain remaining output from the stream readers.
-        let stdout_output = stdout_handle.await.unwrap_or_default();
-        let stderr_output = stderr_handle.await.unwrap_or_default();
-        let output = format!("{}{}", stdout_output, stderr_output);
+        let status = loop {
+            tokio::select! {
+                chunk = rx.recv(), if rx_open => match chunk {
+                    Some(c) => capture.push(&c),
+                    None => rx_open = false,
+                },
+                status = child.wait() => break Some(status),
+                _ = tokio::time::sleep_until(deadline) => break None,
+            }
+        };
 
-        let (exit_code, timed_out, cancelled) = match wait_result {
-            Ok(status) => (status.code(), false, false),
-            Err(e) => {
+        let (exit_code, timed_out) = match status {
+            Some(Ok(status)) => (status.code(), false),
+            Some(Err(e)) => {
                 return Err(ToolError::ExecutionFailed(format!(
                     "process wait failed: {e}"
                 )));
             }
+            None => {
+                terminate(&mut child, &guard).await;
+                (None, true)
+            }
         };
+        guard.disarm();
 
-        // Truncate output if needed.
-        let (truncated_output, truncated) = truncate_output_with_spill(&output, MAX_OUTPUT_BYTES);
+        // Collect what is left in the pipes, bounded in time so a grandchild
+        // that inherited the pipe cannot stall the result.
+        if rx_open {
+            let drain_deadline = Instant::now() + Duration::from_millis(DRAIN_GRACE_MS);
+            while let Ok(Some(c)) = timeout_at(drain_deadline, rx.recv()).await {
+                capture.push(&c);
+            }
+        }
+        for r in &readers {
+            r.abort();
+        }
+
+        let mut output = capture.finish();
+        if timed_out {
+            output.push_str(&format!(
+                "\n[timed out after {timeout_secs}s; process tree killed]"
+            ));
+        }
+        let (output, truncated) = truncate_output_with_spill(&output, MAX_OUTPUT_BYTES);
 
         Ok(ToolExecutionResult {
-            output: truncated_output,
+            output,
             exit_code,
             timed_out,
-            cancelled,
+            cancelled: false,
             truncated,
         })
     }
@@ -189,25 +202,239 @@ impl Tool for RunTool {
     }
 }
 
-/// Read all lines from an async stream into a String.
-async fn read_stream(stream: impl tokio::io::AsyncRead + Unpin + Send + 'static) -> String {
-    let mut output = String::new();
-    let mut lines = BufReader::new(stream).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        output.push_str(&line);
-        output.push('\n');
+/// Forward raw chunks from a stream until EOF or the receiver goes away.
+async fn pump(mut stream: impl AsyncRead + Unpin + Send + 'static, tx: mpsc::Sender<Vec<u8>>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
-    output
 }
 
-/// Drain output from potentially-aborted stream handles.
-async fn drain_output(
-    stdout_handle: tokio::task::JoinHandle<String>,
-    stderr_handle: tokio::task::JoinHandle<String>,
-) -> String {
-    let stdout_output = stdout_handle.await.unwrap_or_default();
-    let stderr_output = stderr_handle.await.unwrap_or_default();
-    format!("{}{}", stdout_output, stderr_output)
+/// Bounded output capture: keeps the head and the most recent tail.
+#[derive(Default)]
+struct Capture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    omitted: usize,
+}
+
+impl Capture {
+    fn push(&mut self, mut chunk: &[u8]) {
+        if self.head.len() < CAPTURE_PART {
+            let take = (CAPTURE_PART - self.head.len()).min(chunk.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        self.tail.extend(chunk);
+        if self.tail.len() > CAPTURE_PART {
+            let excess = self.tail.len() - CAPTURE_PART;
+            self.tail.drain(..excess);
+            self.omitted += excess;
+        }
+    }
+
+    fn finish(self) -> String {
+        let mut bytes = self.head;
+        if self.omitted > 0 {
+            bytes.extend_from_slice(
+                format!("\n...[{} bytes omitted]...\n", self.omitted).as_bytes(),
+            );
+        }
+        bytes.extend(self.tail);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Owns the child's process tree (Unix process group / Windows Job Object).
+/// Dropping it while armed — e.g. on cancellation — kills the whole tree.
+struct TreeGuard {
+    armed: bool,
+    #[cfg(unix)]
+    pgid: Option<u32>,
+    #[cfg(windows)]
+    job: Option<job::Job>,
+}
+
+impl TreeGuard {
+    fn new(child: &Child) -> Self {
+        Self {
+            armed: true,
+            #[cfg(unix)]
+            pgid: child.id(),
+            #[cfg(windows)]
+            job: child.raw_handle().and_then(job::Job::containing),
+        }
+    }
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(pgid as i32), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
+
+    /// Normal completion: leave any background processes the command started running.
+    fn disarm(&mut self) {
+        self.armed = false;
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.release();
+        }
+    }
+}
+
+impl Drop for TreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill();
+        }
+    }
+}
+
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+
+    /// A Job Object with kill-on-close semantics holding the child tree.
+    pub struct Job(HANDLE);
+
+    // The handle is only used through thread-safe Win32 calls.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        /// Create a job and assign `process` to it. Descendants spawned afterwards inherit it.
+        pub fn containing(process: *mut c_void) -> Option<Job> {
+            // SAFETY: plain Win32 calls on handles we own; `info` is a valid zeroed struct.
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let job = Job(handle);
+                if !job.set_kill_on_close(true) || AssignProcessToJobObject(handle, process) == 0 {
+                    return None;
+                }
+                Some(job)
+            }
+        }
+
+        fn set_kill_on_close(&self, on: bool) -> bool {
+            // SAFETY: see `containing`.
+            unsafe {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                if on {
+                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                }
+                SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) != 0
+            }
+        }
+
+        pub fn terminate(&self) {
+            // SAFETY: valid job handle.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+
+        /// Stop killing the tree when the handle is closed.
+        pub fn release(&self) {
+            self.set_kill_on_close(false);
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closing the handle we own exactly once.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// Stop the process tree after a timeout and reap the leader.
+async fn terminate(child: &mut Child, guard: &TreeGuard) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        tokio::time::sleep(Duration::from_millis(GRACE_PERIOD_MS)).await;
+    }
+    // The leader is not reaped yet, so its pid/pgid cannot have been reused.
+    guard.kill();
+    let _ = child.kill().await;
+}
+
+/// Remove credentials from the child's environment.
+fn scrub_env(cmd: &mut Command) {
+    if std::env::var("OKEANOS_RUN_INHERIT_ENV").is_ok_and(|v| v == "1") {
+        return;
+    }
+    for (name, _) in std::env::vars_os() {
+        if let Some(n) = name.to_str()
+            && is_secret_var(n)
+        {
+            cmd.env_remove(n);
+        }
+    }
+}
+
+fn is_secret_var(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    const PREFIXES: &[&str] = &[
+        "OKEANOS_",
+        "ANTHROPIC_",
+        "OPENAI_",
+        "GEMINI_",
+        "AZURE_OPENAI_",
+    ];
+    const EXACT: &[&str] = &[
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_API_KEY",
+    ];
+    const SUFFIXES: &[&str] = &[
+        "_API_KEY",
+        "_APIKEY",
+        "_TOKEN",
+        "_SECRET",
+        "_PASSWORD",
+        "_PRIVATE_KEY",
+        "_ACCESS_KEY",
+    ];
+    const CONTAINS: &[&str] = &["PASSWORD", "SECRET", "CREDENTIAL"];
+    PREFIXES.iter().any(|p| n.starts_with(p))
+        || EXACT.contains(&n.as_str())
+        || SUFFIXES.iter().any(|s| n.ends_with(s))
+        || CONTAINS.iter().any(|c| n.contains(c))
 }
 
 #[cfg(test)]
@@ -231,24 +458,27 @@ mod tests {
 
         assert!(!result.timed_out);
         assert!(!result.cancelled);
-        assert!(result.exit_code.is_some());
         assert_eq!(result.exit_code, Some(0));
         assert!(result.output.contains("hello world"));
     }
 
     #[tokio::test]
-    async fn test_run_tool_timeout() {
+    async fn test_run_tool_timeout_keeps_output_and_kills_tree() {
         let tool = RunTool::new();
-        let args = if cfg!(windows) {
-            json!({ "command": "ping", "args": ["-n", "100", "127.0.0.1"], "timeout_secs": 1 })
+        let script = if cfg!(windows) {
+            "echo before & ping -n 100 127.0.0.1"
         } else {
-            json!({ "command": "sleep", "args": ["100"], "timeout_secs": 1 })
+            "echo before; sleep 100"
         };
+        let mut args = shell(script);
+        args["timeout_secs"] = json!(3);
+        let start = std::time::Instant::now();
         let result = tool.execute(args).await.unwrap();
 
         assert!(result.timed_out);
-        assert!(!result.cancelled);
         assert!(result.exit_code.is_none());
+        assert!(result.output.contains("before"), "got: {}", result.output);
+        assert!(start.elapsed() < Duration::from_secs(15));
     }
 
     #[tokio::test]
@@ -285,19 +515,77 @@ mod tests {
         assert!(!result.timed_out);
     }
 
+    #[tokio::test]
+    async fn test_run_tool_stdin_is_closed() {
+        let tool = RunTool::new();
+        let script = if cfg!(windows) { "more" } else { "cat" };
+        let result = tool.execute(shell(script)).await.unwrap();
+        assert!(!result.timed_out);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn test_run_tool_stderr_captured() {
         let tool = RunTool::new();
-        let result = tool
-            .execute(json!({
-                "command": "sh",
-                "args": ["-c", "echo error >&2"]
-            }))
-            .await
-            .unwrap();
+        let result = tool.execute(shell("echo error >&2")).await.unwrap();
 
         assert_eq!(result.exit_code, Some(0));
         assert!(result.output.contains("error"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_tool_invalid_utf8_does_not_stall() {
+        let tool = RunTool::new();
+        let result = tool
+            .execute(shell(
+                "printf '\\377\\376 start\\n'; yes x | head -c 200000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("start"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_tool_background_grandchild_does_not_hang() {
+        let tool = RunTool::new();
+        let start = std::time::Instant::now();
+        let result = tool.execute(shell("sleep 30 & echo done")).await.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output.contains("done"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_capture_bounds_memory_and_notes_omission() {
+        let mut c = Capture::default();
+        let chunk = vec![b'a'; 100_000];
+        for _ in 0..20 {
+            c.push(&chunk);
+        }
+        c.push(b"END");
+        assert!(c.head.len() <= CAPTURE_PART && c.tail.len() <= CAPTURE_PART);
+        let text = c.finish();
+        assert!(text.contains("bytes omitted"));
+        assert!(text.ends_with("END"));
+        assert!(text.len() < 2 * CAPTURE_PART + 100);
+    }
+
+    #[test]
+    fn test_is_secret_var() {
+        for v in [
+            "OPENAI_API_KEY",
+            "github_token",
+            "DB_PASSWORD",
+            "OKEANOS_X",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(is_secret_var(v), "{v}");
+        }
+        for v in ["PATH", "HOME", "CARGO_HOME", "TERM", "SystemRoot"] {
+            assert!(!is_secret_var(v), "{v}");
+        }
     }
 }

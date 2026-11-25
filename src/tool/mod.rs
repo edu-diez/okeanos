@@ -6,6 +6,7 @@ pub mod builtin;
 pub mod cache;
 pub mod todo;
 pub mod tool_trait;
+pub mod workspace;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;

@@ -1505,7 +1505,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
 
         // Gate execution behind the permission policy.
-        match self.policy.check(&tool_call.name, &spec) {
+        match self
+            .policy
+            .check_call(&tool_call.name, &spec, &tool_call.args)
+        {
             PolicyDecision::Allow => {}
             PolicyDecision::Deny => {
                 return Err(ReactError::Tool(format!(
@@ -1528,7 +1531,8 @@ impl<M: Model + 'static> ReactLoop<M> {
                 match decision {
                     ApprovalDecision::Allow => {}
                     ApprovalDecision::AllowAlways => {
-                        self.policy.allow_always(&tool_call.name);
+                        self.policy
+                            .allow_always_call(&tool_call.name, &tool_call.args);
                     }
                     ApprovalDecision::Deny => {
                         return Err(ReactError::Tool(format!(
@@ -2009,7 +2013,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
 
         // Check if tool has session allow-always grant (skip confirmation)
-        if self.policy.has_session_allow(&tool_call.name) {
+        if self
+            .policy
+            .has_session_allow_call(&tool_call.name, &tool_call.args)
+        {
             return Ok(());
         }
 
@@ -2027,7 +2034,8 @@ impl<M: Model + 'static> ReactLoop<M> {
         match decision {
             ApprovalDecision::Allow => {}
             ApprovalDecision::AllowAlways => {
-                self.policy.allow_always(&tool_call.name);
+                self.policy
+                    .allow_always_call(&tool_call.name, &tool_call.args);
             }
             ApprovalDecision::Deny => {
                 return Err(ReactError::Tool(format!(
