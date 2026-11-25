@@ -9,6 +9,7 @@
 //! This module is feature-gated behind `config-file` (enabled by default).
 //! When the feature is disabled, only programmatic config construction is available.
 
+mod agent_profile;
 mod secret;
 
 #[cfg(feature = "config-file")]
@@ -148,11 +149,50 @@ pub mod file_load {
         }
         None
     }
+
+    /// Discover the project-local agents directory (`.okeanos/agents`).
+    pub fn discover_project_agents_dir(start_dir: Option<&Path>) -> Option<PathBuf> {
+        let mut dir = start_dir
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())?;
+        loop {
+            let candidate = dir.join(".okeanos").join("agents");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+            if dir.join(".git").exists() {
+                break;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Discover the user/global agents directory (`~/.config/okeanos/agents`).
+    pub fn discover_user_agents_dir() -> Option<PathBuf> {
+        let config_home = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| format!("{h}/.config"))
+                    .unwrap_or_else(|_| ".config".to_string())
+            });
+        let path = Path::new(&config_home).join("okeanos").join("agents");
+        if path.is_dir() { Some(path) } else { None }
+    }
 }
 
 // Re-export discovery functions for use in main.rs when config-file feature is enabled
 #[cfg(feature = "config-file")]
-pub use file_load::{discover_global_config, discover_project_config};
+pub use file_load::{
+    discover_global_config, discover_project_agents_dir, discover_project_config,
+    discover_user_agents_dir,
+};
+
+pub use agent_profile::{AgentProfile, AgentRegistry, WorkspaceMode};
 
 use crate::model::{ModelCapabilities, ModelTier};
 use crate::tool::builtin::EditFormat;
@@ -160,6 +200,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "config-file")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Top-level configuration, populated from layered TOML files or programmatically.
@@ -190,6 +231,8 @@ pub struct Config {
     pub rotation: Option<RotationSection>,
     #[serde(default)]
     pub tool_cache: Option<ToolCacheSection>,
+    #[serde(default)]
+    pub agents: Option<AgentsSection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -406,6 +449,17 @@ pub struct ToolCacheSection {
     pub per_tool_ttl: std::collections::HashMap<String, u64>,
     /// Maximum number of cache entries (default: 1000).
     pub max_entries: Option<usize>,
+}
+
+/// Agent profiles configuration.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AgentsSection {
+    /// Project-local agents directory (relative to config file or CWD).
+    /// Default: ".okeanos/agents"
+    pub project_dir: Option<String>,
+    /// User/global agents directory.
+    /// Default: "~/.config/okeanos/agents"
+    pub user_dir: Option<String>,
 }
 
 /// MCP (Model Context Protocol) client configuration.
@@ -975,6 +1029,32 @@ impl Config {
         }
 
         caps
+    }
+
+    /// Load the agent registry from project and user directories.
+    /// Uses the agents section config if available, otherwise defaults.
+    #[cfg(feature = "config-file")]
+    pub fn load_agent_registry(
+        &self,
+        tool_registry: Arc<crate::tool::ToolRegistry>,
+    ) -> Result<AgentRegistry, ConfigError> {
+        let agents_section = self.agents.as_ref();
+
+        let project_dir = agents_section
+            .and_then(|a| a.project_dir.as_deref())
+            .map(PathBuf::from)
+            .or_else(|| file_load::discover_project_agents_dir(None));
+
+        let user_dir = agents_section
+            .and_then(|a| a.user_dir.as_deref())
+            .map(|s| shellexpand::tilde(s).into_owned())
+            .map(PathBuf::from)
+            .or_else(file_load::discover_user_agents_dir);
+
+        Ok(
+            AgentRegistry::load(project_dir.as_deref(), user_dir.as_deref())?
+                .with_tool_registry(tool_registry),
+        )
     }
 }
 

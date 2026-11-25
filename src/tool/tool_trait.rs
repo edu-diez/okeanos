@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Category of a tool operation, used by the permission layer to decide
@@ -118,11 +119,15 @@ pub trait Tool: Send + Sync {
     /// Returns a [`ToolExecutionResult`] containing the output plus
     /// metadata (exit code, timeout, cancellation, truncation).
     async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError>;
+
+    /// Get the tool as `&dyn Any` for downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Registry of available tools.
+#[derive(Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl fmt::Debug for ToolRegistry {
@@ -150,12 +155,17 @@ impl ToolRegistry {
     /// Register a tool.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         let spec = tool.spec();
-        self.tools.insert(spec.name.clone(), Box::new(tool));
+        self.tools.insert(spec.name.clone(), Arc::new(tool));
     }
 
     /// Get a tool by name.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|b| b.as_ref())
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+
+    /// Get a tool by name as a trait object reference (for backward compatibility).
+    pub fn get_ref(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools.get(name).map(|a| a.as_ref())
     }
 
     /// Get all tool specs.
@@ -173,8 +183,20 @@ impl ToolRegistry {
     pub fn filtered_specs(&self, names: &[String]) -> Vec<ToolSpec> {
         names
             .iter()
-            .filter_map(|name| self.get(name).map(|tool| tool.spec()))
+            .filter_map(|name| self.get_ref(name).map(|tool| tool.spec()))
             .collect()
+    }
+
+    /// Create a filtered registry containing only the specified tools.
+    /// Tools not found in the registry are skipped.
+    pub fn filter(&self, names: &[String]) -> Self {
+        let mut filtered = Self::new();
+        for name in names {
+            if let Some(tool) = self.get(name) {
+                filtered.tools.insert(name.clone(), tool);
+            }
+        }
+        filtered
     }
 
     /// Check if a tool exists.
@@ -183,7 +205,7 @@ impl ToolRegistry {
     }
 
     /// Remove a tool.
-    pub fn remove(&mut self, name: &str) -> Option<Box<dyn Tool>> {
+    pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.remove(name)
     }
 
@@ -228,6 +250,10 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::InvalidArgs("missing message".into()))?;
             Ok(ToolExecutionResult::output(message.to_string()))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

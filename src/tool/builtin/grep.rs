@@ -88,6 +88,10 @@ impl Tool for GrepTool {
             truncated,
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Search a single file for regex matches.

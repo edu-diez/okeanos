@@ -1,6 +1,6 @@
 # MILESTONES.md — Development Roadmap
 
-**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0), Milestone 24 complete & tagged (v0.8.0), Milestone 26 complete & tagged (v0.9.0).
+**Status:** Phase 5 — roadmap; Milestone 0 complete & tagged (v0.1.0-milestone-0), Milestone 0.5 complete & tagged (v0.1.0-milestone-0.5), Milestone 1 complete & tagged (v0.1.0-milestone-1), Milestone 4 complete & tagged (v0.1.0-milestone-4), Milestone 5 complete & tagged (v0.1.0-milestone-5), Milestone 6 complete & tagged (v0.1.0-milestone-6), Milestone 7 complete & tagged (v0.1.0-milestone-7), Milestone 8 complete & tagged (v0.1.0-milestone-8), Milestone 9 complete & tagged (v0.1.0-milestone-9), Milestone 10 complete & tagged (v0.1.0-milestone-10), Milestone 11 complete & tagged (v0.1.0-milestone-11), Milestone 12 complete & tagged (v0.1.0-milestone-12), Milestone 12.1 complete & tagged (v0.1.0-milestone-12.1), Milestone 12.5 complete & tagged (v0.1.0-milestone-12.5), Milestone 13 complete & tagged (v0.1.0-milestone-13), Milestone 14 complete & tagged (v0.1.0-milestone-14), Milestone 15 complete & tagged (v0.1.0-milestone-15), Milestone 16 complete & tagged (v0.1.0-milestone-16), Milestone 17 complete & tagged (v0.1.0-milestone-17), Milestone 18 complete & tagged (v0.2.0), Milestone 19 complete & tagged (v0.3.0), Milestone 20 complete & tagged (v0.4.0), Milestone 21 complete & tagged (v0.5.0), Milestone 22 complete & tagged (v0.6.0), Milestone 23 complete & tagged (v0.7.0), Milestone 24 complete & tagged (v0.8.0), Milestone 26 complete & tagged (v0.9.0), Milestone 27 complete & tagged (v0.11.0).
 **Owner:** Workflow manager
 **Related:** PRODUCT_SPEC.md, ARCHITECTURE.md, DESIGN.md
 
@@ -918,12 +918,33 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - `cargo build --release` produces a single binary (plain text fallback)
 - Tagged v0.9.0
 
-### Milestone 27 — Multi-agent crew / delegation
+### Milestone 27 — Multi-agent delegation
+**Status:** complete — tagged v0.11.0
+
 **Scope:** Delegate subtasks to sub-agents via `todo` tool extension.
 - Sub-agent spawn with isolated context + tool subset
 - Parent aggregates results; approval bubbles up
 - Configurable delegation depth / token budget
-- **Out of scope:** Autonomous agent swarms, cross-project delegation.
+- **Out of scope:** Autonomous agent swarms, cross-project delegation, role-based crew orchestration.
+
+**Definition of Done:** ✅ All verified
+- ✅ **Agent profiles**: `.okeanos/agents/*.toml` (project) + `~/.config/okeanos/agents/*.toml` (user) parsed, validated, registered. Profile fields: `description`, `model` (inherit | override), `tools` (allowlist), `disallowed_tools` (denylist), `max_depth`, `token_budget`, `workspace_mode` (inherit | branch | share).
+- ✅ **Todo tool extension**: `Delegate { todo_id, agent, prompt }` action added; validates profile, depth, spawn budget; returns `SubAgentHandle`.
+- ✅ **SubAgent core**: `SubAgent` struct spawns isolated `ReactLoop` with new `Conversation`, filtered `ToolRegistry`, child `CostTracker`, `depth+1`. Runs as background task.
+- ✅ **Workspace modes**: `inherit` (default, shared CWD), `branch` (gix worktree created, cleaned up on completion), `share` (shared directory, path-scoped).
+- ✅ **Approval bubbling**: Sub-agent `RequireApproval` → `ApprovalRequest` on parent's `event_tx` → parent UI/RPC handles → `Approval` routed to sub-agent's approval channel → sub-agent resumes.
+- ✅ **Event streaming**: `SubAgentProgress` (periodic: tokens, status) and `SubAgentComplete` (final result) emitted on parent's event stream. Parent `Todo.complete(todo_id)` + `ToolResult` injected into parent conversation.
+- ✅ **Delegation limits**: `max_depth` enforced at spawn (default 1); global `max_subagents_per_session` (default 64); per-sub-agent `token_budget` via child `CostTracker`.
+- ✅ **Model override**: Profile `model = "inherit"` or explicit `provider/model#variant`; resolved at spawn.
+- ✅ **FleetView TUI**: Panel showing active sub-agents (id, profile, status, tokens, depth) with steer/stop controls. Background updates via `SubAgentProgress`.
+- ✅ **Session log**: Sub-agent events tagged with `subagent_id` in parent's JSONL.
+- ✅ **Tests**: Unit tests for profile parsing, spawn validation, tool subset, budget, depth, approval routing. Integration test: delegate → progress → approval → complete → parent continues.
+- ✅ **CI gates**: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` (including new sub-agent tests), `cargo build --release` single binary.
+- ✅ **Tagged**: `v0.11.0`
+- `cargo fmt --check` passes
+- `cargo clippy -- -D warnings` passes
+- `cargo test` passes (361 unit tests including FleetView tests)
+- `cargo build --release` produces a single binary
 
 ---
 
@@ -965,7 +986,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 24 | ✅ Expensive call confirmation | 1 | M10, M16 |
 | 25 | Tree-sitter scanning (opt-in) | 2 | M16 |
 | 26 | Markdown rendering | 1–2 | M12 |
-| 27 | Multi-agent delegation | 3+ | M16, M13 |
+| 27 | ✅ Multi-agent delegation | 5–6 | M16, M13 |
 
 ---
 
@@ -1010,7 +1031,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M24 Expensive call confirmation | `0.8.0` | ✅ Complete |
 | M25 Tree-sitter scanning | `0.9.0` | |
 | M26 Markdown rendering | `0.10.0` | |
-| M27 Multi-agent delegation | `0.11.0` | |
+| M27 Multi-agent delegation | `0.11.0` | ✅ Complete |
 | … | `0.x.0` | One minor per independent feature milestone |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).

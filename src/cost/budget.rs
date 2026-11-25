@@ -170,6 +170,11 @@ impl CostTracker {
         &self.capabilities
     }
 
+    /// Get the pricing provider.
+    pub fn pricing(&self) -> &Arc<dyn PricingProvider + Send + Sync> {
+        &self.pricing
+    }
+
     /// Check if the budget is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.is_enabled()

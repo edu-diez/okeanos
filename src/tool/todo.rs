@@ -70,15 +70,27 @@ impl TodoList {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum TodoArgs {
-    Add { title: String },
-    Complete { id: String },
+    Add {
+        title: String,
+    },
+    Complete {
+        id: String,
+    },
     List,
+    Delegate {
+        /// ID of the todo item to delegate
+        todo_id: String,
+        /// Name of the agent profile to use
+        agent: String,
+        /// Task description/prompt for the sub-agent
+        prompt: String,
+    },
 }
 
 /// The todo tool implementation.
 #[derive(Debug)]
 pub struct TodoTool {
-    list: TodoList,
+    pub list: TodoList,
 }
 
 impl TodoTool {
@@ -98,16 +110,19 @@ impl Tool for TodoTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec::new(
             "todo",
-            "Manage a todo list: add, complete, or list tasks",
+            "Manage a todo list: add, complete, list tasks, or delegate to sub-agent",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["add", "complete", "list"]
+                        "enum": ["add", "complete", "list", "delegate"]
                     },
                     "title": {"type": "string"},
-                    "id": {"type": "string"}
+                    "id": {"type": "string"},
+                    "todo_id": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "prompt": {"type": "string"}
                 },
                 "required": ["action"]
             }),
@@ -137,7 +152,18 @@ impl Tool for TodoTool {
                     serde_json::to_string(&items).unwrap(),
                 ))
             }
+            TodoArgs::Delegate { .. } => {
+                // This should be intercepted by ReactLoop::execute_tool before reaching here
+                Err(ToolError::InvalidArgs(
+                    "delegate action should be handled by ReactLoop, not TodoTool directly"
+                        .to_string(),
+                ))
+            }
         }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

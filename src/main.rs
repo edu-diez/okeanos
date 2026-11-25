@@ -823,6 +823,13 @@ async fn run_interactive_tui(
     #[cfg(feature = "mcp")]
     let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
+    // Load agent registry for sub-agent delegation
+    let agent_registry = Arc::new(
+        config
+            .load_agent_registry(Arc::new(tools.clone()))
+            .context("failed to load agent registry")?,
+    );
+
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
         .permissions
@@ -891,7 +898,8 @@ async fn run_interactive_tui(
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
-        .with_project_root(project_root.clone());
+        .with_project_root(project_root.clone())
+        .with_agent_registry(agent_registry.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -1189,6 +1197,7 @@ async fn run_tui_and_loop(
                 &mut tui_app.conversation,
                 &mut tui_app.tool_panel,
                 &mut tui_app.todo_panel,
+                &mut tui_app.fleet_view,
                 &mut tui_app.status_bar,
                 &mut tui_app.log_tail,
                 approval_modal,
@@ -1519,6 +1528,13 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     #[cfg(feature = "mcp")]
     let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
+    // Load agent registry for sub-agent delegation
+    let agent_registry = Arc::new(
+        config
+            .load_agent_registry(Arc::new(tools.clone()))
+            .context("failed to load agent registry")?,
+    );
+
     // Build permission policy from config (global + project allow-list).
     let allow_list = config
         .permissions
@@ -1564,7 +1580,8 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
-        .with_project_root(project_root.clone());
+        .with_project_root(project_root.clone())
+        .with_agent_registry(agent_registry.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -2177,6 +2194,13 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     #[cfg(feature = "mcp")]
     let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
+    // Load agent registry for sub-agent delegation
+    let agent_registry = Arc::new(
+        config
+            .load_agent_registry(Arc::new(tools.clone()))
+            .context("failed to load agent registry")?,
+    );
+
     // Build permission policy from config
     let allow_list = config
         .permissions
@@ -2272,7 +2296,8 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx_for_loop)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
-        .with_project_root(project_root.clone());
+        .with_project_root(project_root.clone())
+        .with_agent_registry(agent_registry.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);
@@ -2732,6 +2757,13 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     #[cfg(feature = "mcp")]
     let _mcp_client = { init_mcp_client(&mut tools, config).await? };
 
+    // Load agent registry for sub-agent delegation
+    let agent_registry = Arc::new(
+        config
+            .load_agent_registry(Arc::new(tools.clone()))
+            .context("failed to load agent registry")?,
+    );
+
     // Build permission policy from config
     let allow_list = config
         .permissions
@@ -2839,7 +2871,8 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx_for_loop)
         .with_policy(policy)
         .with_approval_receiver(approval_rx)
-        .with_project_root(project_root.clone());
+        .with_project_root(project_root.clone())
+        .with_agent_registry(agent_registry.clone());
 
     if let Some(store) = snapshot_store {
         loop_ = loop_.with_snapshot_store(store);

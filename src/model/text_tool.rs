@@ -1,14 +1,3 @@
-//! Text-based tool calling for models without native function calling.
-//!
-//! For models that do not support native JSON function calling, the harness
-//! injects a text-based tool schema into the system prompt and parses raw
-//! model output into tool invocations.
-//!
-//! Parsing is lenient: it tolerates trailing text, fixes common quote/bracket
-//! errors, and extracts tool calls even when the closing tag is missing.
-//! Every parsed call is validated against the tool's JSON schema **before**
-//! execution. Invalid calls return structured errors and are never executed.
-
 use crate::tool::tool_trait::{ToolRegistry, ToolSpec};
 use serde_json::Value;
 use thiserror::Error;
@@ -18,7 +7,7 @@ use thiserror::Error;
 pub struct ParsedToolCall {
     /// Name of the tool to invoke.
     pub name: String,
-    /// Raw argument value (unvalidated).
+    /// Raw arguments parsed from the tool call (not yet validated).
     pub args: Value,
 }
 
@@ -671,6 +660,10 @@ mod tests {
                     .to_string(),
             ))
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     // A strict tool that rejects additional properties.
@@ -695,6 +688,10 @@ mod tests {
 
         async fn execute(&self, _args: Value) -> Result<ToolExecutionResult, ToolError> {
             Ok(ToolExecutionResult::output("ok".to_string()))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

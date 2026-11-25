@@ -75,6 +75,10 @@ impl Tool for WriteTool {
             truncated,
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Create all directories in `path` if they don't exist.

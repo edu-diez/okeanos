@@ -183,6 +183,10 @@ impl Tool for RunTool {
             truncated,
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Read all lines from an async stream into a String.

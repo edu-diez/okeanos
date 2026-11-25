@@ -11,7 +11,7 @@ use crate::events::{Event, EventReceiver, EventSender, event_channel};
 use crate::ui::components::welcome_screen::WelcomeAction;
 use crate::ui::components::{
     ApprovalModal, CommandAction, CommandPalette, ConfigModal, ConfigModalResult, ConversationPane,
-    InputComposer, LogTailPanel, StatusBar, TodoPanel, ToolPanel, WelcomeScreen,
+    FleetView, InputComposer, LogTailPanel, StatusBar, TodoPanel, ToolPanel, WelcomeScreen,
 };
 use crate::ui::layout::LayoutRects;
 
@@ -46,6 +46,7 @@ pub struct TerminalApp {
     pub conversation: ConversationPane,
     pub tool_panel: ToolPanel,
     pub todo_panel: TodoPanel,
+    pub fleet_view: FleetView,
     pub status_bar: StatusBar,
     pub log_tail: LogTailPanel,
     pub approval_modal: ApprovalModal,
@@ -150,6 +151,7 @@ impl TerminalApp {
         }
         let tool_panel = ToolPanel::new(theme.clone());
         let todo_panel = TodoPanel::new(theme.clone());
+        let fleet_view = FleetView::new(theme.clone());
         let status_bar = StatusBar::new(theme.clone());
         let log_tail = LogTailPanel::new(theme.clone());
         let approval_modal = ApprovalModal::new(theme.clone());
@@ -177,6 +179,7 @@ impl TerminalApp {
             conversation,
             tool_panel,
             todo_panel,
+            fleet_view,
             status_bar,
             log_tail,
             approval_modal,
@@ -363,6 +366,7 @@ impl TerminalApp {
             self.conversation.handle_event(&event);
             self.tool_panel.handle_event(&event);
             self.todo_panel.handle_event(&event);
+            self.fleet_view.handle_event(&event);
             self.log_tail.handle_event(&event);
             self.input_composer.handle_event(&event);
 
@@ -489,6 +493,7 @@ impl TerminalApp {
                     &mut self.conversation,
                     &mut self.tool_panel,
                     &mut self.todo_panel,
+                    &mut self.fleet_view,
                     &mut self.status_bar,
                     &mut self.log_tail,
                     &self.approval_modal,
@@ -799,6 +804,7 @@ impl TerminalApp {
             self.conversation.handle_event(&event);
             self.tool_panel.handle_event(&event);
             self.todo_panel.handle_event(&event);
+            self.fleet_view.handle_event(&event);
             self.log_tail.handle_event(&event);
             self.input_composer.handle_event(&event);
 
@@ -837,6 +843,7 @@ impl TerminalApp {
         conversation: &mut ConversationPane,
         tool_panel: &mut ToolPanel,
         todo_panel: &mut TodoPanel,
+        fleet_view: &mut FleetView,
         status_bar: &mut StatusBar,
         log_tail: &mut LogTailPanel,
         approval_modal: &ApprovalModal,
@@ -857,6 +864,7 @@ impl TerminalApp {
                 conversation,
                 tool_panel,
                 todo_panel,
+                fleet_view,
                 log_tail,
                 status_bar,
                 input_composer,
@@ -870,6 +878,7 @@ impl TerminalApp {
                 conversation,
                 tool_panel,
                 todo_panel,
+                fleet_view,
                 log_tail,
                 status_bar,
                 input_composer,
@@ -905,6 +914,7 @@ impl TerminalApp {
         conversation: &mut ConversationPane,
         tool_panel: &mut ToolPanel,
         todo_panel: &mut TodoPanel,
+        fleet_view: &mut FleetView,
         log_tail: &mut LogTailPanel,
         status_bar: &mut StatusBar,
         input_composer: &mut InputComposer,
@@ -916,9 +926,11 @@ impl TerminalApp {
         // Conversation (left)
         conversation.render(layout.conversation, frame.buffer_mut());
 
-        // Right rail (tool panel + todo + log tail)
+        // Right rail (tool panel + todo + fleet view + log tail)
         if let Some(right_rail) = layout.right_rail {
-            Self::render_right_rail(frame, right_rail, tool_panel, todo_panel, log_tail, theme);
+            Self::render_right_rail(
+                frame, right_rail, tool_panel, todo_panel, fleet_view, log_tail, theme,
+            );
         }
 
         // Input composer (above status bar)
@@ -943,6 +955,7 @@ impl TerminalApp {
         conversation: &mut ConversationPane,
         tool_panel: &mut ToolPanel,
         todo_panel: &mut TodoPanel,
+        fleet_view: &mut FleetView,
         log_tail: &mut LogTailPanel,
         status_bar: &mut StatusBar,
         input_composer: &mut InputComposer,
@@ -987,6 +1000,7 @@ impl TerminalApp {
                     rail_area_adjusted,
                     tool_panel,
                     todo_panel,
+                    fleet_view,
                     log_tail,
                     theme,
                 );
@@ -1029,15 +1043,17 @@ impl TerminalApp {
         area: ratatui::layout::Rect,
         tool_panel: &mut ToolPanel,
         todo_panel: &mut TodoPanel,
+        fleet_view: &mut FleetView,
         log_tail: &mut LogTailPanel,
         _theme: &Theme,
     ) {
-        let sections = 3;
+        let sections = 4;
         let section_height = area.height / sections;
 
         let layout = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
+                ratatui::layout::Constraint::Length(section_height.max(5)),
                 ratatui::layout::Constraint::Length(section_height.max(5)),
                 ratatui::layout::Constraint::Length(section_height.max(5)),
                 ratatui::layout::Constraint::Min(3),
@@ -1046,7 +1062,8 @@ impl TerminalApp {
 
         tool_panel.render(layout[0], frame.buffer_mut());
         todo_panel.render(layout[1], frame.buffer_mut());
-        log_tail.render(layout[2], frame.buffer_mut());
+        fleet_view.render(layout[2], frame.buffer_mut());
+        log_tail.render(layout[3], frame.buffer_mut());
     }
 
     /// Suspend the TUI (for running external commands).

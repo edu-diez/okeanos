@@ -57,7 +57,7 @@ pub struct SnapshotEntry {
 /// Snapshots are implemented as commits on a special ref `refs/okeanos/snapshots/HEAD`
 /// which points to the current snapshot position. The undo/redo cursor moves along
 /// this history.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SnapshotStore {
     /// Path to the git repository (project root).
     repo_path: PathBuf,

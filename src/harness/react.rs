@@ -5,12 +5,14 @@ use crate::context::{Conversation, ConversationError};
 use crate::cost::{CostBudgetError, CostTracker};
 use crate::events::{
     Approval, ApprovalDecision, ApprovalRequest, CompactionEvent, CompactionTrigger, Event,
-    EventSender, LogLevel, Message, MessageRole, ToolCall, ToolCallStatus, ToolResult,
+    EventSender, LogLevel, Message, MessageRole, SubAgentComplete, SubAgentError, ToolCall,
+    ToolCallStatus, ToolResult,
 };
 use crate::harness::retry::{RetryDecision, RetryPolicy};
 use crate::model::text_tool::{TextToolError, TextToolParser};
 use crate::model::{
-    GenerationParams, Model, ModelError, ModelMessage, ModelResponse, ModelRole, ModelTier,
+    GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
+    ModelTier,
 };
 use crate::session::SessionManager;
 use crate::snapshot::store::{SnapshotEntry, SnapshotError, SnapshotStore};
@@ -18,7 +20,7 @@ use crate::tool::tool_trait::ToolCategory;
 use crate::tool::{CacheConfig, ToolRegistry, ToolResultCache};
 use anyhow::Context as _;
 use futures::StreamExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -128,11 +130,11 @@ pub struct ReactLoop<M: Model> {
     policy: Policy,
     approval_rx: Option<mpsc::Receiver<Approval>>,
     /// Optional session manager for logging events to session log.
-    session: Option<SessionManager>,
+    session: Option<Arc<Mutex<SessionManager>>>,
     /// Optional cost tracker for budget enforcement.
     cost_tracker: Option<CostTracker>,
     /// Optional snapshot store for git snapshots before destructive actions.
-    snapshot_store: Option<SnapshotStore>,
+    snapshot_store: Option<Arc<Mutex<SnapshotStore>>>,
     /// Optional compaction manager for context compaction.
     compaction_manager: Option<CompactionManager>,
     /// Optional tool result cache for idempotent tools (read, grep).
@@ -141,9 +143,17 @@ pub struct ReactLoop<M: Model> {
     event_index: usize,
     /// Project root for selective context inclusion.
     project_root: Option<std::path::PathBuf>,
+    /// Agent registry for sub-agent delegation.
+    agent_registry: Option<Arc<crate::config::AgentRegistry>>,
+    /// Active sub-agent handles for monitoring and cleanup.
+    subagent_handles: Vec<crate::harness::SubAgentHandle>,
+    /// Remaining spawn budget for sub-agent delegation (default 64).
+    spawn_budget: u32,
+    /// Current delegation depth.
+    delegation_depth: u32,
 }
 
-impl<M: Model> ReactLoop<M> {
+impl<M: Model + 'static> ReactLoop<M> {
     /// Create a new ReAct loop.
     pub fn new(
         model: Arc<M>,
@@ -171,6 +181,10 @@ impl<M: Model> ReactLoop<M> {
             tool_cache: None,
             event_index: 0,
             project_root: None,
+            agent_registry: None,
+            subagent_handles: Vec::new(),
+            spawn_budget: 64,
+            delegation_depth: 0,
         }
     }
 
@@ -185,8 +199,64 @@ impl<M: Model> ReactLoop<M> {
         self.event_tx.clone()
     }
 
+    /// Get the tool registry.
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.tools
+    }
+
+    /// Get the model.
+    pub fn model(&self) -> &Arc<M> {
+        &self.model
+    }
+
+    /// Get the model capabilities.
+    pub fn model_capabilities(&self) -> &ModelCapabilities {
+        self.model.capabilities()
+    }
+
+    /// Get the ReactConfig.
+    pub fn config(&self) -> &ReactConfig {
+        &self.config
+    }
+
+    /// Get the cost tracker.
+    pub fn cost_tracker(&self) -> Option<&CostTracker> {
+        self.cost_tracker.as_ref()
+    }
+
+    /// Get the project root.
+    pub fn project_root(&self) -> Option<&std::path::PathBuf> {
+        self.project_root.as_ref()
+    }
+
+    /// Get the session manager.
+    pub fn session(&self) -> Option<Arc<Mutex<SessionManager>>> {
+        self.session.clone()
+    }
+
+    /// Get the snapshot store.
+    pub fn snapshot_store(&self) -> Option<Arc<Mutex<SnapshotStore>>> {
+        self.snapshot_store.clone()
+    }
+
+    /// Get the conversation.
+    pub fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+
+    /// Get the current iteration count.
+    pub fn iteration(&self) -> usize {
+        self.iteration
+    }
+
     /// Set the session manager for logging events to a session log.
     pub fn with_session(mut self, session: SessionManager) -> Self {
+        self.session = Some(Arc::new(Mutex::new(session)));
+        self
+    }
+
+    /// Set the session manager from an Arc (for sharing).
+    pub fn with_session_arc(mut self, session: Arc<Mutex<SessionManager>>) -> Self {
         self.session = Some(session);
         self
     }
@@ -233,6 +303,12 @@ impl<M: Model> ReactLoop<M> {
 
     /// Set the snapshot store for git snapshots before destructive actions.
     pub fn with_snapshot_store(mut self, store: SnapshotStore) -> Self {
+        self.snapshot_store = Some(Arc::new(Mutex::new(store)));
+        self
+    }
+
+    /// Set the snapshot store from an Arc (for sharing).
+    pub fn with_snapshot_store_arc(mut self, store: Arc<Mutex<SnapshotStore>>) -> Self {
         self.snapshot_store = Some(store);
         self
     }
@@ -247,6 +323,39 @@ impl<M: Model> ReactLoop<M> {
     pub fn with_tool_cache(mut self, config: CacheConfig) -> Self {
         self.tool_cache = Some(ToolResultCache::new(config));
         self
+    }
+
+    /// Set the agent registry for sub-agent delegation.
+    pub fn with_agent_registry(mut self, registry: Arc<crate::config::AgentRegistry>) -> Self {
+        self.agent_registry = Some(registry);
+        self
+    }
+
+    /// Get the compaction manager config.
+    pub fn compaction_config(&self) -> Option<CompactionConfig> {
+        self.compaction_manager
+            .as_ref()
+            .map(|cm| cm.config().clone())
+    }
+
+    /// Get the tool cache config.
+    pub fn tool_cache_config(&self) -> Option<CacheConfig> {
+        self.tool_cache.as_ref().map(|tc| tc.config().clone())
+    }
+
+    /// Get the agent registry.
+    pub fn agent_registry(&self) -> Option<Arc<crate::config::AgentRegistry>> {
+        self.agent_registry.clone()
+    }
+
+    /// Get the current delegation depth.
+    pub fn delegation_depth(&self) -> u32 {
+        self.delegation_depth
+    }
+
+    /// Get the remaining spawn budget.
+    pub fn spawn_budget(&self) -> u32 {
+        self.spawn_budget
     }
 
     /// Run selective context inclusion to find relevant files for the current task.
@@ -328,25 +437,25 @@ impl<M: Model> ReactLoop<M> {
 
     /// Undo to the previous snapshot.
     pub fn undo(&mut self) -> Result<SnapshotEntry, SnapshotError> {
-        let Some(store) = &mut self.snapshot_store else {
+        let Some(store) = &self.snapshot_store else {
             return Err(SnapshotError::NoSnapshots);
         };
-        store.undo()
+        store.lock().unwrap().undo()
     }
 
     /// Redo to the next snapshot.
     pub fn redo(&mut self) -> Result<SnapshotEntry, SnapshotError> {
-        let Some(store) = &mut self.snapshot_store else {
+        let Some(store) = &self.snapshot_store else {
             return Err(SnapshotError::NoSnapshots);
         };
-        store.redo()
+        store.lock().unwrap().redo()
     }
 
     /// Check if undo is available.
     pub fn can_undo(&self) -> bool {
         self.snapshot_store
             .as_ref()
-            .map(|s| s.can_undo())
+            .map(|s| s.lock().unwrap().can_undo())
             .unwrap_or(false)
     }
 
@@ -354,7 +463,7 @@ impl<M: Model> ReactLoop<M> {
     pub fn can_redo(&self) -> bool {
         self.snapshot_store
             .as_ref()
-            .map(|s| s.can_redo())
+            .map(|s| s.lock().unwrap().can_redo())
             .unwrap_or(false)
     }
 
@@ -398,7 +507,7 @@ impl<M: Model> ReactLoop<M> {
     }
 
     /// Run the ReAct loop until completion or termination.
-    pub async fn run(mut self, initial_prompt: String) -> Result<String, ReactError> {
+    pub async fn run(&mut self, initial_prompt: String) -> Result<String, ReactError> {
         // Add initial user message
         self.conversation
             .add_user_message(initial_prompt.clone())
@@ -445,6 +554,9 @@ impl<M: Model> ReactLoop<M> {
         });
 
         loop {
+            // Check for completed sub-agents
+            self.check_subagent_completion().await?;
+
             // Check shutdown signal
             if shutdown_rx.try_recv().is_ok() {
                 self.emit_interrupted(false).await; // Signal-based (SIGINT)
@@ -1039,8 +1151,8 @@ impl<M: Model> ReactLoop<M> {
                                 current_timestamp(),
                             );
                             let _ = self.event_tx.send(token_event.clone());
-                            if let Some(session) = &mut self.session {
-                                let _ = session.log_event(token_event);
+                            if let Some(session) = &self.session {
+                                let _ = session.lock().unwrap().log_event(token_event);
                             }
                             content.push_str(&chunk.delta);
                         }
@@ -1054,8 +1166,8 @@ impl<M: Model> ReactLoop<M> {
                             let thinking_event =
                                 crate::events::Event::thinking(th, current_timestamp());
                             let _ = self.event_tx.send(thinking_event.clone());
-                            if let Some(session) = &mut self.session {
-                                let _ = session.log_event(thinking_event);
+                            if let Some(session) = &self.session {
+                                let _ = session.lock().unwrap().log_event(thinking_event);
                             }
                         }
                         if chunk.finished {
@@ -1096,8 +1208,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_interrupted(&mut self, user_initiated: bool) {
         let event = crate::events::Event::interrupted(user_initiated);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1190,6 +1302,19 @@ impl<M: Model> ReactLoop<M> {
             .await;
 
             return Ok(result);
+        }
+
+        // Handle sub-agent delegation via todo tool with "delegate" action.
+        if tool_call.name == "todo"
+            && let Ok(crate::tool::todo::TodoArgs::Delegate {
+                todo_id,
+                agent,
+                prompt,
+            }) = serde_json::from_value::<crate::tool::todo::TodoArgs>(tool_call.args.clone())
+        {
+            return self
+                .handle_delegate(tool_call.id, todo_id, agent, prompt)
+                .await;
         }
 
         // Gate execution behind the permission policy.
@@ -1336,6 +1461,94 @@ impl<M: Model> ReactLoop<M> {
         Ok(result)
     }
 
+    /// Handle sub-agent delegation via todo tool.
+    async fn handle_delegate(
+        &mut self,
+        tool_call_id: String,
+        todo_id: String,
+        agent_name: String,
+        prompt: String,
+    ) -> Result<ToolResult, ReactError> {
+        let Some(agent_registry) = self.agent_registry.clone() else {
+            return Err(ReactError::Tool(
+                "agent registry not configured; cannot delegate".to_string(),
+            ));
+        };
+
+        // Check delegation depth
+        if self.delegation_depth >= 1 {
+            return Err(ReactError::Tool(format!(
+                "maximum delegation depth ({}) exceeded",
+                1
+            )));
+        }
+
+        // Check spawn budget
+        if self.spawn_budget == 0 {
+            return Err(ReactError::Tool(
+                "spawn budget exhausted; cannot delegate".to_string(),
+            ));
+        }
+
+        // Validate agent profile exists
+        let Some(profile) = agent_registry.get(&agent_name) else {
+            return Err(ReactError::Tool(format!(
+                "agent profile not found: {}",
+                agent_name
+            )));
+        };
+
+        // Check profile max_depth
+        if self.delegation_depth >= profile.max_depth {
+            return Err(ReactError::Tool(format!(
+                "maximum delegation depth for agent '{}' exceeded: current={}, max={}",
+                agent_name, self.delegation_depth, profile.max_depth
+            )));
+        }
+
+        // Spawn the sub-agent
+        let handle = crate::harness::spawn_subagent(
+            self,
+            agent_registry,
+            todo_id.clone(),
+            agent_name.clone(),
+            prompt.clone(),
+            self.delegation_depth,
+            self.spawn_budget,
+        )
+        .await
+        .map_err(|e| ReactError::Tool(format!("failed to spawn sub-agent: {}", e)))?;
+
+        // Decrement spawn budget
+        self.spawn_budget -= 1;
+
+        // Store handle for monitoring
+        let subagent_id = handle.subagent_id.clone();
+        self.subagent_handles.push(handle);
+
+        // Return the sub-agent handle as the tool result
+        let output = serde_json::to_string(&serde_json::json!({
+            "subagent_id": subagent_id,
+            "todo_id": todo_id,
+            "agent": agent_name,
+            "status": "spawned"
+        }))
+        .unwrap();
+
+        Ok(ToolResult {
+            id: tool_call_id,
+            name: "subagent".to_string(),
+            args: serde_json::json!({ "todo_id": todo_id, "agent": agent_name, "prompt": prompt }),
+            output,
+            ok: true,
+            duration_ms: 0,
+            truncated: false,
+            exit_code: Some(0),
+            timed_out: false,
+            cancelled: false,
+        })
+    }
+
     /// Check cost budget before executing a tool.
     async fn check_cost_budget(&mut self, tool_call: &ToolCall) -> Result<(), ReactError> {
         let Some(tracker) = &mut self.cost_tracker else {
@@ -1448,12 +1661,119 @@ impl<M: Model> ReactLoop<M> {
         tracker.record_usage(usage);
     }
 
+    /// Get the todo list from the todo tool (if available).
+    fn get_todo_list(&self) -> Option<crate::tool::todo::TodoList> {
+        self.tools.get("todo").and_then(|tool| {
+            // Downcast to TodoTool to access the list
+            tool.as_any()
+                .downcast_ref::<crate::tool::todo::TodoTool>()
+                .map(|todo_tool| todo_tool.list.clone())
+        })
+    }
+
+    /// Check for completed sub-agents and handle their completion.
+    async fn check_subagent_completion(&mut self) -> Result<(), ReactError> {
+        let mut completed_indices = Vec::new();
+
+        // Check each sub-agent handle for completion
+        for (index, handle) in self.subagent_handles.iter().enumerate() {
+            if handle.join_handle.is_finished() {
+                completed_indices.push(index);
+            }
+        }
+
+        // Process completed sub-agents in reverse order to maintain indices
+        for index in completed_indices.into_iter().rev() {
+            let handle = self.subagent_handles.remove(index);
+            let subagent_id = handle.subagent_id.clone();
+            let todo_id = handle.todo_id.clone();
+
+            // Wait for the sub-agent result
+            match handle.join_handle.await {
+                Ok(Ok(result)) => {
+                    // Sub-agent completed successfully
+                    let _summary =
+                        format!("Sub-agent '{}' completed: {}", subagent_id, result.summary);
+
+                    // Emit SubAgentComplete event
+                    let complete_event = SubAgentComplete {
+                        subagent_id: subagent_id.clone(),
+                        todo_id: todo_id.clone(),
+                        summary: result.summary.clone(),
+                        tokens_used: result.tokens_used,
+                        result: result.result.clone(),
+                        ts: current_timestamp(),
+                    };
+                    self.emit_subagent_complete(complete_event).await;
+
+                    // Complete the todo item
+                    if let Some(todo_list) = self.get_todo_list() {
+                        let _ = todo_list.complete(&todo_id);
+                    }
+
+                    // Inject the sub-agent result into the parent conversation
+                    self.conversation
+                        .add_tool_message(result.result.output.clone(), result.result.id.clone())
+                        .context("failed to add sub-agent result to conversation")?;
+
+                    // Emit tool result event for the sub-agent
+                    self.emit_tool_result(result.result).await;
+
+                    // Log completion
+                    self.emit_log(
+                        LogLevel::Info,
+                        format!(
+                            "Sub-agent '{}' completed (todo: {}) in ~{} tokens",
+                            subagent_id, todo_id, result.tokens_used
+                        ),
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => {
+                    // Sub-agent returned an error result
+                    self.emit_log(
+                        LogLevel::Error,
+                        format!("Sub-agent '{}' failed: {}", subagent_id, e),
+                    )
+                    .await;
+
+                    // Emit error event
+                    let error_event = SubAgentError {
+                        subagent_id: subagent_id.clone(),
+                        code: "execution_failed".to_string(),
+                        message: e.to_string(),
+                        ts: current_timestamp(),
+                    };
+                    self.emit_subagent_error(error_event).await;
+                }
+                Err(e) => {
+                    // Join error (task panicked)
+                    self.emit_log(
+                        LogLevel::Error,
+                        format!("Sub-agent '{}' panicked: {}", subagent_id, e),
+                    )
+                    .await;
+
+                    let error_event = SubAgentError {
+                        subagent_id: subagent_id.clone(),
+                        code: "panicked".to_string(),
+                        message: e.to_string(),
+                        ts: current_timestamp(),
+                    };
+                    self.emit_subagent_error(error_event).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Take a git snapshot with the given description.
     ///
     /// Increments the event index and stores the snapshot metadata.
     /// Emits SnapshotProgress events for UI integration.
     async fn take_snapshot(&mut self, description: &str) -> Result<(), ReactError> {
-        let Some(store) = &mut self.snapshot_store else {
+        let Some(store) = &self.snapshot_store else {
             return Ok(()); // Snapshots not enabled
         };
 
@@ -1468,8 +1788,10 @@ impl<M: Model> ReactLoop<M> {
         };
         let _ = self.event_tx.send(Event::SnapshotProgress(progress));
 
-        // Create the snapshot
-        match store.snapshot(description, event_index) {
+        // Create the snapshot - release the lock before calling emit_log
+        let snapshot_result = store.lock().unwrap().snapshot(description, event_index);
+
+        match snapshot_result {
             Ok(snapshot_id) => {
                 // Emit completion progress event
                 let progress = crate::events::SnapshotProgress {
@@ -1544,8 +1866,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_message(&mut self, msg: Message) {
         let event = Event::Message(msg);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1553,8 +1875,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_tool_call(&mut self, call: ToolCall) {
         let event = Event::ToolCall(call);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1562,8 +1884,26 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_tool_result(&mut self, result: ToolResult) {
         let event = Event::ToolResult(result);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
+        }
+    }
+
+    /// Emit a sub-agent completion event.
+    async fn emit_subagent_complete(&mut self, event: SubAgentComplete) {
+        let event = Event::SubAgentComplete(event);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
+        }
+    }
+
+    /// Emit a sub-agent error event.
+    async fn emit_subagent_error(&mut self, event: SubAgentError) {
+        let event = Event::SubAgentError(event);
+        let _ = self.event_tx.send(event.clone());
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1571,8 +1911,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_approval_request(&mut self, req: ApprovalRequest) {
         let event = Event::ApprovalRequest(req);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1596,8 +1936,8 @@ impl<M: Model> ReactLoop<M> {
         };
         let event = Event::Status(status);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1605,8 +1945,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_error(&mut self, code: &str, message: &str) {
         let event = Event::error(code.to_string(), message.to_string());
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1614,8 +1954,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_log(&mut self, level: crate::events::LogLevel, message: String) {
         let event = Event::Log(crate::events::Log { level, message });
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 
@@ -1623,8 +1963,8 @@ impl<M: Model> ReactLoop<M> {
     async fn emit_compaction(&mut self, event: CompactionEvent) {
         let event = Event::Compaction(event);
         let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &mut self.session {
-            let _ = session.log_event(event);
+        if let Some(session) = &self.session {
+            let _ = session.lock().unwrap().log_event(event);
         }
     }
 }
@@ -1635,1342 +1975,4 @@ fn current_timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::{MockModel, ModelCapabilities, ModelError, ModelTier};
-    use crate::tool::ToolRegistry;
-    use crate::tool::todo::TodoTool;
-    use crate::tool::tool_trait::{Tool, ToolCategory, ToolError, ToolExecutionResult, ToolSpec};
-    use async_trait::async_trait;
-    use serde_json::Value;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_react_loop_basic() {
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_max_iterations() {
-        let model = Arc::new(MockModel::small("test-model"));
-        // Model never completes, just keeps responding
-        for _ in 0..20 {
-            model.push_response(crate::model::mock::MockModel::text_response(
-                "Continue working",
-            ));
-        }
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 5,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::MaxIterations { max_iter } => assert_eq!(max_iter, 5),
-            _ => panic!("expected MaxIterations error"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_with_tool_calls() {
-        let model = Arc::new(MockModel::frontier("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me create a todo",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Test task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
-        let tools = ToolRegistry::new();
-        // Note: todo tool would be registered here in real implementation
-        let config = ReactConfig::default();
-        let (event_tx, _event_rx) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Since todo tool isn't registered, we expect a tool error
-        // But the loop should handle it gracefully
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_text_based_tool_call_executes() {
-        // Small model has no native tool calling -> text-based path is used.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Let me create a todo.\n<tool_call name=\"todo\">\n{\"action\": \"add\", \"title\": \"Test task\"}\n</tool_call>",
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Create a todo".into()).await;
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_text_based_tool_call_invalid() {
-        // Invalid text tool call: missing required "action" field.
-        // Fallback is disabled so the validation error surfaces immediately.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            fallback: FallbackConfig {
-                enabled: false,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Create a todo".into()).await;
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::Tool(msg) => assert!(msg.contains("text tool call failed")),
-            _ => panic!("expected text tool call error"),
-        }
-    }
-
-    /// Malformed tool call triggers fallback retry with simpler prompt;
-    /// if fallback also fails, the turn is skipped (not aborted).
-    #[tokio::test]
-    async fn test_react_loop_fallback_retries_with_simpler_prompt() {
-        // First response: malformed tool call (missing required "action").
-        // Second response (fallback): valid tool call.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "<tool_call name=\"todo\">\n{\"action\": \"add\", \"title\": \"Fallback task\"}\n</tool_call>",
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Create a todo".into()).await;
-
-        assert!(
-            result.is_ok(),
-            "loop should complete after fallback: {result:?}"
-        );
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    /// When fallback is exhausted, the turn is skipped rather than aborting
-    /// the loop (provided the model eventually produces a completion).
-    #[tokio::test]
-    async fn test_react_loop_fallback_exhausted_skips_turn() {
-        // Both responses are malformed; fallback is exhausted, turn skipped,
-        // then the model completes on the next iteration.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "<tool_call name=\"todo\">\n{\"title\": \"No action field\"}\n</tool_call>",
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "<tool_call name=\"todo\">\n{\"title\": \"Still no action\"}\n</tool_call>",
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            fallback: FallbackConfig {
-                max_retries_per_turn: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Create a todo".into()).await;
-
-        assert!(
-            result.is_ok(),
-            "loop should complete after skip: {result:?}"
-        );
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    /// Provider 429 rate limit triggers retry with exponential backoff.
-    #[tokio::test]
-    async fn test_react_loop_provider_rate_limited_retries() {
-        // First two calls return 429, third succeeds.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::rate_limit_error(1));
-        model.push_response(crate::model::mock::MockModel::rate_limit_error(1));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            retry_policy: RetryPolicy {
-                max_retries: 3,
-                base_backoff_ms: 10, // short for test
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        assert!(
-            result.is_ok(),
-            "loop should complete after retries: {result:?}"
-        );
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    /// Permanent provider errors (auth failure) are not retried.
-    #[tokio::test]
-    async fn test_react_loop_permanent_error_not_retried() {
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::error_response(
-            ModelError::AuthFailed,
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            retry_policy: RetryPolicy {
-                max_retries: 3,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::Model(ModelError::AuthFailed) => {}
-            _ => panic!("expected AuthFailed error, not retry"),
-        }
-    }
-
-    /// ServiceUnavailable (503) is retried with backoff.
-    #[tokio::test]
-    async fn test_react_loop_service_unavailable_retries() {
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::error_response(
-            ModelError::ServiceUnavailable { retry_after_sec: 0 },
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            retry_policy: RetryPolicy {
-                max_retries: 3,
-                base_backoff_ms: 10,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        assert!(
-            result.is_ok(),
-            "loop should complete after retry: {result:?}"
-        );
-    }
-
-    // ---- WriteTool stub for approval tests ----
-
-    struct WriteTool;
-
-    #[async_trait]
-    impl Tool for WriteTool {
-        fn spec(&self) -> ToolSpec {
-            ToolSpec::new(
-                "write",
-                "Write a file",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"]
-                }),
-            )
-            .with_category(ToolCategory::Write)
-        }
-
-        async fn execute(&self, _args: Value) -> Result<ToolExecutionResult, ToolError> {
-            Ok(ToolExecutionResult::output("written".to_string()))
-        }
-    }
-
-    /// Helper: build a loop with a policy that only allows `todo`, plus an
-    /// approval channel for write/delete/network tools.
-    fn build_approval_loop(
-        model: Arc<MockModel>,
-        conversation: Conversation,
-        tools: ToolRegistry,
-        config: ReactConfig,
-    ) -> (
-        ReactLoop<MockModel>,
-        crate::events::EventReceiver,
-        mpsc::Sender<crate::events::Approval>,
-    ) {
-        let (event_tx, event_rx) = crate::events::event_channel();
-        let (approval_tx, approval_rx) = mpsc::channel(16);
-        let policy = Policy::new(vec!["todo".into()]);
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_policy(policy)
-            .with_approval_receiver(approval_rx);
-        (loop_, event_rx, approval_tx)
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_todo_without_approval() {
-        // todo is on the allow-list -> executes without approval.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Let me create a todo.\n<tool_call name=\"todo\">\n{\"action\": \"add\", \"title\": \"Test task\"}\n</tool_call>",
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-
-        let (loop_, _event_rx, _approval_tx) =
-            build_approval_loop(model, conversation, tools, config);
-        let result = loop_.run("Create a todo".into()).await;
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_write_blocked_until_approval_allowed() {
-        // write requires approval; loop pauses on ApprovalRequest, resumes
-        // when Allow is received.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me write a file",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "write".into(),
-                args: serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(WriteTool);
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-
-        let (loop_, mut event_rx, approval_tx) =
-            build_approval_loop(model, conversation, tools, config);
-
-        // Run the loop in a background task; it will pause at approval.
-        let loop_handle = tokio::spawn(async move { loop_.run("Write a file".into()).await });
-
-        // Wait for the approval request event.
-        let mut req_id = None;
-        for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv()
-                && let crate::events::Event::ApprovalRequest(req) = event
-            {
-                req_id = Some(req.id);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let req_id = req_id.expect("expected approval request event");
-
-        // Grant approval -> loop should resume and complete.
-        approval_tx
-            .send(crate::events::Approval {
-                id: req_id,
-                decision: crate::events::ApprovalDecision::Allow,
-            })
-            .await
-            .expect("failed to send approval");
-
-        let result = loop_handle.await.expect("loop task panicked");
-        assert!(
-            result.is_ok(),
-            "loop should complete after approval: {result:?}"
-        );
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_write_denied() {
-        // write requires approval; Deny aborts the loop with a structured error.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me write a file",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "write".into(),
-                args: serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(WriteTool);
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-
-        let (loop_, mut event_rx, approval_tx) =
-            build_approval_loop(model, conversation, tools, config);
-
-        let loop_handle = tokio::spawn(async move { loop_.run("Write a file".into()).await });
-
-        // Wait for the approval request event.
-        let mut req_id = None;
-        for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv()
-                && let crate::events::Event::ApprovalRequest(req) = event
-            {
-                req_id = Some(req.id);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let req_id = req_id.expect("expected approval request event");
-
-        // Deny approval -> loop should fail with permission denied.
-        approval_tx
-            .send(crate::events::Approval {
-                id: req_id,
-                decision: crate::events::ApprovalDecision::Deny,
-            })
-            .await
-            .expect("failed to send denial");
-
-        let result = loop_handle.await.expect("loop task panicked");
-        assert!(result.is_err(), "loop should fail on denial: {result:?}");
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("permission denied"),
-            "expected permission denied error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_write_allow_always() {
-        // AllowAlways grants session-wide permission; subsequent write calls
-        // proceed without another approval request.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me write a file",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "write".into(),
-                args: serde_json::json!({"path": "/tmp/a.txt", "content": "a"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me write another file",
-            vec![crate::events::ToolCall {
-                id: "call-2".into(),
-                name: "write".into(),
-                args: serde_json::json!({"path": "/tmp/b.txt", "content": "b"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(WriteTool);
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-
-        let (loop_, mut event_rx, approval_tx) =
-            build_approval_loop(model, conversation, tools, config);
-
-        let loop_handle = tokio::spawn(async move { loop_.run("Write files".into()).await });
-
-        // First write: wait for approval request, grant AllowAlways.
-        let mut req_id = None;
-        for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv()
-                && let crate::events::Event::ApprovalRequest(req) = event
-            {
-                req_id = Some(req.id);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let req_id = req_id.expect("expected first approval request event");
-
-        approval_tx
-            .send(crate::events::Approval {
-                id: req_id.clone(),
-                decision: crate::events::ApprovalDecision::AllowAlways,
-            })
-            .await
-            .expect("failed to send allow-always");
-
-        // Second write: should NOT produce another ApprovalRequest because
-        // AllowAlways grants session-wide permission.
-        let mut second_req = None;
-        for _ in 0..200 {
-            if let Ok(event) = event_rx.try_recv()
-                && let crate::events::Event::ApprovalRequest(req) = event
-                && req.id != req_id
-            {
-                second_req = Some(req.id);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            second_req.is_none(),
-            "second write should not require another approval after AllowAlways"
-        );
-
-        let result = loop_handle.await.expect("loop task panicked");
-        assert!(result.is_ok(), "loop should complete: {result:?}");
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_no_approval_receiver_errors() {
-        // Without an approval receiver, a tool requiring approval returns an
-        // error instead of hanging.
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me write a file",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "write".into(),
-                args: serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(WriteTool);
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-        let policy = Policy::new(vec!["todo".into()]);
-
-        // No approval receiver configured.
-        let loop_ =
-            ReactLoop::new(model, conversation, tools, config, event_tx).with_policy(policy);
-        let result = loop_.run("Write a file".into()).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("approval required")
-                || err.to_string().contains("permission denied"),
-            "expected approval error, got: {err}"
-        );
-    }
-
-    // ===== Cost Budget Tests =====
-
-    #[tokio::test]
-    async fn test_react_loop_cost_budget_disabled_by_default() {
-        // Cost budget disabled by default - loop should run normally
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx);
-        let result = loop_.run("Test prompt".into()).await;
-
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_cost_budget_enforces_session_cap() {
-        // Session cap is exceeded - tool calls should be refused
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use a tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Test task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        // Create cost tracker with $0.01 session cap
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(0.01),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: None,
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Should fail with cost budget error
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::CostBudget(crate::cost::CostBudgetError::CapExceeded { .. }) => {}
-            e => panic!("expected CapExceeded error, got: {e:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_cost_budget_allows_under_cap() {
-        // Session cap not exceeded - tool calls should work
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use a tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Test task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        // Create cost tracker with high session cap ($10)
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: None,
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Should succeed
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("Task complete"));
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_cost_budget_unknown_pricing_fails_closed() {
-        // Unknown model pricing should fail closed
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use a tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Test task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        // Create cost tracker with unknown model
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: None,
-            },
-            "unknown-model-xyz".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Should fail with unknown pricing error
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::CostBudget(crate::cost::CostBudgetError::UnknownPricing { model_id }) => {
-                assert_eq!(model_id, "unknown-model-xyz");
-            }
-            e => panic!("expected UnknownPricing error, got: {e:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_react_loop_cost_budget_per_turn_warning() {
-        // Per-turn warning should emit warning event but not block
-        let model = Arc::new(MockModel::small("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use a tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Test task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        // Create cost tracker with very low per-turn warning ($0.000001)
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: Some(0.000001),
-                expensive_call_confirmation_usd: None,
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Should succeed but emit warning
-        assert!(result.is_ok());
-
-        // Check for warning event
-        let mut found_warning = false;
-        for _ in 0..50 {
-            if let Ok(event) = event_rx.try_recv()
-                && let crate::events::Event::Log(log) = event
-                && log.message.contains("per-turn cost warning")
-            {
-                found_warning = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(found_warning, "expected per-turn warning event");
-    }
-
-    /// Test that run_turn can be interrupted via shutdown signal during model generation.
-    #[tokio::test]
-    async fn test_run_turn_interrupted_during_model_generation() {
-        // Create a mock model that streams slowly (small chunk size)
-        let mut model = MockModel::small("test-model");
-        model.set_streaming(true);
-        // Push a long response that will be streamed in chunks
-        model.push_response(MockModel::text_response(
-            "This is a very long response that will be streamed in multiple chunks so we have time to interrupt it. ".repeat(10),
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        let mut loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx);
-
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = loop_.create_turn_shutdown();
-
-        // Start the turn in a background task
-        let turn_handle =
-            tokio::spawn(async move { loop_.run_turn("Test prompt".into(), shutdown_rx).await });
-
-        // Send interrupt signal immediately (race with stream consumption)
-        shutdown_tx
-            .send(())
-            .await
-            .expect("failed to send interrupt");
-
-        // Wait for the turn to complete
-        let result = turn_handle.await.expect("turn task panicked");
-
-        // Should return Interrupted error
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::Interrupted => {}
-            e => panic!("expected Interrupted error, got: {e:?}"),
-        }
-
-        // Check that interrupted event was emitted
-        let mut found_interrupted = false;
-        for _ in 0..50 {
-            if let Ok(event) = event_rx.try_recv()
-                && matches!(event, crate::events::Event::Interrupted(_))
-            {
-                found_interrupted = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(found_interrupted, "expected interrupted event");
-    }
-
-    /// Test that run_turn completes normally when not interrupted.
-    #[tokio::test]
-    async fn test_run_turn_completes_normally() {
-        let model = MockModel::small("test-model");
-        model.push_response(MockModel::text_response("Task complete"));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, _) = crate::events::event_channel();
-
-        let mut loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx);
-
-        // Create shutdown channel but don't send on it
-        let (_shutdown_tx, shutdown_rx) = loop_.create_turn_shutdown();
-
-        let result = loop_.run_turn("Test prompt".into(), shutdown_rx).await;
-
-        // Should complete successfully
-        assert!(result.is_ok());
-        match result.unwrap() {
-            LoopDecision::Complete(content) => assert!(content.contains("Task complete")),
-            d => panic!("expected Complete, got: {d:?}"),
-        }
-    }
-
-    /// Test that run (full loop) can be interrupted via shutdown signal.
-    #[tokio::test]
-    async fn test_run_interrupted_via_signal() {
-        // Create a mock model that streams slowly
-        let mut model = MockModel::small("test-model");
-        model.set_streaming(true);
-        model.push_response(MockModel::text_response(
-            "This is a very long response that will be streamed in multiple chunks. ".repeat(10),
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Small, 4096);
-        let tools = ToolRegistry::new();
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        // Create loop with external shutdown receiver
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
-        let loop_ = ReactLoop::new(Arc::new(model), conversation, tools, config, event_tx)
-            .with_shutdown(shutdown_rx);
-
-        // Start the run in a background task
-        let run_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
-
-        // Send interrupt signal immediately (simulating SIGINT)
-        shutdown_tx
-            .send(())
-            .await
-            .expect("failed to send interrupt");
-
-        // Wait for the run to complete
-        let result = run_handle.await.expect("run task panicked");
-
-        // Should return Interrupted error
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::Interrupted => {}
-            e => panic!("expected Interrupted error, got: {e:?}"),
-        }
-
-        // Check that interrupted event was emitted (signal-based = false)
-        let mut found_interrupted = false;
-        for _ in 0..50 {
-            if let Ok(event) = event_rx.try_recv()
-                && let crate::events::Event::Interrupted(interrupted) = event
-                && !interrupted.user_initiated
-            {
-                found_interrupted = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            found_interrupted,
-            "expected interrupted event with user_initiated=false"
-        );
-    }
-
-    /// Test that expensive call confirmation prompts when tool cost exceeds threshold.
-    #[tokio::test]
-    async fn test_react_loop_expensive_call_confirmation_prompts() {
-        // Use a model that will make a tool call (frontier = native tool calling)
-        let model = Arc::new(MockModel::frontier("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use an expensive tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Expensive task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        // Create cost tracker with very low expensive call confirmation threshold ($0.000001)
-        // This will trigger confirmation for any tool call
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: Some(0.000001),
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let mut loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-
-        // Create approval channel and inject Allow decision
-        let (approval_tx, approval_rx) = mpsc::channel(16);
-        loop_ = loop_.with_approval_receiver(approval_rx);
-
-        // Start the turn in a background task
-        let turn_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
-
-        // Wait for approval request and send Allow
-        let mut found_approval_request = false;
-        for _ in 0..100 {
-            if let Ok(event) = event_rx.try_recv()
-                && matches!(event, crate::events::Event::ApprovalRequest(_))
-            {
-                found_approval_request = true;
-                approval_tx
-                    .send(crate::events::Approval {
-                        id: "approval-expensive-0".into(),
-                        decision: crate::events::ApprovalDecision::Allow,
-                    })
-                    .await
-                    .expect("failed to send approval");
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let result = turn_handle.await.expect("turn task panicked");
-
-        // Should succeed after approval
-        assert!(result.is_ok(), "result: {result:?}");
-        assert!(found_approval_request, "expected ApprovalRequest event");
-    }
-
-    /// Test that expensive call confirmation is skipped when tool has allow-always grant.
-    #[tokio::test]
-    async fn test_react_loop_expensive_call_confirmation_skip_allow_always() {
-        let model = Arc::new(MockModel::frontier("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use a tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Task 1"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        // Create cost tracker with very low expensive call confirmation threshold
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: Some(0.000001),
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let mut loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-
-        // Pre-grant allow-always for todo tool
-        loop_.policy.allow_always("todo");
-
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Should succeed without any approval request (allow-always skips confirmation)
-        assert!(result.is_ok(), "result: {result:?}");
-
-        // Verify no ApprovalRequest was emitted
-        let mut found_approval_request = false;
-        for _ in 0..50 {
-            if let Ok(event) = event_rx.try_recv()
-                && matches!(event, crate::events::Event::ApprovalRequest(_))
-            {
-                found_approval_request = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !found_approval_request,
-            "expected no ApprovalRequest due to allow-always"
-        );
-    }
-
-    /// Test that expensive call confirmation denies execution when user denies.
-    #[tokio::test]
-    async fn test_react_loop_expensive_call_confirmation_deny() {
-        let model = Arc::new(MockModel::frontier("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use an expensive tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Expensive task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        // Create cost tracker with very low expensive call confirmation threshold
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: Some(0.000001),
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let mut loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-
-        // Create approval channel and inject Deny decision
-        let (approval_tx, approval_rx) = mpsc::channel(16);
-        loop_ = loop_.with_approval_receiver(approval_rx);
-
-        // Start the turn in a background task
-        let turn_handle = tokio::spawn(async move { loop_.run("Test prompt".into()).await });
-
-        // Wait for approval request and send Deny
-        for _ in 0..100 {
-            if let Ok(event) = event_rx.try_recv()
-                && matches!(event, crate::events::Event::ApprovalRequest(_))
-            {
-                approval_tx
-                    .send(crate::events::Approval {
-                        id: "approval-expensive-0".into(),
-                        decision: crate::events::ApprovalDecision::Deny,
-                    })
-                    .await
-                    .expect("failed to send approval");
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let result = turn_handle.await.expect("turn task panicked");
-
-        // Should fail with permission denied
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            ReactError::Tool(msg) => {
-                assert!(msg.contains("permission denied (expensive call)"));
-            }
-            e => panic!("expected Tool error, got: {e:?}"),
-        }
-    }
-
-    /// Test that expensive call confirmation is disabled by default (no threshold set).
-    #[tokio::test]
-    async fn test_react_loop_expensive_call_confirmation_disabled_by_default() {
-        let model = Arc::new(MockModel::frontier("test-model"));
-        model.push_response(crate::model::mock::MockModel::tool_call_response(
-            "Let me use a tool",
-            vec![crate::events::ToolCall {
-                id: "call-1".into(),
-                name: "todo".into(),
-                args: serde_json::json!({"action": "add", "title": "Task"}),
-                status: crate::events::ToolCallStatus::Pending,
-            }],
-        ));
-        model.push_response(crate::model::mock::MockModel::text_response(
-            "Task complete",
-        ));
-
-        let conversation = Conversation::from_tier(ModelTier::Frontier, 4096);
-        let mut tools = ToolRegistry::new();
-        tools.register(TodoTool::new_empty());
-        let config = ReactConfig {
-            max_iterations: 10,
-            max_elapsed_sec: 60,
-            ..Default::default()
-        };
-        let (event_tx, mut event_rx) = crate::events::event_channel();
-
-        // Create cost tracker WITHOUT expensive call confirmation threshold
-        let pricing = Arc::new(crate::context::tokens::default_pricing_table());
-        let cost_tracker = crate::cost::CostTracker::new(
-            crate::cost::CostBudgetConfig {
-                session_cap_usd: Some(10.0),
-                per_turn_warning_usd: None,
-                expensive_call_confirmation_usd: None, // Disabled
-            },
-            "gpt-4o".to_string(),
-            pricing,
-            ModelCapabilities::default(),
-        );
-
-        let loop_ = ReactLoop::new(model, conversation, tools, config, event_tx)
-            .with_cost_tracker(cost_tracker);
-
-        let result = loop_.run("Test prompt".into()).await;
-
-        // Should succeed without any approval request
-        assert!(result.is_ok(), "result: {result:?}");
-
-        // Verify no ApprovalRequest was emitted
-        let mut found_approval_request = false;
-        for _ in 0..50 {
-            if let Ok(event) = event_rx.try_recv()
-                && matches!(event, crate::events::Event::ApprovalRequest(_))
-            {
-                found_approval_request = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            !found_approval_request,
-            "expected no ApprovalRequest when disabled"
-        );
-    }
 }

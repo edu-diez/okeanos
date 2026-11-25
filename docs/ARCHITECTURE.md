@@ -23,7 +23,8 @@
 | **Session resume** (`src/session/`) | Append-only JSONL log, session header (id, cwd, version), resume by session ID, project-scoped session directory, corrupted-line tolerance. | `SessionLog`, `SessionHeader`, `ResumeStore` |
 | **Session log** (`src/session/`) | Append-only JSONL log of messages, tool calls, results, approvals, snapshot events; session header with id/cwd/version; resume by session ID; project-scoped storage. | `SessionLog`, `SessionHeader`, `ResumeStore` |
 | **Git snapshots** (`src/snapshot/`) | gix-based git snapshots before destructive actions and on `/undo`/`/redo` boundaries; snapshot store. | `SnapshotStore`, `UndoRedo` |
-| **TUI** (`src/ui/`) | Terminal rendering per DESIGN.md; ratatui + crossterm; themes from `assets/themes/`. | `TerminalApp`, `Theme`, components (conversation, tool panel, modal, status bar, …) |
+| **Sub-agent delegation** (`src/harness/subagent.rs`) | Spawn isolated sub-agents via `todo` tool extension; agent profile registry; per-sub-agent ReAct loop with isolated context, tool subset, token budget, depth limit; approval bubbling; workspace isolation modes (inherit/branch/share); async background execution with progress events. | `SubAgent`, `AgentProfile`, `AgentRegistry`, `SubAgentHandle`, `SubAgentProgress`, `SubAgentComplete`, `WorkspaceHandle` |
+| **TUI** (`src/ui/`) | Terminal rendering per DESIGN.md; ratatui + crossterm; themes from `assets/themes/`. | `TerminalApp`, `Theme`, components (conversation, tool panel, modal, status bar, FleetView, …) |
 | **Headless/RPC** (`src/headless.rs`) | JSON event emitter shared with TUI; stdio or JSON-RPC transport; identical event stream to TUI (DESIGN.md §7). | `HeadlessDriver`, `JsonRpcServer` (feature-gated) |
 | **Logging** | `tracing` spans/events; JSON subscriber via tracing-subscriber; `RUST_LOG` filtering. | — |
 
@@ -41,7 +42,8 @@
 - **Permission layer owns:** The allow-list and approval decisions. No tool executes a write/delete/network operation without policy approval.
 - **Session log owns:** Append-only durability. It is write-only after creation; snapshots reference log positions.
 - **Snapshot store owns:** Git object writes via gix; undo/redo cursor. It never mutates the working tree outside policy-approved operations.
-- **TUI owns:** Rendering and **input loop for interactive mode**. In interactive mode, the TUI owns the input composer; user input triggers a single ReAct turn via the harness, then control returns to the TUI. The TUI does not run an autonomous loop — it drives the harness turn-by-turn. In headless/RPC mode, the harness runs the full ReAct loop autonomously.
+- **Sub-agent delegation owns:** Agent profile registry (project + user config), sub-agent spawning lifecycle, per-sub-agent `ReactLoop` instances, tool subset selection, token budget child accounting, delegation depth enforcement, workspace isolation (git worktree for `branch` mode via gix), approval routing between parent and sub-agent event channels. The parent harness owns the delegation decision; each sub-agent owns its own loop execution.
+- **TUI owns:** Rendering and **input loop for interactive mode**. In interactive mode, the TUI owns the input composer; user input triggers a single ReAct turn via the harness, then control returns to the TUI. The TUI does not run an autonomous loop — it drives the harness turn-by-turn. In headless/RPC mode, the harness runs the full ReAct loop autonomously. FleetView panel renders sub-agent status and provides steer/stop controls.
 - **Headless/RPC owns:** Transport serialization (JSON over stdout/stdio/HTTP). Same event structs as the TUI renderer.
 
 ## Public vs private state
@@ -151,6 +153,45 @@ Headless/RPC (JSON over stdout/stdio/HTTP)            │
 - Approval requests pause the harness turn; the loop resumes on an `Approval` event (from TUI modal or RPC).
 - Context cap errors propagate as a terminal `error` event; the turn stops cleanly.
 
+### Sub-agent delegation data flow
+
+```
+Parent ReAct Loop (Harness)
+    │
+    ├─► todo.delegate(todo_id, agent_profile, prompt)
+    │       │
+    │       ▼
+    │   AgentRegistry.resolve(agent_profile)
+    │       │
+    │       ├── Validate: profile exists, depth < max_depth, spawns < budget
+    │       ├── Create: isolated Conversation, tool subset, TokenBudget child
+    │       ├── WorkspaceHandle: inherit | branch (gix worktree) | share
+    │       └── Spawn: SubAgent { ReactLoop, parent_tx, approval_rx, depth+1 }
+    │
+    ├─► SubAgent runs autonomous ReAct loop (background task)
+    │       ├─► Context (isolated, tiered prompt + selective files)
+    │       ├─► Model (per-profile model override or inherit)
+    │       ├─► Tool subset (profile allowlist/denylist)
+    │       ├─► Permission (sub-agent's own policy; RequireApproval → parent)
+    │       │       └─► ApprovalRequest emitted on PARENT's event_tx
+    │       │       └─► Parent UI/RPC handles → decision → sub-agent approval_rx
+    │       ├─► Cost budget (child tracker, enforced against parent cap)
+    │       ├─► Session log (appends to parent's log with subagent_id tag)
+    │       ├─► Snapshot store (parent's store; snapshots tagged with subagent_id)
+    │       └─► Event stream: SubAgentProgress (periodic), SubAgentComplete (final)
+    │
+    └─► Parent receives SubAgentComplete
+            ├─► Todo.complete(todo_id)
+            ├─► ToolResult injected into parent conversation
+            └─► Parent continues (async, non-blocking)
+
+Key events (extend DESIGN.md §7):
+- SubAgentProgress { subagent_id, profile, tokens_used, status, depth }
+- SubAgentComplete { subagent_id, todo_id, result: ToolResult, summary }
+- SubAgentError { subagent_id, error }
+- ApprovalRequest (bubbled from sub-agent) → handled by parent → Approval routed back
+```
+
 ## Service boundaries
 
 - **Model service boundary:** `Model` trait is the only seam. Providers implement it; the harness depends on the trait, not on `reqwest` types directly (adapters convert). `Model` trait is text-in/text-out as primitive; native JSON tool calling is an optional capability, not a requirement.
@@ -184,12 +225,14 @@ okeanos/
 │   ├── cli.rs             # clap derive definitions
 │   ├── config/
 │   │   ├── mod.rs         # Config, ConfigLayer, load/walk-up
-│   │   └── secret.rs      # {env:VAR} / {file:path} substitution
+│   │   ├── secret.rs      # {env:VAR} / {file:path} substitution
+│   │   └── agent_profile.rs  # AgentProfile, AgentRegistry (M27)
 │   ├── harness/
 │   │   ├── mod.rs
 │   │   ├── react.rs       # ReAct loop, LoopDecision, iteration/elapsed limits
 │   │   ├── policy.rs      # approval policy wiring
-│   │   └── error.rs       # HarnessError (thiserror)
+│   │   ├── error.rs       # HarnessError (thiserror)
+│   │   └── subagent.rs    # SubAgent, SubAgentHandle, spawning, bubbling (M27)
 │   ├── model/
 │   │   ├── mod.rs
 │   │   ├── trait.rs       # Model trait, ModelCapabilities, Tier
@@ -204,7 +247,7 @@ okeanos/
 │   │   ├── edit/          # diff/patch + whole-file fallback, preflight validation
 │   │   ├── execute/       # interruptible process execution, streaming, timeout
 │   │   └── builtin/
-│   │       ├── todo.rs
+│   │       ├── todo.rs    # extended with Delegate action (M27)
 │   │       ├── read.rs
 │   │       ├── write.rs
 │   │       ├── delete.rs
@@ -236,9 +279,9 @@ okeanos/
 │   │   ├── mod.rs
 │   │   ├── theme.rs       # design tokens from assets/themes/
 │   │   ├── layout.rs      # responsive grid per DESIGN.md §4
-│   │   └── components/    # conversation, tool_panel, modal, status_bar, …
+│   │   └── components/    # conversation, tool_panel, modal, status_bar, fleet_view (M27), …
 │   ├── headless.rs        # JSON event emitter, stdio/JSON-RPC transports (TODO: not yet created)
-│   └── events.rs          # shared event structs (Message, ToolCall, Approval, …)
+│   └── events.rs          # shared event structs (Message, ToolCall, Approval, SubAgentProgress, …)
 ├── tests/                 # integration tests (mock provider, harness logic)
 ├── Cargo.toml
 ├── rust-toolchain.toml
@@ -259,6 +302,12 @@ okeanos/
 | TUI input composer | Not implemented | M12 |
 | Welcome screen | Not implemented | M12 |
 | Graceful shutdown flush on SIGINT | Only normal exit cleanup | M17 |
+| `src/config/agent_profile.rs` | Not created | M27 |
+| `src/harness/subagent.rs` | Not created | M27 |
+| `TodoArgs::Delegate` variant | Not in `todo.rs` | M27 |
+| `SubAgentProgress/Complete` events | Not in `events.rs` | M27 |
+| FleetView TUI component | Not created | M27 |
+| `branch` workspace mode (gix worktree) | Not implemented | M27 |
 
 These gaps are tracked in MILESTONES.md Technical Debt section and will be resolved in the indicated milestones.
 
@@ -271,6 +320,9 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 5. **No secrets in logs:** `tracing` events must not log API keys, auth headers, or tool args containing secrets; args are redacted by default in log output.
 6. **Git sandbox:** Snapshots are taken only inside the session's working directory; gix never runs arbitrary git commands outside policy.
 7. **Static binary reduces supply-chain surface:** No libgit2/openssl FFI (gix + rustls), minimizing native dependencies.
+8. **Sub-agent isolation:** Sub-agents inherit parent's permission mode but receive a tool subset per profile (allowlist/denylist). They cannot escalate privileges beyond their profile. `branch` workspace mode uses gix worktrees for filesystem isolation; `share` mode uses a shared directory with path-scoped access.
+9. **Approval bubbling:** Sub-agent approval requests route to parent; parent's decision is the only authority. Sub-agent cannot bypass approval by spawning children (depth limit enforced at spawn).
+10. **Token budget inheritance:** Sub-agent `CostTracker` is a child of parent's tracker; cannot exceed parent's session cap. Global spawn budget (default 64) prevents resource exhaustion.
 
 ## Dependency rules
 
@@ -278,26 +330,27 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 - **No C dependencies** in the primary tree: avoid git2, openssl, rapidjson. Build with `--target x86_64-unknown-linux-musl` for full static.
 - **Feature flags:** `rpc` (jsonrpsee HTTP/WebSocket), `mcp` (lazy MCP client, deferred), `mock-provider` (test-only MockModel), `simd-json` (performance opt, deferred).
 - **Config crate rule:** `toml` is added only for config parsing; it sits in the CLI/config layer, never in the harness `lib`.
-- **Layering rule:** `src/lib` (harness) depends only on model/tool/perm/context/session/snapshot/events — never on `ui`, `headless`, or `cli`. UI and headless depend on the harness, not vice versa.
+- **Layering rule:** `src/lib` (harness) depends only on model/tool/perm/context/session/snapshot/events — never on `ui`, `headless`, or `cli`. UI and headless depend on the harness, not vice versa. Sub-agent delegation (`src/harness/subagent.rs`) is part of the harness lib; it uses `ReactLoop`, `ToolRegistry`, `Policy`, `CostTracker`, `Conversation`, `SnapshotStore` — all harness-internal.
 - **No circular dependencies** between subsystems.
 
 ## Testing strategy
 
 | Layer | Tooling | Scope |
 |-------|---------|-------|
-| Unit | `cargo test`, mock provider | ReAct loop, approval policy, context cap, tool execution, snapshot undo/redo, config load + secret substitution, token counter, model capability negotiation, text tool parsing, tier selection, edit format validation, tool execution interrupt/cancel — no network |
-| Integration | `tests/` | CLI modes, headless JSON event parity with TUI events, session log append, snapshot round-trip, `--resume` restore, graceful shutdown flush, small-model text-based tool calling, interruptible tool execution, cost cap enforcement |
-| TUI snapshot | golden buffer files | Rendered frame at 80×24 and 120×40; resize reflow; modal re-center |
+| Unit | `cargo test`, mock provider | ReAct loop, approval policy, context cap, tool execution, snapshot undo/redo, config load + secret substitution, token counter, model capability negotiation, text tool parsing, tier selection, edit format validation, tool execution interrupt/cancel, **agent profile parsing, sub-agent spawn validation, tool subset selection, token budget child accounting, depth enforcement, approval bubbling routing** — no network |
+| Integration | `tests/` | CLI modes, headless JSON event parity with TUI events, session log append, snapshot round-trip, `--resume` restore, graceful shutdown flush, small-model text-based tool calling, interruptible tool execution, cost cap enforcement, **sub-agent delegation end-to-end: spawn, progress events, approval bubbling, completion, result aggregation, workspace modes (inherit/branch)** |
+| TUI snapshot | golden buffer files | Rendered frame at 80×24 and 120×40; resize reflow; modal re-center; **FleetView panel with active sub-agents** |
 | Visual audit | automated contrast check | WCAG AA/AAA ratios per DESIGN.md §2 on both canvases |
 | Reduced motion | config toggle | No time-dependent frame changes when disabled |
-| Event parity | harness test harness | Every TUI state transition has a matching JSON event (DESIGN.md §7) |
+| Event parity | harness test harness | Every TUI state transition has a matching JSON event (DESIGN.md §7), **including SubAgentProgress, SubAgentComplete, bubbled ApprovalRequest** |
 | Clippy/fmt | CI | `cargo clippy -- -D warnings`, `cargo fmt --check` |
 
 ## Scalability considerations
 
 - **Context:** Hard cap at MVP (no compaction). Selective file inclusion and history-turn capping are tier-aware (small models get fewer files and turns). If compaction is added later, it lives in `src/context/` behind the `ContextCap` seam; the ReAct loop treats it as a context-source change, not a rewrite.
-- **Concurrency:** Single-threaded tokio `current_thread` for the ReAct loop. Parallel tool execution can be added later behind the `ToolRegistry` without changing the loop signature.
-- **Providers:** New providers implement `Model` + declare `ModelCapabilities`; no changes to harness logic. Provider selection is config-driven (feature flags at build time, env/CLI at runtime). Local/self-hosted models require explicit TOML capability override.
-- **Tools:** New tools implement `Tool` and register in the registry. Tool subset is selected by model tier; small models get a minimal subset. No harness changes.
+- **Concurrency:** Single-threaded tokio `current_thread` for the ReAct loop. Parallel tool execution can be added later behind the `ToolRegistry` without changing the loop signature. **Sub-agents run as independent background tasks; each has its own `ReactLoop` on the same runtime. Concurrency bounded by global spawn budget (default 64) and per-session token budget.**
+- **Providers:** New providers implement `Model` + declare `ModelCapabilities`; no changes to harness logic. Provider selection is config-driven (feature flags at build time, env/CLI at runtime). Local/self-hosted models require explicit TOML capability override. **Per-agent model override enables cost-optimized routing (Haiku for exploration, Opus for reasoning).**
+- **Tools:** New tools implement `Tool` and register in the registry. Tool subset is selected by model tier; small models get a minimal subset. No harness changes. **Sub-agent tool subset is a further filter of the tier subset via profile allowlist/denylist.**
 - **Transport:** stdio JSON-RPC first; HTTP/WebSocket via `jsonrpsee` behind the `rpc` feature. Adding a transport means implementing `HeadlessDriver`, not touching the loop.
-- **Session log:** Append-only JSONL is unbounded by design at MVP; rotation/archiving can be added in `src/session/` without affecting the loop.
+- **Session log:** Append-only JSONL is unbounded by design at MVP; rotation/archiving can be added in `src/session/` without affecting the loop. **Sub-agent events are tagged with `subagent_id` in the parent's log for traceability.**
+- **Workspace isolation:** `branch` mode creates git worktrees via gix; cleanup on sub-agent completion. Number of concurrent worktrees bounded by spawn budget. No persistent disk growth.

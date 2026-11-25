@@ -5,6 +5,7 @@ use crate::tool::tool_trait::ToolSpec;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Capabilities declared per model.
@@ -213,6 +214,51 @@ pub trait Model: Send + Sync {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// Implement Model for Arc<dyn Model> to allow trait object usage in ReactLoop.
+/// This delegates all calls to the inner trait object.
+#[async_trait::async_trait]
+impl Model for Arc<dyn Model + Send + Sync> {
+    fn capabilities(&self) -> &ModelCapabilities {
+        (**self).capabilities()
+    }
+
+    fn model_id(&self) -> &str {
+        (**self).model_id()
+    }
+
+    async fn complete(
+        &self,
+        messages: &[ModelMessage],
+        params: &GenerationParams,
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<ModelResponse, ModelError> {
+        (**self).complete(messages, params, tools).await
+    }
+
+    async fn stream(
+        &self,
+        messages: &[ModelMessage],
+        params: &GenerationParams,
+        tools: Option<&[ToolSpec]>,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<ModelStreamChunk, ModelError>> + Send + 'static>>,
+        ModelError,
+    > {
+        (**self).stream(messages, params, tools).await
+    }
+
+    async fn compact_native(
+        &self,
+        request: NativeCompactionRequest,
+    ) -> Result<Option<NativeCompactionResponse>, ModelError> {
+        (**self).compact_native(request).await
+    }
+
+    fn require_capability(&self, capability: &str) -> Result<(), ModelError> {
+        (**self).require_capability(capability)
     }
 }
 

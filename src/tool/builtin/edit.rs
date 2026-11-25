@@ -229,6 +229,10 @@ impl Tool for EditTool {
             truncated,
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Apply a unified diff/patch with preflight validation.

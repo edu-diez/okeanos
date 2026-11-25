@@ -288,6 +288,11 @@ impl CompactionManager {
         }
     }
 
+    /// Get the compaction configuration.
+    pub fn config(&self) -> &CompactionConfig {
+        &self.config
+    }
+
     /// Register a compaction observer.
     pub fn register_observer(&mut self, observer: Box<dyn CompactionObserver>) {
         self.observers.push(observer);

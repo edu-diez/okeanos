@@ -169,6 +169,49 @@ pub struct Thinking {
     pub ts: u64,
 }
 
+/// Sub-agent progress event (emitted periodically during sub-agent execution).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubAgentProgress {
+    /// Sub-agent ID.
+    pub subagent_id: String,
+    /// Current iteration number.
+    pub iteration: usize,
+    /// Brief status message.
+    pub message: String,
+    /// Timestamp in milliseconds.
+    pub ts: u64,
+}
+
+/// Sub-agent completion event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubAgentComplete {
+    /// Sub-agent ID.
+    pub subagent_id: String,
+    /// The todo ID that was delegated to this sub-agent.
+    pub todo_id: String,
+    /// Final result summary.
+    pub summary: String,
+    /// Tokens used by the sub-agent.
+    pub tokens_used: u64,
+    /// The final tool result from the sub-agent.
+    pub result: ToolResult,
+    /// Timestamp in milliseconds.
+    pub ts: u64,
+}
+
+/// Sub-agent error event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubAgentError {
+    /// Sub-agent ID.
+    pub subagent_id: String,
+    /// Error code.
+    pub code: String,
+    /// Error message.
+    pub message: String,
+    /// Timestamp in milliseconds.
+    pub ts: u64,
+}
+
 /// Context compaction event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactionEvent {
@@ -264,6 +307,9 @@ pub enum Event {
     Interrupted(Interrupted),
     Thinking(Thinking),
     Compaction(CompactionEvent),
+    SubAgentProgress(SubAgentProgress),
+    SubAgentComplete(SubAgentComplete),
+    SubAgentError(SubAgentError),
 }
 
 impl Event {
@@ -343,6 +389,18 @@ impl Event {
 
     pub fn compaction(event: CompactionEvent) -> Self {
         Event::Compaction(event)
+    }
+
+    pub fn subagent_progress(event: SubAgentProgress) -> Self {
+        Event::SubAgentProgress(event)
+    }
+
+    pub fn subagent_complete(event: SubAgentComplete) -> Self {
+        Event::SubAgentComplete(event)
+    }
+
+    pub fn subagent_error(event: SubAgentError) -> Self {
+        Event::SubAgentError(event)
     }
 }
 

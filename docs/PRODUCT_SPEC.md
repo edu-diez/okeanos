@@ -74,6 +74,14 @@ A single static Rust binary that turns a language model into an autonomous codin
 | FR-33 | Cost budget: opt-in hard session cost cap (USD) + per-turn soft warning threshold; when cap reached, refuse new tool calls that would exceed it, let in-flight work fail; fail closed ($0 + warning) on unknown pricing. |
 | FR-34 | Context window warnings before cap: per-turn current/total tokens in status bar; clear warning when remaining drops below threshold (10–15%); error (not crash) at hard cap; no silent truncation. |
 | FR-35 | Tool result deduplication: none at MVP; repeated calls always re-execute. Revisit post-MVP with TTL + exclusion of mutating tools. |
+| FR-36 | Sub-agent delegation: `todo` tool extended with `delegate` action to spawn isolated sub-agents; each sub-agent runs a full ReAct loop with its own context, tool subset (per-profile allowlist/denylist), token budget, and delegation depth limit. Parent aggregates results; approval requests bubble up to parent for decision. |
+| FR-37 | Agent profiles: declarative TOML profiles in `.okeanos/agents/*.toml` (project) and `~/.config/okeanos/agents/*.toml` (user), with project overriding user. Profile defines: description, model (inherit or override), tool allowlist/denylist, max delegation depth, token budget, workspace mode (inherit | branch | share). |
+| FR-38 | Sub-agent execution: async background execution with periodic progress events (`SubAgentProgress`) emitted on parent's event stream; parent continues working. On completion, `SubAgentComplete` event delivers structured result; parent's todo item is marked complete. |
+| FR-39 | Approval bubbling: sub-agent `PolicyDecision::RequireApproval` emits `ApprovalRequest` on parent's event channel; parent UI/RPC handles approval; decision routed back to sub-agent's approval channel to resume execution. |
+| FR-40 | Delegation limits: configurable max delegation depth (default 1, enforced at spawn); global spawn budget per session (default 64, like OpenCode/Pi); per-sub-agent token budget enforced via `CostTracker` child budget. |
+| FR-41 | Workspace isolation modes: `inherit` (shared workspace, default M27), `branch` (isolated git worktree via gix, optional), `share` (shared directory storage). `branch` mode creates a temporary worktree for the sub-agent's lifetime. |
+| FR-42 | FleetView TUI: dedicated panel showing active sub-agents (id, profile, status, tokens used, depth), with steer/stop controls. Background sub-agents emit progress updates; parent can open a sub-agent's transcript. |
+| FR-43 | Model override per agent: profile `model` field accepts `"inherit"` (parent's model) or explicit `provider/model#variant`; enables cost optimization (Haiku for exploration, Opus for reasoning). |
 
 ### Non-functional requirements
 
@@ -131,7 +139,6 @@ A single static Rust binary that turns a language model into an autonomous codin
 
 **Out of scope (MVP):**
 - Context compaction/summarization.
-- Multi-agent crew beyond the todo planning primitive (delegation is a design direction, not MVP).
 - Lazy MCP client (feature-gated, deferred).
 - Other model providers beyond OpenAI-compatible (feature-gated).
 - WebSocket RPC (feature-gated).
@@ -140,12 +147,14 @@ A single static Rust binary that turns a language model into an autonomous codin
 - Tree-sitter or other C-based symbol scanners for context inclusion.
 - Tool result caching / deduplication at MVP (revisit post-MVP).
 - Per-turn user confirmation for expensive tool calls (post-MVP).
+- Role-based crew orchestration (oh-my-opencode-slim style) — deferred until sub-agent delegation proves the primitive.
 
 ## Deferred features
 
 - Context compaction (post-MVP; hard cap is the intentional MVP behavior).
-- Role-based crew delegation (oh-my-opencode-slim style) — deferred until the todo tool proves the planning primitive.
+- Role-based crew orchestration (oh-my-opencode-slim style) — deferred until sub-agent delegation proves the primitive. Crews are composition (prompts + workflows using sub-agents), not infrastructure.
 - MCP client — lazy MCP server handling behind a feature flag, post-MVP.
 - Additional providers (Anthropic, Azure, Vertex, etc.) — behind `Model` trait feature flags.
 - WebSocket transport for RPC — stdio JSON-RPC first.
 - Rich text / markdown rendering in TUI — plain mono-data at MVP.
+- Autonomous agent swarms / cross-project delegation — explicitly out of scope for M27.
