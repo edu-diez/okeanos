@@ -233,6 +233,8 @@ pub struct Config {
     pub tool_cache: Option<ToolCacheSection>,
     #[serde(default)]
     pub agents: Option<AgentsSection>,
+    #[serde(default)]
+    pub memory: Option<MemorySection>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -253,6 +255,7 @@ impl std::fmt::Debug for Config {
             .field("mcp", &self.mcp)
             .field("rotation", &self.rotation)
             .field("tool_cache", &self.tool_cache)
+            .field("memory", &self.memory)
             .finish()
     }
 }
@@ -460,6 +463,19 @@ pub struct ToolCacheSection {
     pub per_tool_ttl: std::collections::HashMap<String, u64>,
     /// Maximum number of cache entries (default: 1000).
     pub max_entries: Option<usize>,
+}
+
+/// Durable memory and instruction-file configuration (M28).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MemorySection {
+    /// Load the memory index and register `remember` (default: true).
+    pub enabled: Option<bool>,
+    /// Load `AGENTS.md` / `CLAUDE.md` instruction files (default: true).
+    pub instructions: Option<bool>,
+    /// Total byte cap across instruction files (default: 16384).
+    pub max_instruction_bytes: Option<usize>,
+    /// Line cap per `MEMORY.md` index (default: 200).
+    pub max_index_lines: Option<usize>,
 }
 
 /// Agent profiles configuration.
@@ -876,6 +892,20 @@ impl Config {
             {
                 return Err(ConfigError::Validation {
                     message: "tool_cache.max_entries must be > 0".to_string(),
+                });
+            }
+        }
+
+        // Validate memory section
+        if let Some(memory) = &self.memory {
+            if memory.max_instruction_bytes == Some(0) {
+                return Err(ConfigError::Validation {
+                    message: "memory.max_instruction_bytes must be > 0".to_string(),
+                });
+            }
+            if memory.max_index_lines == Some(0) {
+                return Err(ConfigError::Validation {
+                    message: "memory.max_index_lines must be > 0".to_string(),
                 });
             }
         }

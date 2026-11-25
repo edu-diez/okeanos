@@ -946,9 +946,31 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - `cargo test` passes (361 unit tests including FleetView tests)
 - `cargo build --release` produces a single binary
 
+### Milestone 28 — Durable & cross-session memory
+**Status:** implemented, pending test run + tag — target `v0.12.0`
+
+**Scope:** Give the agent durable context that survives sessions and compaction (FR-44..FR-46).
+- Hierarchical `AGENTS.md` / `CLAUDE.md` loading into the system prompt (size-capped, explicit truncation)
+- File-based memory store: `MEMORY.md` index + topic files, project and user scope
+- `remember` tool (Write category, approval-gated, slugged names)
+- `[memory]` config section (all optional; enabled by default)
+- **Out of scope:** sub-agent inheritance, background extraction/consolidation, session titles/search/`--continue`, todo-state log events, embeddings/vector search.
+
+**Definition of Done:**
+- ✅ Instruction loader: user dir → root → CWD order, `AGENTS.md` preferred over `CLAUDE.md` per dir, byte cap with notice, small tier cap 4 KiB
+- ✅ Memory index loader: project + user, 200 line / 8 KiB cap, skipped for small tier
+- ✅ `build_system_prompt_with_context` used by all four entry points (interactive, headless, rpc, rpc-ws); existing `build_system_prompt` unchanged
+- ✅ `remember` tool registered for mid/frontier; unit tests for slugging, traversal rejection, index upsert, scope selection
+- ✅ `[memory]` config (`enabled`, `instructions`, `max_instruction_bytes`, `max_index_lines`) + validation + `okeanos init` template
+- [ ] Unit tests with tempdirs (no network) — written; **not yet executed** (no linker on dev machine), run in CI
+- [ ] `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo build --release` pass — fmt + clippy (`--all-targets`, `--all-features` check) clean locally; test/release pending
+- ✅ `Cargo.toml` bumped to `0.12.0`
+- [ ] Tagged `v0.12.0` (after tests pass)
+
 ---
 
 ## Milestone summary table
+
 
 | Milestone | Deliverable | Sessions (est.) | Builds on |
 |-----------|-------------|-----------------|-----------|
@@ -987,6 +1009,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 | 25 | Tree-sitter scanning (opt-in) | 2 | M16 |
 | 26 | Markdown rendering | 1–2 | M12 |
 | 27 | ✅ Multi-agent delegation | 5–6 | M16, M13 |
+| 28 | Durable & cross-session memory | 2 | M16, M18 |
 
 ---
 
@@ -1032,6 +1055,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M25 Tree-sitter scanning | `0.9.0` | |
 | M26 Markdown rendering | `0.10.0` | |
 | M27 Multi-agent delegation | `0.11.0` | ✅ Complete |
+| M28 Durable & cross-session memory | `0.12.0` | Minor bump: new feature, additive only (new optional `[memory]` config, new `remember` tool, system prompt gains project instructions). No breaking CLI/config/API change, so not a major/patch bump. |
 | … | `0.x.0` | One minor per independent feature milestone |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).

@@ -20,6 +20,7 @@
 | **Edit format** (`src/tool/edit/`) | Diff/patch default for frontier; whole-file/str_replace fallback for small models; per-model edit-format hint; preflight-validate patches before applying; never silently truncate or partially apply. | `EditFormat`, `PatchValidator`, `PatchApplier` |
 | **Cost budget** (`src/cost/`) | Opt-in hard session cost cap (USD); per-turn soft warning threshold; fail closed on unknown pricing; refuse new tool calls exceeding cap; let in-flight work finish. | `CostBudget`, `CostTracker` |
 | **Conversation & context** (`src/context/`) | Message history, tiered system prompt + `skills/` concatenation, hard context cap, context-cap error, approximate token counting, cost estimation, selective file inclusion, history-turn capping per tier, context window warnings before cap. | `Conversation`, `ContextCap`, `TokenCounter`, `CostEstimate`, `Tier`, `SelectiveContext`, `ContextWarnings` |
+| **Durable memory** (`src/context/memory.rs`, `src/tool/builtin/remember.rs`) | Cross-session context (M28): hierarchical `AGENTS.md`/`CLAUDE.md` instruction loading (user dir → project root → CWD), size-capped with explicit truncation notices; file-based memory store (`MEMORY.md` index + topic files, project and user scope) with the index injected into the system prompt; `remember` tool writes through the permission layer. All loading happens once at startup, synchronously, from a handful of small files; no embeddings, no index service. | `MemoryConfig`, `InstructionFile`, `MemoryIndex`, `ProjectContext`, `RememberTool` |
 | **Session resume** (`src/session/`) | Append-only JSONL log, session header (id, cwd, version), resume by session ID, project-scoped session directory, corrupted-line tolerance. | `SessionLog`, `SessionHeader`, `ResumeStore` |
 | **Session log** (`src/session/`) | Append-only JSONL log of messages, tool calls, results, approvals, snapshot events; session header with id/cwd/version; resume by session ID; project-scoped storage. | `SessionLog`, `SessionHeader`, `ResumeStore` |
 | **Git snapshots** (`src/snapshot/`) | gix-based git snapshots before destructive actions and on `/undo`/`/redo` boundaries; snapshot store. | `SnapshotStore`, `UndoRedo` |
@@ -252,6 +253,7 @@ okeanos/
 │   │       ├── write.rs
 │   │       ├── delete.rs
 │   │       ├── run.rs     # local process at permission boundary
+│   │       ├── remember.rs # durable memory writer, Write category (M28)
 │   │       └── grep.rs
 │   ├── cost/
 │   │   └── budget.rs      # session cost cap, per-turn warnings, fail-closed pricing
@@ -266,6 +268,7 @@ okeanos/
 │   │   ├── tokens.rs      # approximate token counter, CostEstimate
 │   │   ├── tier.rs        # model tier → prompt template + tool subset + generation params
 │   │   ├── selective.rs   # selective file inclusion (ripgrep symbol scan, pure Rust)
+│   │   ├── memory.rs      # instruction-file hierarchy + MEMORY.md index loading (M28)
 │   │   └── warnings.rs    # context window warnings before hard cap
 │   ├── session/
 │   │   ├── log.rs         # append-only JSONL (TODO: not yet split)
@@ -323,7 +326,15 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 8. **Sub-agent isolation:** Sub-agents inherit parent's permission mode but receive a tool subset per profile (allowlist/denylist). They cannot escalate privileges beyond their profile. `branch` workspace mode uses gix worktrees for filesystem isolation; `share` mode uses a shared directory with path-scoped access.
 9. **Approval bubbling:** Sub-agent approval requests route to parent; parent's decision is the only authority. Sub-agent cannot bypass approval by spawning children (depth limit enforced at spawn).
 10. **Token budget inheritance:** Sub-agent `CostTracker` is a child of parent's tracker; cannot exceed parent's session cap. Global spawn budget (default 64) prevents resource exhaustion.
+11. **Instruction files and memory are untrusted-ish input:** `AGENTS.md`/`CLAUDE.md` and memory files from a cloned repo enter the system prompt, like in other agents; they cannot widen permissions because every tool call still passes `Policy::check`. They are plain files, not a new config source: they carry prose for the model and never change okeanos settings. `remember` is Write-category (approval required), slugs file names, and refuses to write outside the memory directories. Memory is never loaded from outside `<project_root>/.okeanos/memory/` or the user config dir.
 
+### Durable memory data flow (M28)
+
+1. **Startup:** `ProjectContext::load(project_root, cwd, tier, &MemoryConfig)` reads the instruction files (user dir, then root→CWD) and, for mid/frontier tiers, the two `MEMORY.md` indexes. Each source is size-capped; truncation appends a notice naming the file.
+2. **Prompt assembly:** `build_system_prompt_with_context` appends, after tier prompt and skills: `## Project instructions` (one labeled block per file), then `## Memory` (index lines + how to `read` topics / `remember`). The result is fixed for the session, so the cached prefix never changes mid-session.
+3. **Compaction:** instructions/memory live in the system prompt, outside the compactable history, so they are re-sent verbatim after every compaction and never summarised away.
+4. **Write:** `remember` → `Policy::check` (approval) → write `<scope dir>/<slug>.md` + upsert the index line. Takes effect next session.
+5. **Out of scope (deferred):** sub-agent inheritance of instructions/memory, background memory extraction/consolidation, session titles/search, `--continue`, dedicated todo-state log events.
 ## Dependency rules
 
 - **Primary crates (Phase 2 recommendation):** ratatui + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC).

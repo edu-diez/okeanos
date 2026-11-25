@@ -7,6 +7,7 @@
 pub mod cap;
 pub mod compaction;
 pub mod conversation;
+pub mod memory;
 pub mod selective;
 pub mod tier;
 pub mod tokens;
@@ -20,8 +21,10 @@ pub use compaction::{
     NativeCompactionResponse, NoopCompactionObserver, summarize_plan,
 };
 pub use conversation::{
-    Conversation, ConversationError, PruneStats, build_system_prompt, load_skills,
+    Conversation, ConversationError, PruneStats, build_system_prompt,
+    build_system_prompt_with_context, load_skills,
 };
+pub use memory::{MemoryConfig, ProjectContext};
 pub use selective::{
     IncludedFile, SelectiveContextConfig, SelectiveContextError, build_file_context,
     expand_mentions, find_relevant_files,

@@ -5,7 +5,11 @@ use clap::Parser;
 use futures::Stream;
 use okeanos::cli::{Cli, Command, ConfigAction, Mode, Shell, Verbosity};
 use okeanos::config::Config;
-use okeanos::context::{Conversation, build_system_prompt, tokens::default_pricing_table};
+use okeanos::context::memory::user_config_dir;
+use okeanos::context::{
+    Conversation, MemoryConfig, ProjectContext, build_system_prompt_with_context,
+    tokens::default_pricing_table,
+};
 use okeanos::cost::{CostBudgetConfig, CostTracker};
 #[allow(unused_imports)]
 use okeanos::events::{Approval, ApprovalDecision, Event, Log, LogLevel};
@@ -331,6 +335,13 @@ kind = "openai-compatible"
 base_url = "https://openrouter.ai/api/v1"
 # API key: use {env:VAR} or {file:path} for secret substitution
 # api_key = "{env:OPENROUTER_API_KEY}"
+
+# Durable memory: AGENTS.md / CLAUDE.md instructions + MEMORY.md index (all optional)
+# [memory]
+# enabled = true                 # load memory index and enable the `remember` tool
+# instructions = true            # load AGENTS.md / CLAUDE.md (user dir, project root .. CWD)
+# max_instruction_bytes = 16384  # total cap across instruction files
+# max_index_lines = 200          # cap per MEMORY.md index
 
 # Context configuration
 [context]
@@ -759,9 +770,18 @@ async fn run_interactive_tui(
     let configured_model = config.model.as_ref().and_then(|m| m.name.clone());
 
     // Build conversation with system prompt and context cap
-    let system_prompt = build_system_prompt(
+    let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
+    let project_ctx = ProjectContext::load(
+        &project_root,
+        &cwd,
+        user_config_dir().as_deref(),
+        model_tier,
+        &memory_cfg,
+    );
+    let system_prompt = build_system_prompt_with_context(
         model_tier,
         config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_ctx,
     )
     .context("failed to build system prompt")?;
 
@@ -863,6 +883,8 @@ async fn run_interactive_tui(
             ]
         }
     };
+
+    register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -1467,9 +1489,18 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     };
 
     // Build conversation with system prompt and context cap
-    let system_prompt = build_system_prompt(
+    let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
+    let project_ctx = ProjectContext::load(
+        &project_root,
+        &cwd,
+        user_config_dir().as_deref(),
+        model_tier,
+        &memory_cfg,
+    );
+    let system_prompt = build_system_prompt_with_context(
         model_tier,
         config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_ctx,
     )
     .context("failed to build system prompt")?;
 
@@ -1575,6 +1606,8 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
             ]
         }
     };
+
+    register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -1832,6 +1865,21 @@ fn apply_cli_overrides(
 }
 
 /// List of available tools for dry-run display.
+/// Register the `remember` tool for tiers that load the memory index.
+fn register_memory_tool(
+    tools: &mut ToolRegistry,
+    cfg: &MemoryConfig,
+    tier: okeanos::model::ModelTier,
+    project_root: &std::path::Path,
+) {
+    if cfg.enabled && tier != okeanos::model::ModelTier::Small {
+        tools.register(okeanos::tool::builtin::RememberTool::new(
+            okeanos::context::memory::project_memory_dir(project_root),
+            okeanos::context::memory::user_memory_dir(),
+        ));
+    }
+}
+
 fn tools_list() -> Vec<&'static str> {
     vec!["todo", "read", "write", "edit", "delete", "run", "grep"]
 }
@@ -2161,9 +2209,18 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     };
 
     // Build conversation with system prompt and context cap
-    let system_prompt = build_system_prompt(
+    let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
+    let project_ctx = ProjectContext::load(
+        &project_root,
+        &cwd,
+        user_config_dir().as_deref(),
+        model_tier,
+        &memory_cfg,
+    );
+    let system_prompt = build_system_prompt_with_context(
         model_tier,
         config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_ctx,
     )
     .context("failed to build system prompt")?;
 
@@ -2248,6 +2305,8 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
             tools.register(GrepTool::new());
         }
     }
+
+    register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -2731,9 +2790,18 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     };
 
     // Build conversation with system prompt and context cap
-    let system_prompt = build_system_prompt(
+    let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
+    let project_ctx = ProjectContext::load(
+        &project_root,
+        &cwd,
+        user_config_dir().as_deref(),
+        model_tier,
+        &memory_cfg,
+    );
+    let system_prompt = build_system_prompt_with_context(
         model_tier,
         config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_ctx,
     )
     .context("failed to build system prompt")?;
 
@@ -2818,6 +2886,8 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
             tools.register(GrepTool::new());
         }
     }
+
+    register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]

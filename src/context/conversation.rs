@@ -562,7 +562,17 @@ pub fn build_system_prompt(
     Ok(prompt)
 }
 
-/// Get the built-in system prompt for a tier.
+/// Like [`build_system_prompt`], plus durable project instructions and the
+/// memory index. The result is fixed for the session (byte-stable prefix).
+pub fn build_system_prompt_with_context(
+    tier: ModelTier,
+    skills_dir: Option<&Path>,
+    project: &crate::context::memory::ProjectContext,
+) -> Result<String, ConversationError> {
+    let mut prompt = build_system_prompt(tier, skills_dir)?;
+    prompt.push_str(&project.render());
+    Ok(prompt)
+}
 fn system_prompt_for_tier(tier: ModelTier) -> &'static str {
     match tier {
         ModelTier::Small => include_str!("../../assets/prompts/small_system_prompt.txt"),

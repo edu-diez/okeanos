@@ -26,6 +26,7 @@ Concise rules for AI-assisted work on this repo. Docs-only project at this phase
 - **Shutdown:** Signal handlers (SIGINT/SIGTERM) must flush the JSONL session log, teardown the TUI alternate screen, and drain in-flight work before exit. No subsystem may block shutdown indefinitely.
 - **Token counting:** Token counts and cost estimates are estimates, not provider-authoritative. Label them clearly in the UI and logs.
 - **Session resume:** The JSONL session log is the source of truth for resume. `--resume <id>` restores conversation, todos, and plan state. Corrupted trailing lines must be tolerated.
+- **Durable memory (M28):** `AGENTS.md`/`CLAUDE.md` and the `MEMORY.md` index are loaded once at startup into the system prompt (byte-stable for prompt caching), always size-capped with an explicit truncation notice. Memory writes go only through the `remember` tool (approval-gated, slugged names, confined to the memory dirs). No embeddings/vector stores.
 - **No visual deviation:** TUI colors, layout regions, tokens, and the §7 event map (DESIGN.md) are the visual spec. Changes require design review; do not implement placeholder UI.
 
 ## Documentation rules
