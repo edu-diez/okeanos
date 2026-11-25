@@ -54,4 +54,8 @@ impl Tool for McpTool {
             .await
             .map_err(ToolError::from)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
