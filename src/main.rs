@@ -230,6 +230,15 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
             .flatten()
             .map(|r| std::path::PathBuf::from(shellexpand::tilde(r).as_ref())),
     );
+    let perms = config.permissions.as_ref();
+    okeanos::tool::sandbox::set_policy(okeanos::tool::sandbox::SandboxPolicy {
+        mode: perms
+            .and_then(|p| p.sandbox.as_deref())
+            .and_then(|m| m.parse().ok())
+            .unwrap_or_default(),
+        network: perms.and_then(|p| p.sandbox_network).unwrap_or(false),
+        roots: write_roots.clone(),
+    });
     okeanos::tool::workspace::set_roots(write_roots);
 
     match cli.mode() {
@@ -373,6 +382,10 @@ max_elapsed_sec = 300
 # Allow-list of tools that can run without approval
 # Tools not on this list require interactive approval
 allow_list = ["todo", "read", "grep"]
+# OS sandbox for `run`: "none" (default), "read-only" or "workspace-write".
+# Linux needs bwrap, macOS uses sandbox-exec; unsupported platforms refuse to run.
+# sandbox = "workspace-write"
+# sandbox_network = false
 
 # Cost budget configuration (opt-in)
 # [cost]

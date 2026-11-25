@@ -100,8 +100,9 @@ impl Tool for RunTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        let mut cmd = Command::new(command);
-        cmd.args(&args_vec);
+        let wrapped = crate::tool::sandbox::apply(command, &args_vec)?;
+        let mut cmd = Command::new(&wrapped.program);
+        cmd.args(&wrapped.args);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

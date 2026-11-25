@@ -336,6 +336,10 @@ pub struct PermissionsSection {
     pub allow_list: Option<Vec<String>>,
     /// Extra directories (besides the project root) that `write`/`edit`/`delete` may modify.
     pub extra_write_roots: Option<Vec<String>>,
+    /// OS sandbox for `run`: "none" (default), "read-only" or "workspace-write" (M30).
+    pub sandbox: Option<String>,
+    /// Allow network access inside the sandbox (default: false).
+    pub sandbox_network: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -896,6 +900,13 @@ impl Config {
                     message: "tool_cache.max_entries must be > 0".to_string(),
                 });
             }
+        }
+
+        if let Some(mode) = self.permissions.as_ref().and_then(|p| p.sandbox.as_deref()) {
+            mode.parse::<crate::tool::sandbox::SandboxMode>()
+                .map_err(|message| ConfigError::Validation {
+                    message: format!("permissions.sandbox: {message}"),
+                })?;
         }
 
         // Validate memory section

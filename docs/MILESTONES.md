@@ -984,6 +984,19 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.13.0`; `nix` made Unix-only, `windows-sys` added Windows-only
 - ☐ Tag `v0.13.0`
 
+### Milestone 30 — Optional OS sandbox
+**Status:** complete — v0.14.0 (tag pending)
+
+**Scope:** FR-50. `permissions.sandbox` (`none` default | `read-only` | `workspace-write`) and `permissions.sandbox_network` (default false) behind a `Sandbox` trait (`src/tool/sandbox.rs`), applied to `run`. Linux: `bwrap`; macOS: `sandbox-exec`; Windows: unsupported (fails closed). Spawns external helpers; nothing linked.
+- **Out of scope:** Landlock, Windows AppContainer/restricted token, network proxy/allowlist, sandboxing MCP servers.
+
+**Definition of Done:**
+- ✅ Config + validation (`sandbox` values), `okeanos init` template comment
+- ✅ Unit tests: bwrap argv per mode/network, `.git`/`.env*` protection, Seatbelt profile + escaping, fail-closed when unsupported/missing
+- ☐ Linux/macOS execution paths verified in CI (compile + argv tests only on Windows dev host)
+- ✅ `Cargo.toml` bumped to `0.14.0`
+- ☐ Tag `v0.14.0`
+
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
 
@@ -1038,7 +1051,7 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 27 | ✅ Multi-agent delegation | 5–6 | M16, M13 |
 | 28 | ✅ Durable & cross-session memory | 2 | M16, M18 |
 | 29 | ✅ Execution environment hardening | 1–2 | M6, M5 |
-| 30 | OS sandbox (optional) | 3 | M29 |
+| 30 | ✅ OS sandbox (optional) | 3 | M29 |
 | 31 | Incremental tool output events | 1–2 | M29, M12 |
 | 32 | Background processes | 1–2 | M29 |
 | 33 | Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
@@ -1090,7 +1103,8 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M28 Durable & cross-session memory | `0.12.0` | ✅ Complete. Minor bump: new feature, additive only (new optional `[memory]` config, new `remember` tool, system prompt gains project instructions). No breaking CLI/config/API change, so not a major/patch bump. |
 | … | `0.x.0` | One minor per independent feature milestone |
 | M29 Execution environment hardening | `0.13.0` | ✅ Complete. Minor bump (pre-1.0 convention for user-visible behaviour change): `run` now defaults to a 120 s timeout, scrubs secret env vars and closes stdin; `write`/`edit`/`delete` refuse paths outside the project root/`.git`/`.env*`; `allow-always` on `run` is command-scoped. New optional `permissions.extra_write_roots`. Not a patch bump because behaviour changes; not 1.0 because still pre-stability. |
-| M30–M33 | `0.14.0`+ | Planned, one minor each |
+| M30 OS sandbox | `0.14.0` | ✅ Complete. Minor bump: additive, opt-in (`permissions.sandbox`, default `none`). |
+| M31–M33 | `0.15.0`+ | Planned, one minor each |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 
