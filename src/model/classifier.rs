@@ -7,7 +7,6 @@
 use crate::model::{ModelCache, ModelTier, discovery};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::HashMap;
 
 /// Model classification result with confidence and reasoning.
 #[derive(Debug, Clone)]
@@ -18,115 +17,6 @@ pub struct ModelClassification {
     pub detected_params: Option<u32>, // Parameter count in billions if detected
     pub detected_context: Option<usize>, // Context window if known
 }
-
-/// Known model database with explicit tier assignments.
-static KNOWN_MODELS: Lazy<HashMap<&'static str, ModelTier>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    // Frontier tier
-    m.insert("gpt-4o", ModelTier::Frontier);
-    m.insert("gpt-4o-2024-05-13", ModelTier::Frontier);
-    m.insert("gpt-4o-2024-08-06", ModelTier::Frontier);
-    m.insert("gpt-4o-2024-11-20", ModelTier::Frontier);
-    m.insert("gpt-4-turbo", ModelTier::Frontier);
-    m.insert("gpt-4-turbo-2024-04-09", ModelTier::Frontier);
-    m.insert("gpt-4", ModelTier::Frontier);
-    m.insert("gpt-4-32k", ModelTier::Frontier);
-    m.insert("gpt-4-0125-preview", ModelTier::Frontier);
-    m.insert("gpt-4-1106-preview", ModelTier::Frontier);
-    m.insert("claude-3-5-sonnet", ModelTier::Mid); // Sonnet is mid-tier
-    m.insert("claude-3-5-sonnet-20241022", ModelTier::Mid);
-    m.insert("claude-3-5-sonnet-20240620", ModelTier::Mid);
-    m.insert("claude-3-opus", ModelTier::Frontier);
-    m.insert("claude-3-opus-20240229", ModelTier::Frontier);
-    m.insert("claude-3-haiku", ModelTier::Small);
-    m.insert("claude-3-haiku-20240307", ModelTier::Small);
-    m.insert("gemini-1.5-pro", ModelTier::Frontier);
-    m.insert("gemini-1.5-flash", ModelTier::Mid);
-    m.insert("gemini-1.0-pro", ModelTier::Mid);
-    m.insert("gemini-1.0-ultra", ModelTier::Frontier);
-
-    // Mid tier
-    m.insert("gpt-3.5-turbo", ModelTier::Mid);
-    m.insert("gpt-3.5-turbo-0125", ModelTier::Mid);
-    m.insert("gpt-3.5-turbo-1106", ModelTier::Mid);
-    m.insert("gpt-3.5-turbo-16k", ModelTier::Mid);
-
-    // OpenRouter / community models - Mid tier
-    m.insert("mistral-large", ModelTier::Mid);
-    m.insert("mistral-large-2407", ModelTier::Mid);
-    m.insert("mistral-large-2411", ModelTier::Mid);
-    m.insert("mistral-medium", ModelTier::Mid);
-    m.insert("command-r-plus", ModelTier::Mid);
-    m.insert("command-r", ModelTier::Mid);
-    m.insert("command-r-08-2024", ModelTier::Mid);
-    m.insert("command-r-plus-08-2024", ModelTier::Mid);
-    m.insert("qwen-2.5-72b", ModelTier::Mid);
-    m.insert("qwen2.5-72b-instruct", ModelTier::Mid);
-    m.insert("qwen2-72b-instruct", ModelTier::Mid);
-    m.insert("llama-3.1-70b", ModelTier::Mid);
-    m.insert("llama-3.1-70b-instruct", ModelTier::Mid);
-    m.insert("llama-3-70b", ModelTier::Mid);
-    m.insert("llama-3-70b-instruct", ModelTier::Mid);
-    m.insert("nemotron-3-ultra", ModelTier::Mid);
-    m.insert("nemotron-4-340b", ModelTier::Mid);
-    m.insert("deepseek-v2.5", ModelTier::Mid);
-    m.insert("deepseek-coder-v2", ModelTier::Mid);
-
-    // Small tier - local/small models
-    m.insert("gpt-4o-mini", ModelTier::Small);
-    m.insert("gpt-4o-mini-2024-07-18", ModelTier::Small);
-    m.insert("gpt-3.5-turbo-instruct", ModelTier::Small);
-    m.insert("claude-3-haiku", ModelTier::Small);
-    m.insert("gemini-1.5-flash-8b", ModelTier::Small);
-    m.insert("gemini-flash-1.5-8b", ModelTier::Small);
-    m.insert("mistral-7b", ModelTier::Small);
-    m.insert("mistral-7b-instruct", ModelTier::Small);
-    m.insert("mistral-nemo", ModelTier::Small);
-    m.insert("mistral-nemo-2407", ModelTier::Small);
-    m.insert("llama-3.1-8b", ModelTier::Small);
-    m.insert("llama-3.1-8b-instruct", ModelTier::Small);
-    m.insert("llama-3-8b", ModelTier::Small);
-    m.insert("llama-3-8b-instruct", ModelTier::Small);
-    m.insert("llama-3.2-1b", ModelTier::Small);
-    m.insert("llama-3.2-1b-instruct", ModelTier::Small);
-    m.insert("llama-3.2-3b", ModelTier::Small);
-    m.insert("llama-3.2-3b-instruct", ModelTier::Small);
-    m.insert("gemma-2b", ModelTier::Small);
-    m.insert("gemma-2b-it", ModelTier::Small);
-    m.insert("gemma-7b", ModelTier::Small);
-    m.insert("gemma-7b-it", ModelTier::Small);
-    m.insert("gemma-2-2b", ModelTier::Small);
-    m.insert("gemma-2-2b-it", ModelTier::Small);
-    m.insert("gemma-2-9b", ModelTier::Small);
-    m.insert("gemma-2-9b-it", ModelTier::Small);
-    m.insert("gemma-2-27b", ModelTier::Mid); // 27B is mid-tier
-    m.insert("gemma-2-27b-it", ModelTier::Mid);
-    m.insert("phi-3-mini", ModelTier::Small);
-    m.insert("phi-3.5-mini", ModelTier::Small);
-    m.insert("phi-4", ModelTier::Small);
-    m.insert("qwen-2.5-7b", ModelTier::Small);
-    m.insert("qwen-2.5-14b", ModelTier::Small);
-    m.insert("qwen-2.5-32b", ModelTier::Mid); // 32B is mid-tier
-    m.insert("qwen2.5-7b-instruct", ModelTier::Small);
-    m.insert("qwen2.5-14b-instruct", ModelTier::Small);
-    m.insert("qwen2.5-32b-instruct", ModelTier::Mid);
-    m.insert("qwen2-7b-instruct", ModelTier::Small);
-    m.insert("qwen2-14b-instruct", ModelTier::Small);
-    m.insert("qwen2-32b-instruct", ModelTier::Mid);
-    m.insert("deepseek-coder-6.7b", ModelTier::Small);
-    m.insert("deepseek-coder-33b", ModelTier::Mid);
-    m.insert("starcoder2-15b", ModelTier::Small);
-    m.insert("codellama-7b", ModelTier::Small);
-    m.insert("codellama-13b", ModelTier::Small);
-    m.insert("codellama-34b", ModelTier::Mid);
-    m.insert("north/mini-code", ModelTier::Small);
-    m.insert("north/mini-code-7b", ModelTier::Small);
-    // Normalized versions (without provider prefix)
-    m.insert("mini-code", ModelTier::Small);
-    m.insert("mini-code-7b", ModelTier::Small);
-
-    m
-});
 
 /// Regex patterns for parameter count detection (e.g., "7b", "70B", "3.5b").
 static PARAM_REGEX: Lazy<Regex> =
@@ -155,36 +45,22 @@ const PROVIDER_PREFIXES: &[&str] = &[
 ];
 
 /// Classify a model by name into a tier.
+///
+/// The model catalog (bundled + models.dev cache) is authoritative; the rest
+/// are name heuristics for models no catalog knows (local, fine-tunes, new releases).
 pub fn classify_model(name: &str) -> ModelClassification {
-    let normalized = normalize_model_name(name);
-
-    // 1. Exact match in known models database
-    if let Some(&tier) = KNOWN_MODELS.get(normalized.as_str()) {
+    // 1. Catalog: tier derived from capabilities (context, tools, price)
+    if let Some(entry) = crate::model::catalog::lookup(name) {
         return ModelClassification {
-            tier,
-            confidence: 1.0,
-            reason: format!("Exact match in known models database: {}", normalized),
+            tier: entry.tier(),
+            confidence: 0.95,
+            reason: format!("Catalog match: {}", entry.id),
             detected_params: None,
-            detected_context: None,
+            detected_context: Some(entry.context),
         };
     }
 
-    // 2. Fuzzy match: check if normalized name contains a known model as a distinct component
-    // Sort by length descending to match longer names first
-    let mut known_entries: Vec<_> = KNOWN_MODELS.iter().collect();
-    known_entries.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
-
-    for (known_name, &tier) in known_entries {
-        if is_distinct_match(&normalized, known_name) {
-            return ModelClassification {
-                tier,
-                confidence: 0.85,
-                reason: format!("Fuzzy match with known model: {}", known_name),
-                detected_params: None,
-                detected_context: None,
-            };
-        }
-    }
+    let normalized = normalize_model_name(name);
 
     // 3. Parameter-based classification
     if let Some(params) = extract_params(&normalized) {
@@ -229,32 +105,6 @@ pub fn classify_model(name: &str) -> ModelClassification {
         detected_params: None,
         detected_context: None,
     }
-}
-
-/// Check if a known model name matches as a distinct component in the normalized name.
-/// This avoids false matches like "gpt-4" matching inside "gpt-4o-mini".
-fn is_distinct_match(normalized: &str, known: &str) -> bool {
-    if !normalized.contains(known) {
-        return false;
-    }
-
-    // Check if the match is at word boundaries (separated by -, _, or string boundaries)
-    let mut search_start = 0;
-    while let Some(pos) = normalized[search_start..].find(known) {
-        let actual_pos = search_start + pos;
-        let before_ok =
-            actual_pos == 0 || matches!(normalized.as_bytes()[actual_pos - 1], b'-' | b'_' | b'.');
-        let after_pos = actual_pos + known.len();
-        let after_ok = after_pos >= normalized.len()
-            || matches!(normalized.as_bytes()[after_pos], b'-' | b'_' | b'.');
-
-        if before_ok && after_ok {
-            return true;
-        }
-        search_start = actual_pos + 1;
-    }
-
-    false
 }
 
 /// Normalize model name for matching.
@@ -533,58 +383,23 @@ mod tests {
     use crate::model::ModelTier;
 
     #[test]
-    fn test_known_frontier_models() {
+    fn test_catalog_models_use_catalog_tier() {
         let result = classify_model("gpt-4o");
         assert_eq!(result.tier, ModelTier::Frontier);
-        assert_eq!(result.confidence, 1.0);
+        assert_eq!(result.confidence, 0.95);
+        assert_eq!(result.detected_context, Some(128_000));
 
-        let result = classify_model("claude-3-opus");
-        assert_eq!(result.tier, ModelTier::Frontier);
-
-        let result = classify_model("gemini-1.5-pro");
-        assert_eq!(result.tier, ModelTier::Frontier);
+        let result = classify_model("openai/gpt-4o-mini");
+        assert_eq!(result.tier, ModelTier::Small);
     }
 
     #[test]
-    fn test_known_mid_models() {
-        let result = classify_model("claude-3-5-sonnet");
-        assert_eq!(result.tier, ModelTier::Mid);
-
-        let result = classify_model("gpt-3.5-turbo");
-        assert_eq!(result.tier, ModelTier::Mid);
-
-        let result = classify_model("mistral-large");
-        assert_eq!(result.tier, ModelTier::Mid);
-
-        let result = classify_model("llama-3.1-70b");
-        assert_eq!(result.tier, ModelTier::Mid);
-
-        let result = classify_model("qwen-2.5-72b");
-        assert_eq!(result.tier, ModelTier::Mid);
-    }
-
-    #[test]
-    fn test_known_small_models() {
-        let result = classify_model("gpt-4o-mini");
-        assert_eq!(result.tier, ModelTier::Small);
-
-        let result = classify_model("claude-3-haiku");
-        assert_eq!(result.tier, ModelTier::Small);
-
-        let result = classify_model("llama-3.1-8b");
-        assert_eq!(result.tier, ModelTier::Small);
-
-        let result = classify_model("gemma-2-9b");
-        assert_eq!(result.tier, ModelTier::Small);
-
-        let result = classify_model("phi-4");
-        assert_eq!(result.tier, ModelTier::Small);
-
-        let result = classify_model("mistral-7b");
-        assert_eq!(result.tier, ModelTier::Small);
-
-        let result = classify_model("north/mini-code");
-        assert_eq!(result.tier, ModelTier::Small);
+    fn test_heuristics_for_uncataloged_models() {
+        assert_eq!(classify_model("claude-3-opus").tier, ModelTier::Frontier);
+        assert_eq!(classify_model("llama-3.1-70b").tier, ModelTier::Mid);
+        assert_eq!(classify_model("llama-3.1-8b").tier, ModelTier::Small);
+        assert_eq!(classify_model("gemma-2-9b").tier, ModelTier::Small);
+        assert_eq!(classify_model("mistral-7b").tier, ModelTier::Small);
     }
 
     #[test]
@@ -620,12 +435,6 @@ mod tests {
     fn test_provider_prefix_stripping() {
         let result = classify_model("openrouter/meta-llama/llama-3.1-70b-instruct");
         assert_eq!(result.tier, ModelTier::Mid);
-
-        let result = classify_model("anthropic/claude-3-5-sonnet");
-        assert_eq!(result.tier, ModelTier::Mid);
-
-        let result = classify_model("north/mini-code");
-        assert_eq!(result.tier, ModelTier::Small);
     }
 
     #[test]

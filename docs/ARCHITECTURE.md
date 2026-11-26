@@ -240,6 +240,11 @@ okeanos/
 │   │   ├── mod.rs
 │   │   ├── trait.rs       # Model trait, ModelCapabilities, Tier
 │   │   ├── openai.rs      # OpenAI-compatible/OpenRouter provider
+│   │   ├── openai_native.rs     # OpenAI Chat Completions (native)
+│   │   ├── openai_responses.rs  # OpenAI Responses API (stateless, encrypted reasoning replay)
+│   │   ├── anthropic.rs / google.rs  # Messages / Generative AI adapters
+│   │   ├── registry.rs    # ProviderKind/WireApi; the only place config becomes a model
+│   │   ├── catalog.rs     # models.dev-derived catalog: bundled assets/models.json + 24h user cache (context, output, vision, reasoning, price; tier derived from capabilities)
 │   │   ├── metadata.rs    # per-model context window + cost table + tier defaults
 │   │   ├── text_tool.rs   # lenient text-based tool call parsing for non-native FC models
 │   │   └── mock.rs        # MockModel (test-only, cfg(test) or test feature)

@@ -16,8 +16,8 @@ use okeanos::events::{Approval, ApprovalDecision, Event, Log, LogLevel};
 use okeanos::harness::{ReactConfig, ReactLoop, policy::Policy};
 use okeanos::headless::{EventEmitter, HeadlessConfig};
 use okeanos::model::{
-    AnthropicModel, GenerationParams, GoogleModel, MockModel, Model, ModelCapabilities, ModelError,
-    ModelMessage, ModelResponse, ModelStreamChunk, OpenAIModel, OpenRouterModel,
+    GenerationParams, MockModel, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse,
+    ModelStreamChunk,
 };
 use okeanos::session::{SessionManager, replay_events};
 use okeanos::snapshot::store::SnapshotStore;
@@ -77,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Sessions) => {
             return cmd_sessions(&cli).await;
         }
+        Some(Command::Models { action }) => {
+            return cmd_models(action).await;
+        }
         Some(Command::Run { prompt }) => run_with_prompt(&cli, prompt.clone()).await,
         None => {
             // No subcommand provided, treat first positional as prompt
@@ -94,10 +97,7 @@ async fn main() -> anyhow::Result<()> {
 // `M: Sized`, so we cannot use `dyn Model` directly.
 enum ActiveModel {
     Mock(MockModel),
-    OpenRouter(OpenRouterModel),
-    OpenAI(OpenAIModel),
-    Anthropic(AnthropicModel),
-    Google(GoogleModel),
+    Provider(Arc<dyn Model + Send + Sync>),
 }
 
 #[async_trait::async_trait]
@@ -105,20 +105,14 @@ impl Model for ActiveModel {
     fn capabilities(&self) -> &ModelCapabilities {
         match self {
             ActiveModel::Mock(m) => m.capabilities(),
-            ActiveModel::OpenRouter(m) => m.capabilities(),
-            ActiveModel::OpenAI(m) => m.capabilities(),
-            ActiveModel::Anthropic(m) => m.capabilities(),
-            ActiveModel::Google(m) => m.capabilities(),
+            ActiveModel::Provider(m) => m.capabilities(),
         }
     }
 
     fn model_id(&self) -> &str {
         match self {
             ActiveModel::Mock(m) => m.model_id(),
-            ActiveModel::OpenRouter(m) => m.model_id(),
-            ActiveModel::OpenAI(m) => m.model_id(),
-            ActiveModel::Anthropic(m) => m.model_id(),
-            ActiveModel::Google(m) => m.model_id(),
+            ActiveModel::Provider(m) => m.model_id(),
         }
     }
 
@@ -130,10 +124,7 @@ impl Model for ActiveModel {
     ) -> Result<ModelResponse, ModelError> {
         match self {
             ActiveModel::Mock(m) => m.complete(messages, params, tools).await,
-            ActiveModel::OpenRouter(m) => m.complete(messages, params, tools).await,
-            ActiveModel::OpenAI(m) => m.complete(messages, params, tools).await,
-            ActiveModel::Anthropic(m) => m.complete(messages, params, tools).await,
-            ActiveModel::Google(m) => m.complete(messages, params, tools).await,
+            ActiveModel::Provider(m) => m.complete(messages, params, tools).await,
         }
     }
 
@@ -148,20 +139,14 @@ impl Model for ActiveModel {
     > {
         match self {
             ActiveModel::Mock(m) => m.stream(messages, params, tools).await,
-            ActiveModel::OpenRouter(m) => m.stream(messages, params, tools).await,
-            ActiveModel::OpenAI(m) => m.stream(messages, params, tools).await,
-            ActiveModel::Anthropic(m) => m.stream(messages, params, tools).await,
-            ActiveModel::Google(m) => m.stream(messages, params, tools).await,
+            ActiveModel::Provider(m) => m.stream(messages, params, tools).await,
         }
     }
 
     fn require_capability(&self, capability: &str) -> Result<(), ModelError> {
         match self {
             ActiveModel::Mock(m) => m.require_capability(capability),
-            ActiveModel::OpenRouter(m) => m.require_capability(capability),
-            ActiveModel::OpenAI(m) => m.require_capability(capability),
-            ActiveModel::Anthropic(m) => m.require_capability(capability),
-            ActiveModel::Google(m) => m.require_capability(capability),
+            ActiveModel::Provider(m) => m.require_capability(capability),
         }
     }
 
@@ -170,8 +155,8 @@ impl Model for ActiveModel {
         request: okeanos::context::compaction::NativeCompactionRequest,
     ) -> Result<Option<okeanos::context::compaction::NativeCompactionResponse>, ModelError> {
         match self {
-            ActiveModel::Anthropic(m) => m.compact_native(request).await,
-            _ => Ok(None),
+            ActiveModel::Mock(_) => Ok(None),
+            ActiveModel::Provider(m) => m.compact_native(request).await,
         }
     }
 }
@@ -186,35 +171,12 @@ fn build_summarizer(config: &Config) -> Option<Arc<dyn Model>> {
     build_named_model(config, &name)
 }
 
-/// Build a model by name on the configured provider (used for sub-agent
-/// profiles that pick their own model).
+/// Build a model by name (optionally `provider/model` for a `[providers.*]`
+/// entry), used for sub-agent profiles and the summarizer.
 fn build_named_model(config: &Config, name: &str) -> Option<Arc<dyn Model>> {
-    let provider = config.provider.as_ref()?;
-    let api_key = provider.api_key.as_deref().filter(|k| !k.is_empty())?;
-    let kind = provider.kind.as_deref().unwrap_or("openai-compatible");
-    let base_url = provider.base_url.as_deref().unwrap_or(match kind {
-        "anthropic" => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
-        "openai" => okeanos::model::OPENAI_DEFAULT_BASE_URL,
-        "google" => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
-        _ => okeanos::model::DEFAULT_BASE_URL,
-    });
-    let client = reqwest::Client::new();
     let caps = config.to_model_capabilities(None);
-    let model = match kind {
-        "anthropic" => ActiveModel::Anthropic(AnthropicModel::new(
-            client, base_url, api_key, name, caps, None,
-        )),
-        "openai" => ActiveModel::OpenAI(OpenAIModel::new(
-            client, base_url, api_key, name, caps, None,
-        )),
-        "google" => ActiveModel::Google(GoogleModel::new(
-            client, base_url, api_key, name, caps, None,
-        )),
-        _ => ActiveModel::OpenRouter(OpenRouterModel::new(
-            client, base_url, api_key, name, caps, None,
-        )),
-    };
-    Some(Arc::new(model))
+    let model = okeanos::model::registry::build_from_config(config, name, &caps)?;
+    Some(Arc::new(ActiveModel::Provider(model)))
 }
 
 async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
@@ -227,6 +189,14 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
         .validate()
         .context("configuration validation failed")?;
     tracing::info!("configuration loaded");
+    let refresh = config
+        .model
+        .as_ref()
+        .and_then(|m| m.catalog_refresh)
+        .unwrap_or(true);
+    if refresh && std::env::var_os("OKEANOS_OFFLINE").is_none() {
+        okeanos::model::catalog::spawn_background_refresh();
+    }
     okeanos::tool::workspace::set_protect_secrets(
         config
             .permissions
@@ -833,66 +803,7 @@ async fn run_interactive_tui(
         .unwrap_or(model_capabilities.max_context)
         .max(1);
 
-    // Create model: real provider when an API key is configured,
-    // otherwise fall back to the mock model for testing.
-    let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
-        && let Some(api_key) = &provider.api_key
-        && !api_key.is_empty()
-    {
-        let base_url = provider
-            .base_url
-            .as_deref()
-            .unwrap_or(match provider.kind.as_deref() {
-                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
-                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
-                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
-                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
-            });
-        let client = reqwest::Client::new();
-        let pricing = None; // Pricing would come from discovery
-        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
-        match provider_kind {
-            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-        }
-    } else {
-        let m = MockModel::new(model_capabilities.clone(), model_name.clone());
-        // For mock model in interactive mode, provide a simple completion response
-        m.push_response(okeanos::model::mock::MockModel::text_response(
-            "Task complete. I've finished the requested work.",
-        ));
-        Arc::new(ActiveModel::Mock(m))
-    };
+    let model = build_active_model(config, &model_name, &model_capabilities);
 
     // Check provider configuration status for welcome screen
     let provider_configured = config
@@ -941,31 +852,7 @@ async fn run_interactive_tui(
     let mut conversation =
         Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
-    // Restore conversation messages if resuming
-    for msg in restored_messages {
-        match msg.role {
-            okeanos::events::MessageRole::User => {
-                if let Err(e) = conversation.add_user_message(msg.content) {
-                    eprintln!("[WARN] Failed to restore user message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Assistant => {
-                if let Err(e) =
-                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
-                {
-                    eprintln!("[WARN] Failed to restore assistant message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Tool => {
-                if let Some(tool_call_id) = msg.tool_call_id
-                    && let Err(e) = conversation.add_tool_message(msg.content, tool_call_id)
-                {
-                    eprintln!("[WARN] Failed to restore tool message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::System => {}
-        }
-    }
+    restore_messages(&mut conversation, restored_messages);
 
     // Create tool registry with tier-appropriate tools (using restored todo list)
     let todo_list = restored_todos;
@@ -1088,6 +975,7 @@ async fn run_interactive_tui(
             tool_call_id: None,
             ts: current_timestamp(),
             thinking: None,
+            extras: Default::default(),
         };
         let _ = loop_
             .event_tx()
@@ -1294,6 +1182,7 @@ async fn run_tui_and_loop(
                 tool_call_id: None,
                 ts: current_timestamp(),
                 thinking: None,
+                extras: Default::default(),
             };
             let _ = loop_
                 .event_tx()
@@ -1523,65 +1412,7 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         .unwrap_or(model_capabilities.max_context)
         .max(1); // Ensure at least 1
 
-    // Create model: real provider when an API key is configured,
-    // otherwise fall back to the mock model for testing.
-    let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
-        && let Some(api_key) = &provider.api_key
-        && !api_key.is_empty()
-    {
-        let base_url = provider
-            .base_url
-            .as_deref()
-            .unwrap_or(match provider.kind.as_deref() {
-                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
-                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
-                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
-                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
-            });
-        let client = reqwest::Client::new();
-        let pricing = None; // Pricing would come from discovery
-        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
-        match provider_kind {
-            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-        }
-    } else {
-        let m = MockModel::new(model_capabilities.clone(), model_name.clone());
-        m.push_response(okeanos::model::mock::MockModel::text_response(
-            "Task complete. I've finished the requested work.",
-        ));
-        Arc::new(ActiveModel::Mock(m))
-    };
+    let model = build_active_model(config, &model_name, &model_capabilities);
 
     // Build conversation with system prompt and context cap
     let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
@@ -1625,33 +1456,7 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     let mut conversation =
         Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
-    // Restore conversation messages if resuming
-    for msg in restored_messages {
-        match msg.role {
-            okeanos::events::MessageRole::User => {
-                if let Err(e) = conversation.add_user_message(msg.content) {
-                    eprintln!("[WARN] Failed to restore user message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Assistant => {
-                if let Err(e) =
-                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
-                {
-                    eprintln!("[WARN] Failed to restore assistant message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Tool => {
-                if let Some(tool_call_id) = msg.tool_call_id
-                    && let Err(e) = conversation.add_tool_message(msg.content, tool_call_id)
-                {
-                    eprintln!("[WARN] Failed to restore tool message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::System => {
-                // System messages are handled separately
-            }
-        }
-    }
+    restore_messages(&mut conversation, restored_messages);
 
     // Create tool registry with tier-appropriate tools (using restored todo list)
     let todo_list = restored_todos;
@@ -1871,7 +1676,7 @@ fn apply_cli_overrides(
     okeanos::model::ModelCapabilities,
     okeanos::model::GenerationParams,
 ) {
-    use okeanos::model::{default_capabilities_for_tier, default_generation_params};
+    use okeanos::model::default_generation_params;
 
     // Start with config values
     let mut model_name = config
@@ -1887,16 +1692,20 @@ fn apply_cli_overrides(
     // Apply CLI overrides
     if let Some(ref m) = cli.model {
         model_name = m.clone();
-        // Re-classify capabilities for the new model name
-        if config
-            .model
-            .as_ref()
-            .is_none_or(|m| m.capabilities.is_none())
-        {
-            // Only auto-classify if no explicit capabilities were provided
-            let classification = okeanos::model::classify_model(m);
-            model_capabilities = default_capabilities_for_tier(classification.tier);
-        }
+        // Re-derive capabilities for the new name; explicit config overrides still apply.
+        let mut overridden = config.clone();
+        overridden.model.get_or_insert_with(Default::default).name = Some(m.clone());
+        model_capabilities = overridden.to_model_capabilities(None);
+        generation_params = default_generation_params(model_capabilities.tier);
+    }
+
+    if let Some(level) = config
+        .model
+        .as_ref()
+        .and_then(|m| m.reasoning.as_deref())
+        .and_then(|r| r.parse::<okeanos::model::ReasoningLevel>().ok())
+    {
+        generation_params.reasoning = Some(level);
     }
 
     if cli.provider.is_some() {
@@ -1926,6 +1735,21 @@ fn apply_cli_overrides(
     (model_name, model_capabilities, generation_params)
 }
 
+/// Re-add messages from a resumed session, keeping reasoning blocks and images.
+fn restore_messages(conversation: &mut Conversation, messages: Vec<okeanos::events::Message>) {
+    use okeanos::events::MessageRole;
+    for msg in messages {
+        let keep = match msg.role {
+            MessageRole::System => false,
+            MessageRole::Tool => msg.tool_call_id.is_some(),
+            _ => true,
+        };
+        if keep && let Err(e) = conversation.add_restored_message(msg) {
+            eprintln!("[WARN] Failed to restore message: {e}");
+        }
+    }
+}
+
 /// Build the active model: a real provider when an API key is configured,
 /// otherwise the mock model.
 fn build_active_model(
@@ -1933,46 +1757,22 @@ fn build_active_model(
     model_name: &str,
     caps: &ModelCapabilities,
 ) -> Arc<ActiveModel> {
-    if let Some(provider) = &config.provider
-        && let Some(api_key) = &provider.api_key
-        && !api_key.is_empty()
-    {
-        let base_url = provider
-            .base_url
-            .as_deref()
-            .unwrap_or(match provider.kind.as_deref() {
-                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
-                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
-                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
-                _ => okeanos::model::DEFAULT_BASE_URL,
-            });
-        let client = reqwest::Client::new();
-        let caps = caps.clone();
-        return match provider.kind.as_deref().unwrap_or("openai-compatible") {
-            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
-                client, base_url, api_key, model_name, caps, None,
-            ))),
-            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
-                client, base_url, api_key, model_name, caps, None,
-            ))),
-            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
-                client, base_url, api_key, model_name, caps, None,
-            ))),
-            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-                client, base_url, api_key, model_name, caps, None,
-            ))),
-        };
+    match okeanos::model::registry::build_from_config(config, model_name, caps) {
+        Some(model) => Arc::new(ActiveModel::Provider(model)),
+        None => {
+            let m = MockModel::new(caps.clone(), model_name.to_string());
+            m.push_response(okeanos::model::mock::MockModel::text_response(
+                "Task complete. I've finished the requested work.",
+            ));
+            Arc::new(ActiveModel::Mock(m))
+        }
     }
-    let m = MockModel::new(caps.clone(), model_name.to_string());
-    m.push_response(okeanos::model::mock::MockModel::text_response(
-        "Task complete. I've finished the requested work.",
-    ));
-    Arc::new(ActiveModel::Mock(m))
 }
 
 struct AcpPrompt {
     id: serde_json::Value,
     text: String,
+    images: Vec<okeanos::model::ImagePart>,
 }
 
 struct AcpSession {
@@ -2197,7 +1997,7 @@ async fn acp_new_session(
             *cancel_task.lock().unwrap() = Some(stop_tx);
 
             let result = {
-                let turn = loop_.run_turn(job.text, stop_rx);
+                let turn = loop_.run_turn_with_images(job.text, job.images, stop_rx);
                 tokio::pin!(turn);
                 loop {
                     tokio::select! {
@@ -2308,12 +2108,14 @@ async fn run_acp(cli: &Cli, config: &Config) -> anyhow::Result<()> {
                 id,
                 session_id,
                 text,
+                images,
             } => match sessions.get(&session_id) {
                 Some(s) => {
                     if s.prompt_tx
                         .try_send(AcpPrompt {
                             id: id.clone(),
                             text,
+                            images,
                         })
                         .is_err()
                     {
@@ -2373,6 +2175,46 @@ fn build_policy(config: &Config, cli: &Cli, allow_list: Vec<String>) -> Policy {
 }
 
 /// `okeanos trust [--revoke]`.
+async fn cmd_models(action: &okeanos::cli::ModelsAction) -> anyhow::Result<()> {
+    use okeanos::cli::ModelsAction;
+    use okeanos::model::catalog;
+    match action {
+        ModelsAction::Update { out } => {
+            let entries = catalog::fetch()
+                .await
+                .context("failed to fetch models.dev")?;
+            let path = match out {
+                Some(p) => p.clone(),
+                None => catalog::cache_path().context("no cache directory available")?,
+            };
+            catalog::write_entries(&path, &entries)?;
+            println!("Wrote {} models to {}", entries.len(), path.display());
+        }
+        ModelsAction::Show { name } => {
+            let c = okeanos::model::classify_model(name);
+            println!(
+                "tier: {:?} (confidence {:.2}) - {}",
+                c.tier, c.confidence, c.reason
+            );
+            match catalog::lookup(name) {
+                Some(e) => println!(
+                    "catalog: {} context={} max_output={} tools={} vision={} reasoning={} price=${}/{} per M",
+                    e.id,
+                    e.context,
+                    e.max_output,
+                    e.tool_calling,
+                    e.vision,
+                    e.reasoning,
+                    e.input_per_million,
+                    e.output_per_million
+                ),
+                None => println!("catalog: not found (using name heuristics)"),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_trust(cli: &Cli, revoke: bool) -> anyhow::Result<()> {
     use okeanos::config::trust;
     let dir = trust::project_dir(cli.root.as_deref());
@@ -2759,64 +2601,7 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
         .unwrap_or(model_capabilities.max_context)
         .max(1);
 
-    // Create model
-    let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
-        && let Some(api_key) = &provider.api_key
-        && !api_key.is_empty()
-    {
-        let base_url = provider
-            .base_url
-            .as_deref()
-            .unwrap_or(match provider.kind.as_deref() {
-                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
-                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
-                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
-                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
-            });
-        let client = reqwest::Client::new();
-        let pricing = None;
-        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
-        match provider_kind {
-            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-        }
-    } else {
-        let m = MockModel::new(model_capabilities.clone(), model_name.clone());
-        m.push_response(okeanos::model::mock::MockModel::text_response(
-            "Task complete. I've finished the requested work.",
-        ));
-        Arc::new(ActiveModel::Mock(m))
-    };
+    let model = build_active_model(config, &model_name, &model_capabilities);
 
     // Build conversation with system prompt and context cap
     let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
@@ -2858,31 +2643,7 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     let mut conversation =
         Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
-    // Restore conversation messages if resuming
-    for msg in restored_messages {
-        match msg.role {
-            okeanos::events::MessageRole::User => {
-                if let Err(e) = conversation.add_user_message(msg.content) {
-                    eprintln!("[WARN] Failed to restore user message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Assistant => {
-                if let Err(e) =
-                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
-                {
-                    eprintln!("[WARN] Failed to restore assistant message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Tool => {
-                if let Some(tool_call_id) = msg.tool_call_id
-                    && let Err(e) = conversation.add_tool_message(msg.content, tool_call_id)
-                {
-                    eprintln!("[WARN] Failed to restore tool message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::System => {}
-        }
-    }
+    restore_messages(&mut conversation, restored_messages);
 
     // Create tool registry with tier-appropriate tools
     let todo_list = restored_todos;
@@ -3318,64 +3079,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
         .unwrap_or(model_capabilities.max_context)
         .max(1);
 
-    // Create model
-    let model: Arc<ActiveModel> = if let Some(provider) = &config.provider
-        && let Some(api_key) = &provider.api_key
-        && !api_key.is_empty()
-    {
-        let base_url = provider
-            .base_url
-            .as_deref()
-            .unwrap_or(match provider.kind.as_deref() {
-                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
-                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
-                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
-                _ => okeanos::model::DEFAULT_BASE_URL, // openai-compatible
-            });
-        let client = reqwest::Client::new();
-        let pricing = None;
-        let provider_kind = provider.kind.as_deref().unwrap_or("openai-compatible");
-        match provider_kind {
-            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
-                client,
-                base_url,
-                api_key,
-                &model_name,
-                model_capabilities.clone(),
-                pricing,
-            ))),
-        }
-    } else {
-        let m = MockModel::new(model_capabilities.clone(), model_name.clone());
-        m.push_response(okeanos::model::mock::MockModel::text_response(
-            "Task complete. I've finished the requested work.",
-        ));
-        Arc::new(ActiveModel::Mock(m))
-    };
+    let model = build_active_model(config, &model_name, &model_capabilities);
 
     // Build conversation with system prompt and context cap
     let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
@@ -3417,31 +3121,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     let mut conversation =
         Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
 
-    // Restore conversation messages if resuming
-    for msg in restored_messages {
-        match msg.role {
-            okeanos::events::MessageRole::User => {
-                if let Err(e) = conversation.add_user_message(msg.content) {
-                    eprintln!("[WARN] Failed to restore user message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Assistant => {
-                if let Err(e) =
-                    conversation.add_assistant_message(msg.content, msg.tool_calls, msg.thinking)
-                {
-                    eprintln!("[WARN] Failed to restore assistant message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::Tool => {
-                if let Some(tool_call_id) = msg.tool_call_id
-                    && let Err(e) = conversation.add_tool_message(msg.content, tool_call_id)
-                {
-                    eprintln!("[WARN] Failed to restore tool message: {e}");
-                }
-            }
-            okeanos::events::MessageRole::System => {}
-        }
-    }
+    restore_messages(&mut conversation, restored_messages);
 
     // Create tool registry with tier-appropriate tools
     let todo_list = restored_todos;

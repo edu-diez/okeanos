@@ -74,10 +74,134 @@ pub struct GenerationParams {
     pub max_tokens: Option<usize>,
     pub stop_sequences: Option<Vec<String>>,
     pub top_p: Option<f64>,
+    /// Provider-neutral reasoning effort; adapters map it to their native knob.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningLevel>,
+    /// Tool selection constraint (default: provider "auto").
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
+}
+
+/// Provider-neutral reasoning effort.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningLevel {
+    /// OpenAI-style `reasoning_effort` value; `None` when reasoning is off.
+    pub fn effort(self) -> Option<&'static str> {
+        match self {
+            ReasoningLevel::Off => None,
+            ReasoningLevel::Low => Some("low"),
+            ReasoningLevel::Medium => Some("medium"),
+            ReasoningLevel::High => Some("high"),
+        }
+    }
+
+    /// Token budget for budget-based providers (Anthropic, Gemini 2.5).
+    pub fn budget_tokens(self) -> Option<usize> {
+        match self {
+            ReasoningLevel::Off => None,
+            ReasoningLevel::Low => Some(2_048),
+            ReasoningLevel::Medium => Some(8_192),
+            ReasoningLevel::High => Some(24_576),
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningLevel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "off" | "none" => Ok(ReasoningLevel::Off),
+            "low" => Ok(ReasoningLevel::Low),
+            "medium" | "med" => Ok(ReasoningLevel::Medium),
+            "high" => Ok(ReasoningLevel::High),
+            _ => Err(format!("invalid reasoning level: {s}")),
+        }
+    }
+}
+
+/// Constraint on which tool the model may call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    None,
+    Tool(String),
+}
+
+/// A provider reasoning block that must round-trip verbatim (signatures,
+/// encrypted content). Only replayed to the provider that produced it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReasoningBlock {
+    /// Producing provider kind: "anthropic", "openai", "google", ...
+    pub provider: String,
+    /// Readable text/summary (may be empty).
+    #[serde(default)]
+    pub text: String,
+    /// Anthropic signature, Gemini thoughtSignature, or OpenAI encrypted content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Anthropic `redacted_thinking`: `signature` then holds the opaque data.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
+    /// Provider item id (OpenAI Responses reasoning item).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// Base64-encoded image attached to a message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImagePart {
+    pub media_type: String,
+    pub data: String,
+}
+
+impl ImagePart {
+    /// `data:` URL form used by OpenAI-style APIs.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
+
+/// OpenAI reasoning families (o-series, gpt-5): they reject `temperature`/`top_p`
+/// and `max_tokens`, and accept `reasoning_effort`.
+pub fn is_openai_reasoning_model(model_id: &str) -> bool {
+    let id = model_id.rsplit('/').next().unwrap_or(model_id);
+    id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") || id.starts_with("gpt-5")
+}
+
+/// Rich message parts beyond plain text, kept out of the common literal shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MessageExtras {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<ReasoningBlock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
+    /// Tool result reported a failure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
+}
+
+impl MessageExtras {
+    pub fn is_empty(&self) -> bool {
+        self.reasoning.is_empty() && self.images.is_empty() && !self.is_error
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A single message in the conversation for the model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,
@@ -86,31 +210,47 @@ pub struct ModelMessage {
     /// Optional thinking/reasoning content (replayed for frontier models).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "MessageExtras::is_empty")]
+    pub extras: MessageExtras,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelRole {
     System,
+    #[default]
     User,
     Assistant,
     Tool,
 }
 
 /// Response from a model completion request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ModelResponse {
     pub content: String,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub thinking: Option<String>,
     pub usage: Option<Usage>,
+    /// Provider reasoning blocks to round-trip on the next request.
+    #[serde(default)]
+    pub reasoning: Vec<ReasoningBlock>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Usage {
+    /// Total prompt tokens, including cached ones.
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// Prompt tokens served from the provider cache (subset of `prompt_tokens`).
+    #[serde(default)]
+    pub cache_read_tokens: usize,
+    /// Prompt tokens written to the provider cache (subset of `prompt_tokens`).
+    #[serde(default)]
+    pub cache_write_tokens: usize,
+    /// Reasoning tokens (subset of `completion_tokens`).
+    #[serde(default)]
+    pub reasoning_tokens: usize,
 }
 
 /// Streaming chunk from a model.
@@ -119,6 +259,9 @@ pub struct ModelStreamChunk {
     pub delta: String,
     pub tool_calls: Option<Vec<ToolCall>>,
     pub thinking: Option<String>,
+    /// Completed provider reasoning blocks (normally on the final chunk).
+    #[serde(default)]
+    pub reasoning: Vec<ReasoningBlock>,
     pub finished: bool,
     /// Provider-reported token usage (normally on the final chunk).
     #[serde(default)]
@@ -325,18 +468,21 @@ pub fn default_generation_params(tier: ModelTier) -> GenerationParams {
             max_tokens: Some(2048),
             stop_sequences: None,
             top_p: Some(0.9),
+            ..Default::default()
         },
         ModelTier::Mid => GenerationParams {
             temperature: Some(0.5),
             max_tokens: Some(4096),
             stop_sequences: None,
             top_p: Some(0.95),
+            ..Default::default()
         },
         ModelTier::Frontier => GenerationParams {
             temperature: Some(0.7),
             max_tokens: Some(8192),
             stop_sequences: None,
             top_p: Some(0.95),
+            ..Default::default()
         },
     }
 }

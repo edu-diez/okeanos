@@ -69,11 +69,34 @@ pub enum Command {
     },
     /// List resumable sessions.
     Sessions,
+    /// Download the models.dev catalog into the cache (or to `--out`, e.g. to
+    /// regenerate the bundled `assets/models.json`).
+    #[command(name = "models")]
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
     /// Generate shell completions.
     #[command(name = "completions")]
     Completions {
         /// Shell to generate completions for.
         shell: Shell,
+    },
+}
+
+/// Models subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ModelsAction {
+    /// Refresh the model catalog from models.dev.
+    Update {
+        /// Write here instead of the user cache.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Show what the catalog and classifier resolve for a model name.
+    Show {
+        #[arg(value_name = "MODEL")]
+        name: String,
     },
 }
 

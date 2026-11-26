@@ -8,9 +8,10 @@
 use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
-    GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
+    GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse,
+    ModelStreamChunk, ToolChoice, Usage, is_context_overflow_message, retry_after_secs,
 };
+use crate::model::openai_native::{OpenAIMessage, OpenAIUsage};
 use crate::tool::builtin::EditFormat;
 use crate::tool::tool_trait::ToolSpec;
 use async_trait::async_trait;
@@ -25,7 +26,7 @@ use std::pin::Pin;
 #[derive(Debug, Clone, Serialize)]
 struct ChatCompletionRequest {
     model: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<OpenAIMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,18 +40,10 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<String>,
-}
-
-/// OpenAI-compatible chat message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+    tool_choice: Option<Value>,
+    /// OpenRouter unified reasoning control: `{"effort": "high"}`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<crate::events::ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    reasoning: Option<Value>,
 }
 
 /// OpenAI-compatible tool definition.
@@ -100,6 +93,11 @@ struct ChatMessageResponse {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCall>>,
+    /// OpenRouter returns reasoning text as `reasoning`; DeepSeek-style as `reasoning_content`.
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// An OpenAI tool call.
@@ -120,13 +118,7 @@ struct OpenAIFunctionCall {
 }
 
 /// Token usage info from OpenAI API.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct UsageInfo {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
-}
+type UsageInfo = OpenAIUsage;
 
 /// OpenAI API error response.
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +170,10 @@ struct ChunkDelta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ChunkToolCall>>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// A tool call in a streaming chunk delta.
@@ -325,18 +321,8 @@ impl OpenRouterModel {
     }
 
     /// Convert a [`ModelMessage`] to an OpenAI chat message.
-    fn to_openai_message(msg: &ModelMessage) -> ChatMessage {
-        ChatMessage {
-            role: match msg.role {
-                ModelRole::System => "system".to_string(),
-                ModelRole::User => "user".to_string(),
-                ModelRole::Assistant => "assistant".to_string(),
-                ModelRole::Tool => "tool".to_string(),
-            },
-            content: msg.content.clone(),
-            tool_calls: msg.tool_calls.clone(),
-            tool_call_id: msg.tool_call_id.clone(),
-        }
+    fn to_openai_message(msg: &ModelMessage) -> OpenAIMessage {
+        crate::model::openai_native::OpenAIModel::to_openai_message(msg)
     }
 
     /// Convert [`ToolSpec`] items to OpenAI tool definitions.
@@ -364,6 +350,11 @@ impl OpenRouterModel {
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
 
+        let thinking = message
+            .as_ref()
+            .and_then(|m| m.reasoning.clone().or_else(|| m.reasoning_content.clone()))
+            .filter(|t| !t.is_empty());
+
         let tool_calls = message.and_then(|m| m.tool_calls).map(|calls| {
             calls
                 .into_iter()
@@ -376,16 +367,13 @@ impl OpenRouterModel {
                 .collect()
         });
 
-        let usage = resp.usage.map(|u| Usage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        });
+        let usage = resp.usage.map(|u| u.to_usage());
 
         ModelResponse {
             content,
             tool_calls,
-            thinking: None,
+            thinking,
+            reasoning: Vec::new(),
             usage,
         }
     }
@@ -409,18 +397,27 @@ impl OpenRouterModel {
         tools: Option<&[ToolSpec]>,
         stream: bool,
     ) -> ChatCompletionRequest {
-        let openai_messages: Vec<ChatMessage> =
+        let openai_messages: Vec<OpenAIMessage> =
             messages.iter().map(Self::to_openai_message).collect();
 
         let openai_tools = tools.map(Self::to_openai_tools);
 
-        let tool_choice = if openai_tools
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-        {
+        let has_tools = openai_tools.as_ref().is_some_and(|t| !t.is_empty());
+        let tool_choice = has_tools.then(|| match &params.tool_choice {
+            Some(ToolChoice::None) => Value::String("none".into()),
+            Some(ToolChoice::Required) => Value::String("required".into()),
+            Some(ToolChoice::Tool(name)) => {
+                serde_json::json!({"type": "function", "function": {"name": name}})
+            }
             // The model must be free to answer in plain text to finish a task.
-            Some("auto".to_string())
+            _ => Value::String("auto".into()),
+        });
+
+        let reasoning = if self.capabilities.thinking {
+            params
+                .reasoning
+                .and_then(|l| l.effort())
+                .map(|effort| serde_json::json!({"effort": effort}))
         } else {
             None
         };
@@ -435,6 +432,7 @@ impl OpenRouterModel {
             stream: Some(stream),
             tools: openai_tools,
             tool_choice,
+            reasoning,
         }
     }
 }
@@ -581,11 +579,7 @@ impl SseStream {
         };
 
         if let Some(u) = chunk.usage {
-            self.usage = Some(Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-            });
+            self.usage = Some(u.to_usage());
         }
 
         let choice = chunk.choices.into_iter().next();
@@ -596,6 +590,10 @@ impl SseStream {
         }
 
         let mut content_delta = String::new();
+        let reasoning_delta = delta
+            .reasoning
+            .or(delta.reasoning_content)
+            .filter(|r| !r.is_empty());
         let mut tool_call_chunks: Vec<ChunkToolCall> = Vec::new();
 
         if let Some(content) = delta.content {
@@ -645,13 +643,14 @@ impl SseStream {
             output_tool_calls = Some(self.flush_tool_calls());
         }
 
-        if content_delta.is_empty() && output_tool_calls.is_none() {
+        if content_delta.is_empty() && output_tool_calls.is_none() && reasoning_delta.is_none() {
             return None; // nothing to emit
         }
 
         Some(Ok(ModelStreamChunk {
             delta: content_delta,
             tool_calls: output_tool_calls,
+            thinking: reasoning_delta,
             ..Default::default()
         }))
     }
@@ -702,17 +701,10 @@ impl Stream for SseStream {
                     .trim_end_matches(['\r', '\n'])
                     .to_string();
 
-                if !line.is_empty() {
-                    if let Some(data) = line.strip_prefix("data: ")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    } else if let Some(data) = line.strip_prefix("data:")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    }
-                    // Skip empty lines, event: lines, etc.
+                if let Some(data) = line.strip_prefix("data:")
+                    && let Some(result) = this.process_data_line(data)
+                {
+                    return std::task::Poll::Ready(Some(result));
                 }
                 continue;
             }
@@ -737,16 +729,10 @@ impl Stream for SseStream {
                             .trim_end_matches(['\r', '\n'])
                             .to_string();
                         this.buffer.clear();
-                        if !line.is_empty() {
-                            if let Some(data) = line.strip_prefix("data: ")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            } else if let Some(data) = line.strip_prefix("data:")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            }
+                        if let Some(data) = line.strip_prefix("data:")
+                            && let Some(result) = this.process_data_line(data)
+                        {
+                            return std::task::Poll::Ready(Some(result));
                         }
                     }
                     // Flush pending tool calls
@@ -764,7 +750,7 @@ pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::model_trait::ModelTier;
+    use crate::model::model_trait::{ModelRole, ModelTier};
 
     fn test_capabilities() -> ModelCapabilities {
         ModelCapabilities {
@@ -885,24 +871,29 @@ mod tests {
                     role: "assistant".to_string(),
                     content: Some("Hello!".to_string()),
                     tool_calls: None,
+                    reasoning: Some("thought".to_string()),
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],
-            usage: Some(UsageInfo {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-            }),
+            usage: Some(
+                serde_json::from_str::<UsageInfo>(
+                    r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}"#,
+                )
+                .unwrap(),
+            ),
         };
         let model_resp = OpenRouterModel::from_openai_response(resp);
         assert_eq!(model_resp.content, "Hello!");
+        assert_eq!(model_resp.thinking.as_deref(), Some("thought"));
         assert_eq!(model_resp.tool_calls, None);
         assert_eq!(
             model_resp.usage,
             Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
-                total_tokens: 15
+                total_tokens: 15,
+                ..Default::default()
             })
         );
     }
@@ -927,6 +918,8 @@ mod tests {
                             arguments: r#"{"action":"add","title":"Test"}"#.to_string(),
                         },
                     }]),
+                    reasoning: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
             }],
@@ -961,6 +954,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         let cost = model.estimate_cost(&usage);
         assert!((cost - 12.50).abs() < 0.001); // 2.50 + 10.00
@@ -981,6 +975,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         assert_eq!(model.estimate_cost(&usage), 0.0);
     }
@@ -999,15 +994,14 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::User,
             content: "Hello".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let params = GenerationParams {
             temperature: Some(0.7),
             max_tokens: Some(100),
             stop_sequences: None,
             top_p: Some(0.95),
+            ..Default::default()
         };
         let request = model.build_request(&messages, &params, None, false);
         assert_eq!(request.model, "gpt-4o");
@@ -1032,9 +1026,7 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::User,
             content: "Hello".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let params = GenerationParams::default();
         let specs = vec![crate::tool::ToolSpec::new(
@@ -1047,7 +1039,36 @@ mod tests {
         let tools = request.tools.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].r#type, "function");
-        assert_eq!(request.tool_choice, Some("auto".to_string()));
+        assert_eq!(request.tool_choice, Some(Value::String("auto".into())));
+    }
+
+    #[test]
+    fn test_reasoning_param_and_stream_reasoning_delta() {
+        let mut caps = test_capabilities();
+        caps.thinking = true;
+        let model = OpenRouterModel::new(
+            reqwest::Client::new(),
+            "https://openrouter.ai/api/v1",
+            "key",
+            "deepseek/deepseek-r1",
+            caps,
+            None,
+        );
+        let params = GenerationParams {
+            reasoning: Some(crate::model::ReasoningLevel::Low),
+            ..Default::default()
+        };
+        let request = model.build_request(&[], &params, None, true);
+        assert_eq!(request.reasoning.unwrap()["effort"], "low");
+
+        let mut sse = SseStream::new(futures::stream::empty());
+        let chunk = sse
+            .process_data_line(
+                r#"{"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning":"hm"}}]}"#,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.thinking.as_deref(), Some("hm"));
     }
 
     #[test]

@@ -8,7 +8,8 @@ use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
+    ModelStreamChunk, ToolChoice, Usage, is_context_overflow_message, is_openai_reasoning_model,
+    retry_after_secs,
 };
 #[cfg(test)]
 use crate::tool::builtin::EditFormat;
@@ -30,6 +31,9 @@ struct OpenAIRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
+    /// Reasoning models reject `max_tokens` in favour of this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,7 +58,7 @@ struct OpenAIStreamOptions {
 
 /// OpenAI chat message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpenAIMessage {
+pub(crate) struct OpenAIMessage {
     role: String,
     content: Value, // Can be string or array of content parts
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,7 +105,7 @@ struct OpenAIToolChoiceFunction {
 
 /// OpenAI tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpenAIToolCall {
+pub(crate) struct OpenAIToolCall {
     id: String,
     r#type: String,
     function: OpenAIFunctionCall,
@@ -109,7 +113,7 @@ struct OpenAIToolCall {
 
 /// OpenAI function call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpenAIFunctionCall {
+pub(crate) struct OpenAIFunctionCall {
     name: String,
     arguments: String,
 }
@@ -148,33 +152,65 @@ struct OpenAIResponseMessage {
     tool_calls: Option<Vec<OpenAIToolCall>>,
     #[serde(default)]
     refusal: Option<String>,
+    /// DeepSeek/vLLM/Together style reasoning text.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
 }
 
 /// OpenAI token usage.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
-struct OpenAIUsage {
-    prompt_tokens: usize,
-    completion_tokens: usize,
-    total_tokens: usize,
+pub(crate) struct OpenAIUsage {
+    #[serde(default)]
+    pub(crate) prompt_tokens: usize,
+    #[serde(default)]
+    pub(crate) completion_tokens: usize,
+    #[serde(default)]
+    pub(crate) total_tokens: usize,
+    #[serde(default)]
     prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+    #[serde(default)]
     completion_tokens_details: Option<OpenAICompletionTokensDetails>,
+    /// DeepSeek-style cache hit counter.
+    #[serde(default)]
+    pub(crate) prompt_cache_hit_tokens: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+impl OpenAIUsage {
+    pub(crate) fn to_usage(&self) -> Usage {
+        let cached = self
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .or(self.prompt_cache_hit_tokens)
+            .unwrap_or(0);
+        Usage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            cache_read_tokens: cached,
+            cache_write_tokens: 0,
+            reasoning_tokens: self
+                .completion_tokens_details
+                .as_ref()
+                .map(|d| d.reasoning_tokens)
+                .unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 struct OpenAIPromptTokensDetails {
+    #[serde(default)]
     cached_tokens: usize,
-    audio_tokens: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[allow(dead_code)]
 struct OpenAICompletionTokensDetails {
+    #[serde(default)]
     reasoning_tokens: usize,
-    audio_tokens: usize,
-    accepted_prediction_tokens: usize,
-    rejected_prediction_tokens: usize,
 }
 
 /// OpenAI API error response.
@@ -231,6 +267,8 @@ struct OpenAIStreamDelta {
     tool_calls: Option<Vec<OpenAIStreamToolCall>>,
     #[serde(default)]
     refusal: Option<String>,
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
 }
 
 /// A tool call in a streaming chunk delta.
@@ -308,7 +346,7 @@ impl OpenAIModel {
     }
 
     /// Map an HTTP error response to a [`ModelError`].
-    fn map_http_error(status: StatusCode, body: &str) -> ModelError {
+    pub(crate) fn map_http_error(status: StatusCode, body: &str) -> ModelError {
         let error_message = serde_json::from_str::<OpenAIErrorResponse>(body)
             .ok()
             .map(|e| e.error.message)
@@ -337,7 +375,7 @@ impl OpenAIModel {
     }
 
     /// Map a reqwest error to a [`ModelError`].
-    fn map_reqwest_error(err: reqwest::Error) -> ModelError {
+    pub(crate) fn map_reqwest_error(err: reqwest::Error) -> ModelError {
         if err.is_timeout() {
             return ModelError::ServiceUnavailable { retry_after_sec: 0 };
         }
@@ -348,10 +386,23 @@ impl OpenAIModel {
     }
 
     /// Convert a [`ModelMessage`] to an OpenAI chat message.
-    fn to_openai_message(msg: &ModelMessage) -> OpenAIMessage {
-        let content = if msg.tool_calls.is_some() {
-            // Assistant message with tool calls
-            Value::Null // content is null when tool_calls present
+    pub(crate) fn to_openai_message(msg: &ModelMessage) -> OpenAIMessage {
+        let content = if msg.role == ModelRole::User && !msg.extras.images.is_empty() {
+            let mut parts: Vec<Value> = msg
+                .extras
+                .images
+                .iter()
+                .map(|img| {
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": img.data_url()}
+                    })
+                })
+                .collect();
+            parts.push(serde_json::json!({"type": "text", "text": msg.content}));
+            Value::Array(parts)
+        } else if msg.tool_calls.is_some() && msg.content.is_empty() {
+            Value::Null
         } else {
             Value::String(msg.content.clone())
         };
@@ -407,6 +458,7 @@ impl OpenAIModel {
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
 
+        let thinking = message.as_ref().and_then(|m| m.reasoning_content.clone());
         let tool_calls = message.and_then(|m| m.tool_calls).map(|calls| {
             calls
                 .into_iter()
@@ -419,16 +471,13 @@ impl OpenAIModel {
                 .collect()
         });
 
-        let usage = resp.usage.map(|u| Usage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        });
+        let usage = resp.usage.map(|u| u.to_usage());
 
         ModelResponse {
             content,
             tool_calls,
-            thinking: None, // OpenAI doesn't have a separate thinking channel in standard API
+            thinking: thinking.filter(|t| !t.is_empty()),
+            reasoning: Vec::new(),
             usage,
         }
     }
@@ -457,19 +506,22 @@ impl OpenAIModel {
 
         let openai_tools = tools.map(Self::to_openai_tools);
 
-        let tool_choice = if openai_tools
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-        {
-            Some(OpenAIToolChoice::Auto("auto".to_string()))
-        } else {
-            None
-        };
+        let has_tools = openai_tools.as_ref().is_some_and(|t| !t.is_empty());
+        let tool_choice = has_tools.then(|| match &params.tool_choice {
+            Some(ToolChoice::None) => OpenAIToolChoice::None("none".to_string()),
+            Some(ToolChoice::Required) => OpenAIToolChoice::Required("required".to_string()),
+            Some(ToolChoice::Tool(name)) => OpenAIToolChoice::Specific {
+                r#type: "function".to_string(),
+                function: OpenAIToolChoiceFunction { name: name.clone() },
+            },
+            // The model must be free to answer in plain text to finish a task.
+            _ => OpenAIToolChoice::Auto("auto".to_string()),
+        });
 
-        // Determine if we should send reasoning_effort for o1 models
-        let reasoning_effort = if self.model_id.starts_with("o1") {
-            Some("medium".to_string())
+        // Reasoning models: `max_completion_tokens`, no sampling params, and an effort level.
+        let reasoning_model = is_openai_reasoning_model(&self.model_id);
+        let reasoning_effort = if reasoning_model && self.capabilities.thinking {
+            params.reasoning.and_then(|l| l.effort()).map(String::from)
         } else {
             None
         };
@@ -477,9 +529,10 @@ impl OpenAIModel {
         OpenAIRequest {
             model: self.model_id.clone(),
             messages: openai_messages,
-            temperature: params.temperature,
-            max_tokens: params.max_tokens,
-            top_p: params.top_p,
+            temperature: params.temperature.filter(|_| !reasoning_model),
+            max_tokens: params.max_tokens.filter(|_| !reasoning_model),
+            max_completion_tokens: params.max_tokens.filter(|_| reasoning_model),
+            top_p: params.top_p.filter(|_| !reasoning_model),
             stop: params.stop_sequences.clone(),
             stream: Some(stream),
             tools: openai_tools,
@@ -629,11 +682,7 @@ impl SseStream {
         };
 
         if let Some(u) = chunk.usage {
-            self.usage = Some(Usage {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-            });
+            self.usage = Some(u.to_usage());
         }
 
         let choice = chunk.choices.into_iter().next();
@@ -644,6 +693,7 @@ impl SseStream {
         }
 
         let mut content_delta = String::new();
+        let reasoning_delta = delta.reasoning_content.filter(|r| !r.is_empty());
         let mut tool_call_chunks: Vec<OpenAIStreamToolCall> = Vec::new();
 
         if let Some(content) = delta.content {
@@ -696,13 +746,14 @@ impl SseStream {
             output_tool_calls = Some(self.flush_tool_calls());
         }
 
-        if content_delta.is_empty() && output_tool_calls.is_none() {
+        if content_delta.is_empty() && output_tool_calls.is_none() && reasoning_delta.is_none() {
             return None; // nothing to emit
         }
 
         Some(Ok(ModelStreamChunk {
             delta: content_delta,
             tool_calls: output_tool_calls,
+            thinking: reasoning_delta,
             ..Default::default()
         }))
     }
@@ -748,17 +799,10 @@ impl Stream for SseStream {
                     .trim_end_matches(['\r', '\n'])
                     .to_string();
 
-                if !line.is_empty() {
-                    if let Some(data) = line.strip_prefix("data: ")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    } else if let Some(data) = line.strip_prefix("data:")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    }
-                    // Skip empty lines, event: lines, etc.
+                if let Some(data) = line.strip_prefix("data:")
+                    && let Some(result) = this.process_data_line(data)
+                {
+                    return std::task::Poll::Ready(Some(result));
                 }
                 continue;
             }
@@ -783,16 +827,10 @@ impl Stream for SseStream {
                             .trim_end_matches(['\r', '\n'])
                             .to_string();
                         this.buffer.clear();
-                        if !line.is_empty() {
-                            if let Some(data) = line.strip_prefix("data: ")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            } else if let Some(data) = line.strip_prefix("data:")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            }
+                        if let Some(data) = line.strip_prefix("data:")
+                            && let Some(result) = this.process_data_line(data)
+                        {
+                            return std::task::Poll::Ready(Some(result));
                         }
                     }
                     // Flush pending tool calls
@@ -926,6 +964,7 @@ mod tests {
                     content: Some("Hello!".to_string()),
                     tool_calls: None,
                     refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("stop".to_string()),
                 logprobs: None,
@@ -934,8 +973,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-                prompt_tokens_details: None,
-                completion_tokens_details: None,
+                ..Default::default()
             }),
             system_fingerprint: None,
         };
@@ -947,7 +985,8 @@ mod tests {
             Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
-                total_tokens: 15
+                total_tokens: 15,
+                ..Default::default()
             })
         );
     }
@@ -973,6 +1012,7 @@ mod tests {
                         },
                     }]),
                     refusal: None,
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
                 logprobs: None,
@@ -1009,6 +1049,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         let cost = model.estimate_cost(&usage);
         assert!((cost - 12.50).abs() < 0.001); // 2.50 + 10.00
@@ -1029,6 +1070,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         assert_eq!(model.estimate_cost(&usage), 0.0);
     }
@@ -1047,15 +1089,14 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::User,
             content: "Hello".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let params = GenerationParams {
             temperature: Some(0.7),
             max_tokens: Some(100),
             stop_sequences: None,
             top_p: Some(0.95),
+            ..Default::default()
         };
         let request = model.build_request(&messages, &params, None, false);
         assert_eq!(request.model, "gpt-4o");
@@ -1080,9 +1121,7 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::User,
             content: "Hello".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let params = GenerationParams::default();
         let specs = vec![crate::tool::ToolSpec::new(
@@ -1106,13 +1145,86 @@ mod tests {
         let msg = ModelMessage {
             role: ModelRole::Tool,
             content: "Result".to_string(),
-            tool_calls: None,
             tool_call_id: Some("call_123".to_string()),
-            thinking: None,
+            ..Default::default()
         };
         let openai_msg = OpenAIModel::to_openai_message(&msg);
         assert_eq!(openai_msg.role, "tool");
         assert_eq!(openai_msg.tool_call_id, Some("call_123".to_string()));
         assert_eq!(openai_msg.content, Value::String("Result".to_string()));
+    }
+
+    #[test]
+    fn test_reasoning_model_request_shape() {
+        let mut caps = test_capabilities();
+        caps.thinking = true;
+        let model = OpenAIModel::new(
+            reqwest::Client::new(),
+            DEFAULT_BASE_URL,
+            "k",
+            "o3-mini",
+            caps,
+            None,
+        );
+        let params = GenerationParams {
+            temperature: Some(0.5),
+            max_tokens: Some(1000),
+            reasoning: Some(crate::model::ReasoningLevel::High),
+            ..Default::default()
+        };
+        let req = model.build_request(&[], &params, None, true);
+        assert_eq!(req.max_tokens, None);
+        assert_eq!(req.max_completion_tokens, Some(1000));
+        assert_eq!(req.temperature, None);
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_assistant_text_kept_with_tool_calls_and_images_sent() {
+        let msg = ModelMessage {
+            role: ModelRole::Assistant,
+            content: "Looking".into(),
+            tool_calls: Some(vec![ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                args: serde_json::json!({"p": 1}),
+                status: crate::events::ToolCallStatus::Ok,
+            }]),
+            ..Default::default()
+        };
+        let m = OpenAIModel::to_openai_message(&msg);
+        assert_eq!(m.content, Value::String("Looking".into()));
+        assert_eq!(m.tool_calls.unwrap()[0].function.arguments, "{\"p\":1}");
+
+        let user = ModelMessage {
+            role: ModelRole::User,
+            content: "see".into(),
+            extras: crate::model::MessageExtras {
+                images: vec![crate::model::ImagePart {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let m = OpenAIModel::to_openai_message(&user);
+        assert_eq!(
+            m.content[0]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn test_usage_details_tolerate_missing_fields() {
+        let u: OpenAIUsage = serde_json::from_str(
+            r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,
+                "prompt_tokens_details":{"cached_tokens":64},
+                "completion_tokens_details":{"reasoning_tokens":7}}"#,
+        )
+        .unwrap();
+        let usage = u.to_usage();
+        assert_eq!(usage.cache_read_tokens, 64);
+        assert_eq!(usage.reasoning_tokens, 7);
     }
 }

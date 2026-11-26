@@ -1111,6 +1111,7 @@ mod tests {
                 tool_call_id: None,
                 ts: 0,
                 thinking: None,
+                extras: Default::default(),
             };
             manager.log_event(Event::Message(msg)).unwrap();
         }
@@ -1164,6 +1165,7 @@ mod tests {
                 tool_call_id: None,
                 ts: 0,
                 thinking: None,
+                extras: Default::default(),
             };
             manager.log_event(Event::Message(msg)).unwrap();
         }
@@ -1207,6 +1209,7 @@ mod tests {
                 tool_call_id: None,
                 ts: 0,
                 thinking: None,
+                extras: Default::default(),
             };
             manager.log_event(Event::Message(msg)).unwrap();
         }

@@ -8,7 +8,8 @@ use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
+    ModelStreamChunk, ReasoningBlock, ToolChoice, Usage, is_context_overflow_message,
+    retry_after_secs,
 };
 #[cfg(test)]
 use crate::tool::builtin::EditFormat;
@@ -23,6 +24,7 @@ use std::pin::Pin;
 
 /// Google Generative AI request.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleRequest {
     contents: Vec<GoogleContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,32 +40,56 @@ struct GoogleRequest {
 }
 
 /// Google content block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GoogleContent {
+    #[serde(default)]
     role: String,
+    #[serde(default)]
     parts: Vec<GooglePart>,
 }
 
-/// Google content part.
+/// Google content part. The wire format is a union expressed as optional fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GooglePart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// `true` on reasoning-summary parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
+    /// Opaque token that must be echoed back with the part it belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_call: Option<GoogleFunctionCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_response: Option<GoogleFunctionResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GoogleInlineData>,
+}
+
+impl GooglePart {
+    fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Base64 inline media.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum GooglePart {
-    Text {
-        text: String,
-    },
-    FunctionCall {
-        function_call: GoogleFunctionCall,
-    },
-    FunctionResponse {
-        function_response: GoogleFunctionResponse,
-    },
-    // File data and other types not used for now
+#[serde(rename_all = "camelCase")]
+struct GoogleInlineData {
+    mime_type: String,
+    data: String,
 }
 
 /// Google function call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GoogleFunctionCall {
     name: String,
+    #[serde(default)]
     args: Value,
 }
 
@@ -76,6 +102,7 @@ struct GoogleFunctionResponse {
 
 /// Google generation config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
@@ -93,10 +120,14 @@ struct GoogleGenerationConfig {
     response_mime_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<Value>,
+    /// `{"thinkingBudget": n, "includeThoughts": true}` for Gemini 2.5+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<Value>,
 }
 
 /// Google tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleTool {
     function_declarations: Vec<GoogleFunctionDeclaration>,
 }
@@ -111,12 +142,14 @@ struct GoogleFunctionDeclaration {
 
 /// Google tool config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleToolConfig {
     function_calling_config: GoogleFunctionCallingConfig,
 }
 
 /// Google function calling config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GoogleFunctionCallingConfig {
     mode: String, // "AUTO", "ANY", "NONE"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,8 +167,11 @@ struct GoogleSafetySetting {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct GoogleResponse {
+    #[serde(default)]
     candidates: Vec<GoogleCandidate>,
+    #[serde(alias = "promptFeedback")]
     prompt_feedback: Option<GooglePromptFeedback>,
+    #[serde(alias = "usageMetadata")]
     usage_metadata: Option<GoogleUsageMetadata>,
 }
 
@@ -143,10 +179,15 @@ struct GoogleResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct GoogleCandidate {
+    #[serde(default)]
     content: GoogleContent,
+    #[serde(alias = "finishReason")]
     finish_reason: Option<String>,
+    #[serde(default)]
     index: usize,
+    #[serde(alias = "safetyRatings")]
     safety_ratings: Option<Vec<GoogleSafetyRating>>,
+    #[serde(alias = "tokenCount")]
     token_count: Option<usize>,
 }
 
@@ -176,7 +217,30 @@ struct GoogleUsageMetadata {
     candidates_token_count: usize,
     #[serde(default, alias = "totalTokenCount")]
     total_token_count: usize,
+    #[serde(default, alias = "cachedContentTokenCount")]
     cached_content_token_count: Option<usize>,
+    #[serde(default, alias = "thoughtsTokenCount")]
+    thoughts_token_count: Option<usize>,
+}
+
+impl GoogleUsageMetadata {
+    fn to_usage(&self) -> Usage {
+        let reasoning = self.thoughts_token_count.unwrap_or(0);
+        let total = if self.total_token_count > 0 {
+            self.total_token_count
+        } else {
+            self.prompt_token_count + self.candidates_token_count + reasoning
+        };
+        Usage {
+            prompt_tokens: self.prompt_token_count,
+            // Thought tokens are billed as output but reported separately.
+            completion_tokens: self.candidates_token_count + reasoning,
+            total_tokens: total,
+            cache_read_tokens: self.cached_content_token_count.unwrap_or(0),
+            reasoning_tokens: reasoning,
+            ..Default::default()
+        }
+    }
 }
 
 /// Google API error response.
@@ -201,6 +265,7 @@ struct GoogleErrorBody {
 #[allow(dead_code)]
 struct GoogleStreamChunk {
     candidates: Option<Vec<GoogleStreamCandidate>>,
+    #[serde(alias = "promptFeedback")]
     prompt_feedback: Option<GooglePromptFeedback>,
     #[serde(alias = "usageMetadata")]
     usage_metadata: Option<GoogleUsageMetadata>,
@@ -211,16 +276,19 @@ struct GoogleStreamChunk {
 #[allow(dead_code)]
 struct GoogleStreamCandidate {
     content: Option<GoogleContent>,
+    #[serde(alias = "finishReason")]
     finish_reason: Option<String>,
+    #[serde(default)]
     index: usize,
+    #[serde(alias = "safetyRatings")]
     safety_ratings: Option<Vec<GoogleSafetyRating>>,
+    #[serde(alias = "tokenCount")]
     token_count: Option<usize>,
 }
 
 /// Accumulated state for a streaming function call.
 #[derive(Debug, Clone, Default)]
 struct StreamingFunctionCall {
-    index: usize,
     name: Option<String>,
     args: String,
 }
@@ -233,6 +301,87 @@ pub struct GoogleModel {
     model_id: String,
     capabilities: ModelCapabilities,
     pricing: Option<ModelPricing>,
+}
+
+const PROVIDER_TAG: &str = "google";
+
+/// Gemini accepts only an OpenAPI subset: inline `$ref`s and drop keywords it rejects.
+fn sanitize_schema(schema: &Value) -> Value {
+    let defs = schema
+        .get("$defs")
+        .or_else(|| schema.get("definitions"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    sanitize_node(schema, &defs, 0)
+}
+
+fn sanitize_node(node: &Value, defs: &Value, depth: usize) -> Value {
+    const DROP: &[&str] = &[
+        "$schema",
+        "$id",
+        "$defs",
+        "definitions",
+        "additionalProperties",
+        "default",
+        "examples",
+        "title",
+        "patternProperties",
+        "unevaluatedProperties",
+    ];
+    match node {
+        Value::Object(map) => {
+            if let Some(Value::String(r)) = map.get("$ref") {
+                let key = r.rsplit('/').next().unwrap_or("");
+                if depth < 8
+                    && let Some(target) = defs.get(key)
+                {
+                    return sanitize_node(target, defs, depth + 1);
+                }
+                return serde_json::json!({"type": "object"});
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if DROP.contains(&k.as_str()) {
+                    continue;
+                }
+                match (k.as_str(), v) {
+                    ("type", Value::Array(types)) => {
+                        let non_null: Vec<&Value> = types
+                            .iter()
+                            .filter(|t| t.as_str() != Some("null"))
+                            .collect();
+                        if let Some(first) = non_null.first() {
+                            out.insert("type".into(), (*first).clone());
+                        }
+                        if non_null.len() != types.len() {
+                            out.insert("nullable".into(), Value::Bool(true));
+                        }
+                    }
+                    ("const", c) => {
+                        out.insert("enum".into(), Value::Array(vec![c.clone()]));
+                    }
+                    ("properties", Value::Object(props)) => {
+                        let sanitized = props
+                            .iter()
+                            .map(|(pk, pv)| (pk.clone(), sanitize_node(pv, defs, depth + 1)))
+                            .collect();
+                        out.insert("properties".into(), Value::Object(sanitized));
+                    }
+                    _ => {
+                        out.insert(k.clone(), sanitize_node(v, defs, depth + 1));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|i| sanitize_node(i, defs, depth + 1))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
 }
 
 impl GoogleModel {
@@ -320,48 +469,79 @@ impl GoogleModel {
     ) -> (Option<GoogleContent>, Vec<GoogleContent>) {
         let mut system_instruction = None;
         let mut contents = Vec::new();
+        let call_names: std::collections::HashMap<&str, String> = messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .map(|tc| (tc.id.as_str(), tc.name.clone()))
+            .collect();
 
         for msg in messages {
             match msg.role {
                 ModelRole::System => {
                     system_instruction = Some(GoogleContent {
                         role: "user".to_string(), // System instructions use "user" role in parts
-                        parts: vec![GooglePart::Text {
-                            text: msg.content.clone(),
-                        }],
+                        parts: vec![GooglePart::text(msg.content.clone())],
                     });
                 }
                 ModelRole::User => {
+                    let mut parts: Vec<GooglePart> = msg
+                        .extras
+                        .images
+                        .iter()
+                        .map(|img| GooglePart {
+                            inline_data: Some(GoogleInlineData {
+                                mime_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            }),
+                            ..Default::default()
+                        })
+                        .collect();
+                    parts.push(GooglePart::text(msg.content.clone()));
                     contents.push(GoogleContent {
                         role: "user".to_string(),
-                        parts: vec![GooglePart::Text {
-                            text: msg.content.clone(),
-                        }],
+                        parts,
                     });
                 }
                 ModelRole::Assistant => {
                     let mut parts = Vec::new();
                     if !msg.content.is_empty() {
-                        parts.push(GooglePart::Text {
-                            text: msg.content.clone(),
-                        });
+                        parts.push(GooglePart::text(msg.content.clone()));
                     }
                     if let Some(tool_calls) = &msg.tool_calls {
                         for tc in tool_calls {
-                            parts.push(GooglePart::FunctionCall {
-                                function_call: GoogleFunctionCall {
+                            parts.push(GooglePart {
+                                function_call: Some(GoogleFunctionCall {
                                     name: tc.name.clone(),
                                     args: tc.args.clone(),
-                                },
+                                }),
+                                ..Default::default()
                             });
                         }
                     }
-                    if let Some(thinking) = &msg.thinking {
-                        // Google doesn't have a native thinking channel in the standard API
-                        // Include as text for now
-                        parts.push(GooglePart::Text {
-                            text: format!("<thinking>{}</thinking>", thinking),
-                        });
+                    // Echo thought signatures back on the part they came from
+                    // (`id` holds the function name for function-call parts).
+                    for block in msg
+                        .extras
+                        .reasoning
+                        .iter()
+                        .filter(|b| b.provider == PROVIDER_TAG)
+                    {
+                        let Some(sig) = &block.signature else {
+                            continue;
+                        };
+                        let target = match &block.id {
+                            Some(name) => parts.iter_mut().find(|p| {
+                                p.thought_signature.is_none()
+                                    && p.function_call.as_ref().is_some_and(|f| &f.name == name)
+                            }),
+                            None => parts.iter_mut().find(|p| {
+                                p.thought_signature.is_none() && p.function_call.is_none()
+                            }),
+                        };
+                        if let Some(part) = target {
+                            part.thought_signature = Some(sig.clone());
+                        }
                     }
                     if !parts.is_empty() {
                         contents.push(GoogleContent {
@@ -371,19 +551,42 @@ impl GoogleModel {
                     }
                 }
                 ModelRole::Tool => {
-                    // Tool result - Google uses function_response
-                    if let Some(tool_call_id) = &msg.tool_call_id {
-                        // We need to know the function name for the response
-                        // For now, extract from tool_call_id or use a placeholder
-                        contents.push(GoogleContent {
-                            role: "user".to_string(),
-                            parts: vec![GooglePart::FunctionResponse {
-                                function_response: GoogleFunctionResponse {
-                                    name: tool_call_id.clone(), // Using tool_call_id as function name
-                                    response: Value::String(msg.content.clone()),
-                                },
-                            }],
+                    let Some(tool_call_id) = &msg.tool_call_id else {
+                        continue;
+                    };
+                    let name = call_names
+                        .get(tool_call_id.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            tool_call_id
+                                .strip_prefix("call_")
+                                .unwrap_or(tool_call_id)
+                                .to_string()
                         });
+                    let key = if msg.extras.is_error {
+                        "error"
+                    } else {
+                        "result"
+                    };
+                    let part = GooglePart {
+                        function_response: Some(GoogleFunctionResponse {
+                            name,
+                            response: serde_json::json!({ key: msg.content }),
+                        }),
+                        ..Default::default()
+                    };
+                    // Parallel results must share a single user turn.
+                    match contents.last_mut() {
+                        Some(last)
+                            if last.role == "user"
+                                && last.parts.iter().all(|p| p.function_response.is_some()) =>
+                        {
+                            last.parts.push(part)
+                        }
+                        _ => contents.push(GoogleContent {
+                            role: "user".to_string(),
+                            parts: vec![part],
+                        }),
                     }
                 }
             }
@@ -403,7 +606,7 @@ impl GoogleModel {
                 .map(|spec| GoogleFunctionDeclaration {
                     name: spec.name.clone(),
                     description: spec.description.clone(),
-                    parameters: spec.input_schema.clone(),
+                    parameters: sanitize_schema(&spec.input_schema),
                 })
                 .collect(),
         }]
@@ -416,39 +619,36 @@ impl GoogleModel {
 
         let mut text_content = String::new();
         let mut tool_calls = Vec::new();
-        let mut thinking = None;
+        let mut thinking = String::new();
+        let mut reasoning = Vec::new();
 
         if let Some(content) = content {
             for part in content.parts {
-                match part {
-                    GooglePart::Text { text } => {
-                        if text.starts_with("<thinking>") && text.ends_with("</thinking>") {
-                            thinking = Some(
-                                text["<thinking>".len()..text.len() - "</thinking>".len()]
-                                    .to_string(),
-                            );
-                        } else {
-                            text_content.push_str(&text);
-                        }
+                let signature = part.thought_signature.clone();
+                if let Some(fc) = part.function_call {
+                    if let Some(sig) = signature {
+                        reasoning.push(Self::signature_block(sig, Some(fc.name.clone())));
                     }
-                    GooglePart::FunctionCall { function_call } => {
-                        tool_calls.push(ToolCall {
-                            id: format!("call_{}", function_call.name), // Generate ID
-                            name: function_call.name,
-                            args: function_call.args,
-                            status: crate::events::ToolCallStatus::Ok,
-                        });
+                    tool_calls.push(ToolCall {
+                        id: format!("call_{}_{}", fc.name, tool_calls.len()),
+                        name: fc.name,
+                        args: fc.args,
+                        status: crate::events::ToolCallStatus::Ok,
+                    });
+                } else if let Some(text) = part.text {
+                    if part.thought == Some(true) {
+                        thinking.push_str(&text);
+                    } else {
+                        text_content.push_str(&text);
                     }
-                    _ => {}
+                    if let Some(sig) = signature {
+                        reasoning.push(Self::signature_block(sig, None));
+                    }
                 }
             }
         }
 
-        let usage = resp.usage_metadata.map(|u| Usage {
-            prompt_tokens: u.prompt_token_count,
-            completion_tokens: u.candidates_token_count,
-            total_tokens: u.total_token_count,
-        });
+        let usage = resp.usage_metadata.map(|u| u.to_usage());
 
         ModelResponse {
             content: text_content,
@@ -457,8 +657,18 @@ impl GoogleModel {
             } else {
                 Some(tool_calls)
             },
-            thinking,
+            thinking: (!thinking.is_empty()).then_some(thinking),
+            reasoning,
             usage,
+        }
+    }
+
+    fn signature_block(signature: String, function_name: Option<String>) -> ReasoningBlock {
+        ReasoningBlock {
+            provider: PROVIDER_TAG.to_string(),
+            signature: Some(signature),
+            id: function_name,
+            ..Default::default()
         }
     }
 
@@ -489,25 +699,40 @@ impl GoogleModel {
             .map(|t| !t.is_empty())
             .unwrap_or(false)
         {
+            let (mode, allowed) = match &params.tool_choice {
+                Some(ToolChoice::None) => ("NONE", None),
+                Some(ToolChoice::Required) => ("ANY", None),
+                Some(ToolChoice::Tool(name)) => ("ANY", Some(vec![name.clone()])),
+                _ => ("AUTO", None),
+            };
             Some(GoogleToolConfig {
                 function_calling_config: GoogleFunctionCallingConfig {
-                    mode: "AUTO".to_string(),
-                    allowed_function_names: None,
+                    mode: mode.to_string(),
+                    allowed_function_names: allowed,
                 },
             })
         } else {
             None
         };
 
+        let thinking_config = match params.reasoning {
+            Some(level) if self.capabilities.thinking => Some(serde_json::json!({
+                "thinkingBudget": level.budget_tokens().map_or(0, |b| b as i64),
+                "includeThoughts": level.effort().is_some(),
+            })),
+            _ => None,
+        };
+
         let generation_config = GoogleGenerationConfig {
             temperature: params.temperature,
-            max_output_tokens: params.max_tokens,
+            max_output_tokens: params.max_tokens.or(Some(self.capabilities.max_output)),
             top_p: params.top_p,
             top_k: Some(40),
             stop_sequences: params.stop_sequences.clone(),
             candidate_count: Some(1),
             response_mime_type: None,
             response_schema: None,
+            thinking_config,
         };
 
         GoogleRequest {
@@ -657,16 +882,7 @@ impl SseStream {
         };
 
         if let Some(u) = chunk.usage_metadata {
-            let total = if u.total_token_count > 0 {
-                u.total_token_count
-            } else {
-                u.prompt_token_count + u.candidates_token_count
-            };
-            self.usage = Some(Usage {
-                prompt_tokens: u.prompt_token_count,
-                completion_tokens: u.candidates_token_count,
-                total_tokens: total,
-            });
+            self.usage = Some(u.to_usage());
         }
 
         let candidate = chunk.candidates.and_then(|c| c.into_iter().next());
@@ -680,60 +896,51 @@ impl SseStream {
 
             if let Some(content) = candidate.content {
                 let mut text_delta = String::new();
-                let mut function_call_delta: Option<GoogleFunctionCall> = None;
+                let mut thinking_delta = String::new();
+                let mut reasoning = Vec::new();
 
                 for part in content.parts {
-                    match part {
-                        GooglePart::Text { text } => {
+                    let signature = part.thought_signature.clone();
+                    if let Some(fc) = part.function_call {
+                        // Gemini streams function calls whole, one per part.
+                        if let Some(sig) = signature {
+                            reasoning
+                                .push(GoogleModel::signature_block(sig, Some(fc.name.clone())));
+                        }
+                        self.pending_function_calls.push(StreamingFunctionCall {
+                            name: Some(fc.name),
+                            args: fc.args.to_string(),
+                        });
+                    } else if let Some(text) = part.text {
+                        if part.thought == Some(true) {
+                            thinking_delta.push_str(&text);
+                        } else {
                             text_delta.push_str(&text);
                         }
-                        GooglePart::FunctionCall { function_call } => {
-                            function_call_delta = Some(function_call);
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Handle function call streaming
-                if let Some(fc) = function_call_delta {
-                    // For Google, function calls come in complete form in each chunk
-                    // Find or create the accumulated function call
-                    let idx = candidate.index;
-                    let existing = self
-                        .pending_function_calls
-                        .iter_mut()
-                        .find(|t| t.index == idx);
-
-                    match existing {
-                        Some(acc) => {
-                            if acc.name.is_none() {
-                                acc.name = Some(fc.name);
-                            }
-                            acc.args = fc.args.to_string();
-                        }
-                        None => {
-                            self.pending_function_calls.push(StreamingFunctionCall {
-                                index: idx,
-                                name: Some(fc.name),
-                                args: fc.args.to_string(),
-                            });
+                        if let Some(sig) = signature {
+                            reasoning.push(GoogleModel::signature_block(sig, None));
                         }
                     }
                 }
 
-                // If finished, flush function calls
                 let mut output_tool_calls = None;
                 if finished && !self.pending_function_calls.is_empty() {
                     output_tool_calls = Some(self.flush_function_calls());
                 }
 
-                if text_delta.is_empty() && output_tool_calls.is_none() {
+                if text_delta.is_empty()
+                    && thinking_delta.is_empty()
+                    && reasoning.is_empty()
+                    && output_tool_calls.is_none()
+                {
                     return None;
                 }
 
                 return Some(Ok(ModelStreamChunk {
                     delta: text_delta,
                     tool_calls: output_tool_calls,
+                    thinking: (!thinking_delta.is_empty()).then_some(thinking_delta),
+                    reasoning,
                     ..Default::default()
                 }));
             }
@@ -747,11 +954,12 @@ impl SseStream {
         let calls: Vec<ToolCall> = self
             .pending_function_calls
             .drain(..)
-            .filter_map(|fc| {
+            .enumerate()
+            .filter_map(|(i, fc)| {
                 let name = fc.name?;
                 let args = serde_json::from_str(&fc.args).unwrap_or(Value::Null);
                 Some(ToolCall {
-                    id: format!("call_{}", name),
+                    id: format!("call_{}_{}", name, i),
                     name,
                     args,
                     status: crate::events::ToolCallStatus::Ok,
@@ -783,17 +991,10 @@ impl Stream for SseStream {
                     .trim_end_matches(['\r', '\n'])
                     .to_string();
 
-                if !line.is_empty() {
-                    if let Some(data) = line.strip_prefix("data: ")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    } else if let Some(data) = line.strip_prefix("data:")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    }
-                    // Skip empty lines, event: lines, etc.
+                if let Some(data) = line.strip_prefix("data:")
+                    && let Some(result) = this.process_data_line(data)
+                {
+                    return std::task::Poll::Ready(Some(result));
                 }
                 continue;
             }
@@ -818,16 +1019,10 @@ impl Stream for SseStream {
                             .trim_end_matches(['\r', '\n'])
                             .to_string();
                         this.buffer.clear();
-                        if !line.is_empty() {
-                            if let Some(data) = line.strip_prefix("data: ")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            } else if let Some(data) = line.strip_prefix("data:")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            }
+                        if let Some(data) = line.strip_prefix("data:")
+                            && let Some(result) = this.process_data_line(data)
+                        {
+                            return std::task::Poll::Ready(Some(result));
                         }
                     }
                     // Flush pending function calls
@@ -935,9 +1130,7 @@ mod tests {
             candidates: vec![GoogleCandidate {
                 content: GoogleContent {
                     role: "model".to_string(),
-                    parts: vec![GooglePart::Text {
-                        text: "Hello!".to_string(),
-                    }],
+                    parts: vec![GooglePart::text("Hello!")],
                 },
                 finish_reason: Some("STOP".to_string()),
                 index: 0,
@@ -950,6 +1143,7 @@ mod tests {
                 candidates_token_count: 5,
                 total_token_count: 15,
                 cached_content_token_count: None,
+                thoughts_token_count: None,
             }),
         };
         let model_resp = GoogleModel::from_google_response(resp);
@@ -960,7 +1154,8 @@ mod tests {
             Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
-                total_tokens: 15
+                total_tokens: 15,
+                ..Default::default()
             })
         );
     }
@@ -971,11 +1166,12 @@ mod tests {
             candidates: vec![GoogleCandidate {
                 content: GoogleContent {
                     role: "model".to_string(),
-                    parts: vec![GooglePart::FunctionCall {
-                        function_call: GoogleFunctionCall {
+                    parts: vec![GooglePart {
+                        function_call: Some(GoogleFunctionCall {
                             name: "todo".to_string(),
                             args: serde_json::json!({"action":"add","title":"Test"}),
-                        },
+                        }),
+                        ..Default::default()
                     }],
                 },
                 finish_reason: Some("FUNCTION_CALL".to_string()),
@@ -1014,6 +1210,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         let cost = model.estimate_cost(&usage);
         assert!((cost - 6.25).abs() < 0.001); // 1.25 + 5.00
@@ -1034,27 +1231,32 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         assert_eq!(model.estimate_cost(&usage), 0.0);
     }
 
     #[test]
-    fn test_to_google_contents_user() {
+    fn test_to_google_contents_user_with_image() {
         let messages = vec![ModelMessage {
             role: ModelRole::User,
             content: "Hello".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            extras: crate::model::MessageExtras {
+                images: vec![crate::model::ImagePart {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
         }];
         let (system, contents) = GoogleModel::to_google_contents(&messages);
         assert!(system.is_none());
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role, "user");
-        assert!(matches!(
-            &contents[0].parts[0],
-            GooglePart::Text { text } if text == "Hello"
-        ));
+        let v = serde_json::to_value(&contents[0].parts).unwrap();
+        assert_eq!(v[0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(v[1]["text"], "Hello");
     }
 
     #[test]
@@ -1062,35 +1264,147 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::System,
             content: "You are a helpful assistant".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let (system, contents) = GoogleModel::to_google_contents(&messages);
-        assert!(system.is_some());
         assert_eq!(contents.len(), 0);
-        assert!(matches!(
-            &system.unwrap().parts[0],
-            GooglePart::Text { text } if text == "You are a helpful assistant"
-        ));
+        assert_eq!(
+            system.unwrap().parts[0].text.as_deref(),
+            Some("You are a helpful assistant")
+        );
     }
 
     #[test]
-    fn test_to_google_contents_tool_result() {
-        let messages = vec![ModelMessage {
+    fn test_tool_round_trip_names_signatures_and_merging() {
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: serde_json::json!({}),
+            status: crate::events::ToolCallStatus::Ok,
+        };
+        let tool = |id: &str, content: &str, err: bool| ModelMessage {
             role: ModelRole::Tool,
-            content: "File contents here".to_string(),
-            tool_calls: None,
-            tool_call_id: Some("my_function".to_string()),
-            thinking: None,
-        }];
-        let (system, contents) = GoogleModel::to_google_contents(&messages);
-        assert!(system.is_none());
-        assert_eq!(contents.len(), 1);
-        assert_eq!(contents[0].role, "user");
-        assert!(matches!(
-            &contents[0].parts[0],
-            GooglePart::FunctionResponse { function_response } if function_response.name == "my_function" && function_response.response == "File contents here"
-        ));
+            content: content.into(),
+            tool_call_id: Some(id.into()),
+            extras: crate::model::MessageExtras {
+                is_error: err,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let messages = vec![
+            ModelMessage {
+                role: ModelRole::Assistant,
+                tool_calls: Some(vec![call("c0", "read"), call("c1", "grep")]),
+                extras: crate::model::MessageExtras {
+                    reasoning: vec![
+                        GoogleModel::signature_block("sigA".into(), Some("grep".into())),
+                        ReasoningBlock {
+                            provider: "anthropic".into(),
+                            signature: Some("other".into()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            tool("c0", "ok", false),
+            tool("c1", "boom", true),
+        ];
+        let (_, contents) = GoogleModel::to_google_contents(&messages);
+        assert_eq!(contents.len(), 2);
+        let model_parts = serde_json::to_value(&contents[0].parts).unwrap();
+        assert!(model_parts[0].get("thoughtSignature").is_none());
+        assert_eq!(model_parts[1]["thoughtSignature"], "sigA");
+        let results = serde_json::to_value(&contents[1].parts).unwrap();
+        assert_eq!(results[0]["functionResponse"]["name"], "read");
+        assert_eq!(results[0]["functionResponse"]["response"]["result"], "ok");
+        assert_eq!(results[1]["functionResponse"]["name"], "grep");
+        assert_eq!(results[1]["functionResponse"]["response"]["error"], "boom");
+    }
+
+    #[test]
+    fn test_sanitize_schema_inlines_refs_and_strips_keywords() {
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "title": {"type": ["string", "null"], "default": "x"},
+                "mode": {"$ref": "#/$defs/Mode"}
+            },
+            "$defs": {"Mode": {"type": "string", "enum": ["a", "b"]}}
+        });
+        let out = sanitize_schema(&schema);
+        assert!(out.get("$schema").is_none());
+        assert!(out.get("additionalProperties").is_none());
+        assert!(out.get("$defs").is_none());
+        assert_eq!(out["properties"]["title"]["type"], "string");
+        assert_eq!(out["properties"]["title"]["nullable"], true);
+        assert!(out["properties"]["title"].get("default").is_none());
+        assert_eq!(out["properties"]["mode"]["enum"][1], "b");
+    }
+
+    #[test]
+    fn test_stream_thought_signature_usage_and_calls() {
+        let mut sse = SseStream::new(futures::stream::empty());
+        let thought = sse
+            .process_data_line(
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"plan","thought":true}]}}]}"#,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(thought.thinking.as_deref(), Some("plan"));
+        assert!(thought.delta.is_empty());
+
+        let call = sse
+            .process_data_line(
+                r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read","args":{"p":1}},"thoughtSignature":"SIG"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":7,"cachedContentTokenCount":4,"totalTokenCount":19}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let calls = call.tool_calls.unwrap();
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].args["p"], 1);
+        assert_eq!(call.reasoning[0].signature.as_deref(), Some("SIG"));
+        assert_eq!(call.reasoning[0].id.as_deref(), Some("read"));
+
+        let last = sse.final_chunk();
+        let usage = last.usage.unwrap();
+        assert_eq!(usage.completion_tokens, 9);
+        assert_eq!(usage.reasoning_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, 4);
+    }
+
+    #[test]
+    fn test_request_thinking_config_and_tool_choice() {
+        let mut caps = test_capabilities();
+        caps.thinking = true;
+        let model = GoogleModel::new(
+            reqwest::Client::new(),
+            DEFAULT_BASE_URL,
+            "k",
+            "gemini-2.5-pro",
+            caps,
+            None,
+        );
+        let params = GenerationParams {
+            reasoning: Some(crate::model::ReasoningLevel::Medium),
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
+        let specs = vec![ToolSpec::new(
+            "t",
+            "d",
+            serde_json::json!({"type":"object"}),
+        )];
+        let req = model.build_request(&[], &params, Some(&specs));
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
+        );
+        assert_eq!(v["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
     }
 }

@@ -41,7 +41,7 @@ A single static Rust binary that turns a language model into an autonomous codin
 |----|-------------|
 | FR-01 | CLI: `okeanos <prompt>`, `okeanos --interactive`, `okeanos --headless`, `okeanos --rpc`, plus `/undo`, `/redo`, `/help`, `/todos`, `/logs` commands. |
 | FR-02 | ReAct loop: think → call tool → observe → repeat until task complete, blocked, or context cap reached. |
-| FR-03 | Model abstraction: `Model` trait with chat-completion + streaming; OpenAI-compatible/OpenRouter provider at launch; additional providers feature-gated. |
+| FR-03 | Model abstraction: `Model` trait with chat-completion + streaming; OpenAI-compatible/OpenRouter provider at launch; Anthropic, OpenAI (Chat + Responses) and Google adapters with provider-native reasoning replay, images, and named multi-provider config (`[providers.*]`). |
 | FR-04 | Tool system: `Tool` trait with JSON-schema input/output; built-in `todo`, `read`, `write`, `delete`, `run` (local process), `grep`; user-defined tools via the trait. |
 | FR-05 | Approval policy: safe-by-default allow-list; confirm before write/delete/network; allow/deny/allow-always per session. |
 | FR-06 | Context management: hard token/message cap; clear error when exceeded (no silent compaction/truncation). |

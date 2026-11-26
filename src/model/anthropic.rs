@@ -11,7 +11,8 @@ use crate::context::tokens::ModelPricing;
 use crate::events::ToolCall;
 use crate::model::model_trait::{
     GenerationParams, Model, ModelCapabilities, ModelError, ModelMessage, ModelResponse, ModelRole,
-    ModelStreamChunk, Usage, is_context_overflow_message, retry_after_secs,
+    ModelStreamChunk, ReasoningBlock, ToolChoice, Usage, is_context_overflow_message,
+    retry_after_secs,
 };
 #[cfg(test)]
 use crate::tool::builtin::EditFormat;
@@ -45,6 +46,8 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<AnthropicToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
 }
 
 /// Anthropic message format.
@@ -60,6 +63,9 @@ struct AnthropicMessage {
 enum AnthropicContentBlock {
     Text {
         text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
     },
     ToolUse {
         id: String,
@@ -81,6 +87,15 @@ enum AnthropicContentBlock {
     },
 }
 
+/// Base64 image payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AnthropicImageSource {
+    #[serde(rename = "type")]
+    kind: String,
+    media_type: String,
+    data: String,
+}
+
 /// Anthropic tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AnthropicTool {
@@ -95,6 +110,7 @@ struct AnthropicTool {
 enum AnthropicToolChoice {
     Auto,
     Any,
+    None,
     Tool { name: String },
 }
 
@@ -131,6 +147,17 @@ impl AnthropicUsage {
             + self.cache_creation_input_tokens.unwrap_or(0)
             + self.cache_read_input_tokens.unwrap_or(0)
     }
+
+    fn to_usage(&self) -> Usage {
+        Usage {
+            prompt_tokens: self.total_input(),
+            completion_tokens: self.output_tokens,
+            total_tokens: self.total_input() + self.output_tokens,
+            cache_read_tokens: self.cache_read_input_tokens.unwrap_or(0),
+            cache_write_tokens: self.cache_creation_input_tokens.unwrap_or(0),
+            reasoning_tokens: 0,
+        }
+    }
 }
 
 /// Anthropic API error response.
@@ -155,6 +182,12 @@ struct AnthropicStreamChunk {
     r#type: String,
     message: Option<AnthropicStreamMessage>,
     delta: Option<AnthropicStreamDelta>,
+    /// Real API shape: block start payload (`content_block_start`).
+    #[serde(default)]
+    content_block: Option<AnthropicStreamDelta>,
+    /// Real API shape: block index lives at the top level.
+    #[serde(default)]
+    index: Option<usize>,
     usage: Option<AnthropicUsage>,
     /// Present on mid-stream `error` events.
     #[serde(default)]
@@ -190,6 +223,14 @@ struct AnthropicStreamDelta {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    id: Option<String>,
+    /// `redacted_thinking` payload.
+    #[serde(default)]
+    data: Option<String>,
+    /// Real API: incremental tool-input JSON text.
+    #[serde(default)]
+    partial_json: Option<String>,
+    #[serde(default)]
     input: Option<Value>,
     #[serde(default)]
     index: Option<usize>,
@@ -207,9 +248,13 @@ struct StreamingToolCall {
 /// Accumulated thinking state.
 #[derive(Debug, Clone, Default)]
 struct StreamingThinking {
+    index: Option<usize>,
     thinking: String,
     signature: Option<String>,
 }
+
+/// Provider tag stored on [`ReasoningBlock`]s produced here.
+const PROVIDER_TAG: &str = "anthropic";
 
 /// Anthropic/Claude model provider.
 pub struct AnthropicModel {
@@ -260,9 +305,7 @@ impl AnthropicModel {
             messages.push(ModelMessage {
                 role: ModelRole::System,
                 content: request.system_prompt.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                thinking: None,
+                ..Default::default()
             });
         }
         messages.extend(request.messages.iter().cloned());
@@ -306,8 +349,18 @@ impl AnthropicModel {
         format!("{}/v1/messages", self.base_url)
     }
 
-    fn bearer_auth(&self) -> header::HeaderValue {
-        header::HeaderValue::from_str(&format!("Bearer {}", self.api_key)).unwrap()
+    /// Auth headers: `x-api-key` for the direct API, plus Bearer for gateways/proxies.
+    fn auth_headers(&self) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        if let Ok(v) = header::HeaderValue::from_str(&self.api_key) {
+            headers.insert("x-api-key", v);
+        }
+        if self.base_url != DEFAULT_BASE_URL
+            && let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+        {
+            headers.insert(header::AUTHORIZATION, v);
+        }
+        headers
     }
 
     fn anthropic_version(&self) -> header::HeaderValue {
@@ -370,15 +423,47 @@ impl AnthropicModel {
                     });
                 }
                 ModelRole::User => {
+                    let mut content: Vec<AnthropicContentBlock> = msg
+                        .extras
+                        .images
+                        .iter()
+                        .map(|img| AnthropicContentBlock::Image {
+                            source: AnthropicImageSource {
+                                kind: "base64".to_string(),
+                                media_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            },
+                        })
+                        .collect();
+                    content.push(AnthropicContentBlock::Text {
+                        text: msg.content.clone(),
+                    });
                     anthropic_messages.push(AnthropicMessage {
                         role: "user".to_string(),
-                        content: vec![AnthropicContentBlock::Text {
-                            text: msg.content.clone(),
-                        }],
+                        content,
                     });
                 }
                 ModelRole::Assistant => {
                     let mut content = Vec::new();
+                    // Signed thinking blocks must precede other content and round-trip verbatim.
+                    for block in msg
+                        .extras
+                        .reasoning
+                        .iter()
+                        .filter(|b| b.provider == PROVIDER_TAG)
+                    {
+                        let Some(signature) = block.signature.clone() else {
+                            continue;
+                        };
+                        content.push(if block.redacted {
+                            AnthropicContentBlock::RedactedThinking { data: signature }
+                        } else {
+                            AnthropicContentBlock::Thinking {
+                                thinking: block.text.clone(),
+                                signature,
+                            }
+                        });
+                    }
                     if !msg.content.is_empty() {
                         content.push(AnthropicContentBlock::Text {
                             text: msg.content.clone(),
@@ -392,13 +477,6 @@ impl AnthropicModel {
                                 input: tc.args.clone(),
                             });
                         }
-                    }
-                    if let Some(thinking) = &msg.thinking {
-                        // Anthropic uses a separate thinking block with signature
-                        // For replay, we just include the thinking as text for now
-                        content.push(AnthropicContentBlock::Text {
-                            text: format!("<thinking>{}</thinking>", thinking),
-                        });
                     }
                     if !content.is_empty() {
                         anthropic_messages.push(AnthropicMessage {
@@ -415,7 +493,7 @@ impl AnthropicModel {
                             content: vec![AnthropicContentBlock::ToolResult {
                                 tool_use_id: tool_call_id.clone(),
                                 content: Value::String(msg.content.clone()),
-                                is_error: None,
+                                is_error: msg.extras.is_error.then_some(true),
                             }],
                         });
                     }
@@ -442,20 +520,12 @@ impl AnthropicModel {
     fn from_anthropic_response(resp: AnthropicResponse) -> ModelResponse {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
-        let mut thinking = None;
+        let mut thinking: Option<String> = None;
+        let mut reasoning = Vec::new();
 
         for block in resp.content {
             match block {
-                AnthropicContentBlock::Text { text } => {
-                    // Check if this is thinking content
-                    if text.starts_with("<thinking>") && text.ends_with("</thinking>") {
-                        thinking = Some(
-                            text["<thinking>".len()..text.len() - "</thinking>".len()].to_string(),
-                        );
-                    } else {
-                        content.push_str(&text);
-                    }
-                }
+                AnthropicContentBlock::Text { text } => content.push_str(&text),
                 AnthropicContentBlock::ToolUse { id, name, input } => {
                     tool_calls.push(ToolCall {
                         id,
@@ -466,20 +536,29 @@ impl AnthropicModel {
                 }
                 AnthropicContentBlock::Thinking {
                     thinking: t,
-                    signature: _,
+                    signature,
                 } => {
-                    thinking = Some(t);
-                    // Signature could be stored for native compaction
+                    thinking.get_or_insert_with(String::new).push_str(&t);
+                    reasoning.push(ReasoningBlock {
+                        provider: PROVIDER_TAG.to_string(),
+                        text: t,
+                        signature: Some(signature),
+                        ..Default::default()
+                    });
+                }
+                AnthropicContentBlock::RedactedThinking { data } => {
+                    reasoning.push(ReasoningBlock {
+                        provider: PROVIDER_TAG.to_string(),
+                        signature: Some(data),
+                        redacted: true,
+                        ..Default::default()
+                    });
                 }
                 _ => {}
             }
         }
 
-        let usage = Some(Usage {
-            prompt_tokens: resp.usage.total_input(),
-            completion_tokens: resp.usage.output_tokens,
-            total_tokens: resp.usage.total_input() + resp.usage.output_tokens,
-        });
+        let usage = Some(resp.usage.to_usage());
 
         ModelResponse {
             content,
@@ -489,6 +568,7 @@ impl AnthropicModel {
                 Some(tool_calls)
             },
             thinking,
+            reasoning,
             usage,
         }
     }
@@ -515,13 +595,28 @@ impl AnthropicModel {
         let (system, anthropic_messages) = Self::to_anthropic_messages(messages);
 
         let anthropic_tools = tools.map(Self::to_anthropic_tools);
+        let has_tools = anthropic_tools.as_ref().is_some_and(|t| !t.is_empty());
 
-        let tool_choice = if anthropic_tools
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
-        {
-            Some(AnthropicToolChoice::Auto)
+        // Extended thinking: needs a budget below max_tokens, forbids temperature/top_p
+        // and any forced tool choice.
+        let level = params.reasoning.filter(|_| self.capabilities.thinking);
+        let mut max_tokens = params.max_tokens.unwrap_or(self.capabilities.max_output);
+        let mut thinking = None;
+        if let Some(budget) = level.and_then(|l| l.budget_tokens()) {
+            max_tokens = max_tokens.max(budget + 1024);
+            thinking = Some(serde_json::json!({"type": "enabled", "budget_tokens": budget}));
+        }
+        let thinking_on = thinking.is_some();
+
+        let tool_choice = if has_tools {
+            Some(match &params.tool_choice {
+                Some(ToolChoice::None) => AnthropicToolChoice::None,
+                Some(ToolChoice::Required) if !thinking_on => AnthropicToolChoice::Any,
+                Some(ToolChoice::Tool(name)) if !thinking_on => {
+                    AnthropicToolChoice::Tool { name: name.clone() }
+                }
+                _ => AnthropicToolChoice::Auto,
+            })
         } else {
             None
         };
@@ -530,17 +625,14 @@ impl AnthropicModel {
             model: self.model_id.clone(),
             messages: anthropic_messages,
             system,
-            temperature: params.temperature,
-            max_tokens: Some(
-                params
-                    .max_tokens
-                    .unwrap_or(self.capabilities.max_output.min(8192)),
-            ),
-            top_p: params.top_p,
+            temperature: params.temperature.filter(|_| !thinking_on),
+            max_tokens: Some(max_tokens),
+            top_p: params.top_p.filter(|_| !thinking_on),
             stop_sequences: params.stop_sequences.clone(),
             stream: Some(stream),
             tools: anthropic_tools,
             tool_choice,
+            thinking,
         }
     }
 
@@ -603,7 +695,7 @@ impl Model for AnthropicModel {
         let response = self
             .client
             .post(self.messages_url())
-            .header(header::AUTHORIZATION, self.bearer_auth())
+            .headers(self.auth_headers())
             .header(header::CONTENT_TYPE, "application/json")
             .header("anthropic-version", self.anthropic_version())
             .header("anthropic-beta", COMPACTION_BETA)
@@ -648,9 +740,7 @@ impl Model for AnthropicModel {
                 summary_message: ModelMessage {
                     role: ModelRole::User,
                     content: summary.clone(),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    thinking: None,
+                    ..Default::default()
                 },
             },
             summary_text: summary,
@@ -669,7 +759,7 @@ impl Model for AnthropicModel {
         let response = self
             .client
             .post(self.messages_url())
-            .header(header::AUTHORIZATION, self.bearer_auth())
+            .headers(self.auth_headers())
             .header(header::CONTENT_TYPE, "application/json")
             .header("anthropic-version", self.anthropic_version())
             .json(&Self::request_body(&request))
@@ -705,7 +795,7 @@ impl Model for AnthropicModel {
         let response = self
             .client
             .post(self.messages_url())
-            .header(header::AUTHORIZATION, self.bearer_auth())
+            .headers(self.auth_headers())
             .header(header::CONTENT_TYPE, "application/json")
             .header("anthropic-version", self.anthropic_version())
             .json(&Self::request_body(&request))
@@ -733,10 +823,13 @@ pub(crate) struct SseStream {
     buffer: Vec<u8>,
     pending_tool_calls: Vec<StreamingToolCall>,
     pending_thinking: StreamingThinking,
+    completed_reasoning: Vec<ReasoningBlock>,
     finished: bool,
     message_started: bool,
     input_tokens: usize,
     output_tokens: usize,
+    cache_read_tokens: usize,
+    cache_write_tokens: usize,
     truncated: bool,
 }
 
@@ -749,12 +842,42 @@ impl SseStream {
             buffer: Vec::new(),
             pending_tool_calls: Vec::new(),
             pending_thinking: StreamingThinking::default(),
+            completed_reasoning: Vec::new(),
             finished: false,
             message_started: false,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             truncated: false,
         }
+    }
+
+    /// Test helper: a stream over fixed SSE bytes.
+    #[cfg(test)]
+    fn from_bytes(data: &'static str) -> Self {
+        Self::new(futures::stream::iter(vec![Ok(Bytes::from_static(
+            data.as_bytes(),
+        ))]))
+    }
+
+    fn tool_args(input: &str) -> Value {
+        if input.trim().is_empty() {
+            return serde_json::json!({});
+        }
+        serde_json::from_str(input).unwrap_or(Value::Null)
+    }
+
+    /// Close the open thinking block (if any) into a replayable reasoning block.
+    fn finish_thinking(&mut self) -> Option<ReasoningBlock> {
+        let state = std::mem::take(&mut self.pending_thinking);
+        state.index?;
+        Some(ReasoningBlock {
+            provider: PROVIDER_TAG.to_string(),
+            text: state.thinking,
+            signature: state.signature,
+            ..Default::default()
+        })
     }
 
     /// Parse an SSE `data:` line into a [`ModelStreamChunk`].
@@ -771,89 +894,139 @@ impl SseStream {
             Ok(c) => c,
             Err(_) => return None, // skip unparseable lines
         };
+        let block_index = |c: &AnthropicStreamChunk| {
+            c.index
+                .or_else(|| c.delta.as_ref().and_then(|d| d.index))
+                .or_else(|| c.content_block.as_ref().and_then(|d| d.index))
+        };
 
         match chunk.r#type.as_str() {
             "message_start" => {
                 self.message_started = true;
                 if let Some(msg) = chunk.message {
-                    self.input_tokens = msg.usage.total_input();
-                    self.output_tokens = msg.usage.output_tokens;
+                    let usage = msg.usage.to_usage();
+                    self.input_tokens = usage.prompt_tokens;
+                    self.output_tokens = usage.completion_tokens;
+                    self.cache_read_tokens = usage.cache_read_tokens;
+                    self.cache_write_tokens = usage.cache_write_tokens;
                 }
                 None // Don't emit chunk for message_start
             }
             "content_block_start" => {
-                if let Some(delta) = chunk.delta {
-                    if delta.delta_type == "tool_use" {
-                        // Start accumulating a new tool call
-                        let index = delta.index.unwrap_or(self.pending_tool_calls.len());
+                let index = block_index(&chunk);
+                // Real API nests the block under `content_block`; older synthetic
+                // streams used `delta`.
+                let block = chunk.content_block.or(chunk.delta)?;
+                match block.delta_type.as_str() {
+                    "tool_use" => {
+                        let index = index.unwrap_or(self.pending_tool_calls.len());
+                        let mut input = String::new();
+                        // Some servers send complete input up front.
+                        if let Some(v) = &block.input
+                            && v.as_object().is_none_or(|o| !o.is_empty())
+                        {
+                            input = v.to_string();
+                        }
                         self.pending_tool_calls.push(StreamingToolCall {
                             index,
-                            id: None,
-                            name: delta.name,
-                            input: String::new(),
+                            id: block.id,
+                            name: block.name,
+                            input,
                         });
-                    } else if delta.delta_type == "thinking" {
-                        self.pending_thinking = StreamingThinking::default();
                     }
+                    "thinking" => {
+                        self.pending_thinking = StreamingThinking {
+                            index: Some(index.unwrap_or(0)),
+                            ..Default::default()
+                        };
+                    }
+                    "redacted_thinking" => {
+                        self.completed_reasoning.push(ReasoningBlock {
+                            provider: PROVIDER_TAG.to_string(),
+                            signature: block.data,
+                            redacted: true,
+                            ..Default::default()
+                        });
+                    }
+                    _ => {}
                 }
                 None
             }
             "content_block_delta" => {
-                if let Some(delta) = chunk.delta {
-                    match delta.delta_type.as_str() {
-                        "text_delta" => {
-                            if let Some(text) = delta.text {
-                                return Some(Ok(ModelStreamChunk {
-                                    delta: text,
-                                    ..Default::default()
-                                }));
-                            }
-                        }
-                        "thinking_delta" => {
-                            if let Some(thinking) = delta.thinking {
-                                self.pending_thinking.thinking.push_str(&thinking);
-                            }
-                            if let Some(signature) = delta.signature {
-                                self.pending_thinking.signature = Some(signature);
-                            }
-                        }
-                        "input_json_delta" => {
-                            if let Some(input) = delta.input {
-                                let idx = delta.index.unwrap_or(0);
-                                if let Some(tc) =
-                                    self.pending_tool_calls.iter_mut().find(|t| t.index == idx)
-                                {
-                                    tc.input.push_str(&input.to_string());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                None
-            }
-            "content_block_stop" => {
-                // Tool call or thinking block finished
-                if let Some(idx) = chunk.delta.and_then(|d| d.index) {
-                    // Check if this was a tool call
-                    if let Some(pos) = self.pending_tool_calls.iter().position(|t| t.index == idx) {
-                        let tc = self.pending_tool_calls.remove(pos);
-                        if let Some(name) = tc.name {
-                            let args = serde_json::from_str(&tc.input).unwrap_or(Value::Null);
+                let index = block_index(&chunk);
+                let delta = chunk.delta?;
+                match delta.delta_type.as_str() {
+                    "text_delta" => {
+                        if let Some(text) = delta.text {
                             return Some(Ok(ModelStreamChunk {
-                                delta: String::new(),
-                                tool_calls: Some(vec![ToolCall {
-                                    id: tc.id.unwrap_or_default(),
-                                    name,
-                                    args,
-                                    status: crate::events::ToolCallStatus::Ok,
-                                }]),
+                                delta: text,
                                 ..Default::default()
                             }));
                         }
                     }
+                    "thinking_delta" => {
+                        if let Some(thinking) = delta.thinking {
+                            self.pending_thinking.thinking.push_str(&thinking);
+                            return Some(Ok(ModelStreamChunk {
+                                thinking: Some(thinking),
+                                ..Default::default()
+                            }));
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(signature) = delta.signature {
+                            self.pending_thinking.signature = Some(signature);
+                        }
+                    }
+                    "input_json_delta" => {
+                        let fragment = delta.partial_json.or_else(|| {
+                            delta.input.map(|v| match v {
+                                Value::String(s) => s,
+                                other => other.to_string(),
+                            })
+                        });
+                        if let Some(fragment) = fragment {
+                            let tc = match index {
+                                Some(idx) => {
+                                    self.pending_tool_calls.iter_mut().find(|t| t.index == idx)
+                                }
+                                None => self.pending_tool_calls.last_mut(),
+                            };
+                            if let Some(tc) = tc {
+                                tc.input.push_str(&fragment);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 None
+            }
+            "content_block_stop" => {
+                let idx = block_index(&chunk);
+                if self.pending_thinking.index.is_some()
+                    && (idx.is_none() || idx == self.pending_thinking.index)
+                {
+                    let block = self.finish_thinking()?;
+                    return Some(Ok(ModelStreamChunk {
+                        reasoning: vec![block],
+                        ..Default::default()
+                    }));
+                }
+                let pos = match idx {
+                    Some(idx) => self.pending_tool_calls.iter().position(|t| t.index == idx),
+                    None => (!self.pending_tool_calls.is_empty()).then_some(0),
+                }?;
+                let tc = self.pending_tool_calls.remove(pos);
+                let name = tc.name?;
+                Some(Ok(ModelStreamChunk {
+                    tool_calls: Some(vec![ToolCall {
+                        id: tc.id.unwrap_or_default(),
+                        name,
+                        args: Self::tool_args(&tc.input),
+                        status: crate::events::ToolCallStatus::Ok,
+                    }]),
+                    ..Default::default()
+                }))
             }
             "message_delta" => {
                 if let Some(usage) = chunk.usage {
@@ -885,22 +1058,28 @@ impl SseStream {
         }
     }
 
-    /// Build the terminal chunk: flush pending tool calls/thinking and attach usage.
+    /// Build the terminal chunk: flush pending tool calls/reasoning and attach usage.
     fn final_chunk(&mut self) -> ModelStreamChunk {
         let tool_calls = if self.pending_tool_calls.is_empty() {
             None
         } else {
             Some(self.flush_tool_calls())
         };
+        let mut reasoning = std::mem::take(&mut self.completed_reasoning);
+        reasoning.extend(self.finish_thinking());
         let usage = (self.input_tokens > 0 || self.output_tokens > 0).then(|| Usage {
             prompt_tokens: self.input_tokens,
             completion_tokens: self.output_tokens,
             total_tokens: self.input_tokens + self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            reasoning_tokens: 0,
         });
         ModelStreamChunk {
             delta: String::new(),
             tool_calls,
-            thinking: self.flush_thinking(),
+            thinking: None,
+            reasoning,
             finished: true,
             usage,
             truncated: self.truncated,
@@ -914,7 +1093,7 @@ impl SseStream {
             .drain(..)
             .filter_map(|tc| {
                 let name = tc.name?;
-                let args = serde_json::from_str(&tc.input).unwrap_or(Value::Null);
+                let args = Self::tool_args(&tc.input);
                 Some(ToolCall {
                     id: tc.id.unwrap_or_default(),
                     name,
@@ -924,15 +1103,6 @@ impl SseStream {
             })
             .collect();
         calls
-    }
-
-    fn flush_thinking(&mut self) -> Option<String> {
-        if self.pending_thinking.thinking.is_empty() {
-            None
-        } else {
-            let thinking = std::mem::take(&mut self.pending_thinking.thinking);
-            Some(thinking)
-        }
     }
 }
 
@@ -957,17 +1127,10 @@ impl Stream for SseStream {
                     .trim_end_matches(['\r', '\n'])
                     .to_string();
 
-                if !line.is_empty() {
-                    if let Some(data) = line.strip_prefix("data: ")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    } else if let Some(data) = line.strip_prefix("data:")
-                        && let Some(result) = this.process_data_line(data)
-                    {
-                        return std::task::Poll::Ready(Some(result));
-                    }
-                    // Skip empty lines, event: lines, etc.
+                if let Some(data) = line.strip_prefix("data:")
+                    && let Some(result) = this.process_data_line(data)
+                {
+                    return std::task::Poll::Ready(Some(result));
                 }
                 continue;
             }
@@ -992,16 +1155,10 @@ impl Stream for SseStream {
                             .trim_end_matches(['\r', '\n'])
                             .to_string();
                         this.buffer.clear();
-                        if !line.is_empty() {
-                            if let Some(data) = line.strip_prefix("data: ")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            } else if let Some(data) = line.strip_prefix("data:")
-                                && let Some(result) = this.process_data_line(data)
-                            {
-                                return std::task::Poll::Ready(Some(result));
-                            }
+                        if let Some(data) = line.strip_prefix("data:")
+                            && let Some(result) = this.process_data_line(data)
+                        {
+                            return std::task::Poll::Ready(Some(result));
                         }
                     }
                     // Flush pending tool calls
@@ -1026,9 +1183,7 @@ mod tests {
         let msg = |role, content: &str| ModelMessage {
             role,
             content: content.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         };
         let msgs = vec![
             msg(ModelRole::System, "a"),
@@ -1053,9 +1208,7 @@ mod tests {
         let msg = |role, content: &str| ModelMessage {
             role,
             content: content.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         };
         let msgs = vec![msg(ModelRole::System, "sys"), msg(ModelRole::User, "hi")];
         let tools = vec![ToolSpec::new(
@@ -1087,9 +1240,7 @@ mod tests {
             messages: vec![ModelMessage {
                 role: ModelRole::User,
                 content: "hi".into(),
-                tool_calls: None,
-                tool_call_id: None,
-                thinking: None,
+                ..Default::default()
             }],
             system_prompt: String::new(),
             tools: Vec::new(),
@@ -1218,7 +1369,8 @@ mod tests {
             Some(Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
-                total_tokens: 15
+                total_tokens: 15,
+                ..Default::default()
             })
         );
     }
@@ -1306,6 +1458,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         let cost = model.estimate_cost(&usage);
         assert!((cost - 18.00).abs() < 0.001); // 3.00 + 15.00
@@ -1326,6 +1479,7 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
+            ..Default::default()
         };
         assert_eq!(model.estimate_cost(&usage), 0.0);
     }
@@ -1335,9 +1489,7 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::User,
             content: "Hello".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let (system, anthropic_msgs) = AnthropicModel::to_anthropic_messages(&messages);
         assert!(system.is_none());
@@ -1354,9 +1506,7 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::System,
             content: "You are a helpful assistant".to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         }];
         let (system, anthropic_msgs) = AnthropicModel::to_anthropic_messages(&messages);
         assert_eq!(system, Some("You are a helpful assistant".to_string()));
@@ -1368,9 +1518,8 @@ mod tests {
         let messages = vec![ModelMessage {
             role: ModelRole::Tool,
             content: "File contents here".to_string(),
-            tool_calls: None,
             tool_call_id: Some("toolu_123".to_string()),
-            thinking: None,
+            ..Default::default()
         }];
         let (system, anthropic_msgs) = AnthropicModel::to_anthropic_messages(&messages);
         assert!(system.is_none());
@@ -1381,5 +1530,171 @@ mod tests {
             AnthropicContentBlock::ToolResult { tool_use_id, content, .. }
             if tool_use_id == "toolu_123" && content == "File contents here"
         ));
+    }
+
+    async fn collect(data: &'static str) -> Vec<ModelStreamChunk> {
+        use futures::StreamExt;
+        SseStream::from_bytes(data)
+            .map(|c| c.expect("chunk"))
+            .collect()
+            .await
+    }
+
+    const TOOL_USE_STREAM: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":25,\"cache_read_input_tokens\":100,\"cache_creation_input_tokens\":10,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me look.\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a.txt\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":42}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    #[tokio::test]
+    async fn test_stream_real_tool_use_format() {
+        let chunks = collect(TOOL_USE_STREAM).await;
+        let text: String = chunks.iter().map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, "Let me look.");
+        let calls: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.tool_calls.clone())
+            .flatten()
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "toolu_01");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].args["path"], "a.txt");
+        let last = chunks.last().unwrap();
+        assert!(last.finished);
+        let usage = last.usage.clone().unwrap();
+        assert_eq!(usage.prompt_tokens, 135);
+        assert_eq!(usage.cache_read_tokens, 100);
+        assert_eq!(usage.cache_write_tokens, 10);
+        assert_eq!(usage.completion_tokens, 42);
+    }
+
+    #[tokio::test]
+    async fn test_stream_thinking_blocks_round_trip() {
+        let data = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Hmm \"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"ok.\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"OPAQUE\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let chunks = collect(data).await;
+        let thinking: String = chunks.iter().filter_map(|c| c.thinking.clone()).collect();
+        assert_eq!(thinking, "Hmm ok.");
+        let blocks: Vec<_> = chunks.iter().flat_map(|c| c.reasoning.clone()).collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].signature.as_deref(), Some("SIG"));
+        assert_eq!(blocks[0].text, "Hmm ok.");
+        assert!(blocks[1].redacted);
+
+        // Replayed to Anthropic verbatim, ahead of the text.
+        let msg = ModelMessage {
+            role: ModelRole::Assistant,
+            content: "done".into(),
+            extras: crate::model::MessageExtras {
+                reasoning: blocks,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_, out) = AnthropicModel::to_anthropic_messages(&[msg]);
+        assert!(matches!(
+            &out[0].content[0],
+            AnthropicContentBlock::Thinking { signature, .. } if signature == "SIG"
+        ));
+        assert!(matches!(
+            &out[0].content[1],
+            AnthropicContentBlock::RedactedThinking { data } if data == "OPAQUE"
+        ));
+        assert!(matches!(
+            &out[0].content[2],
+            AnthropicContentBlock::Text { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_stream_legacy_synthetic_shape_still_parses() {
+        let data = concat!(
+            "data: {\"type\":\"content_block_start\",\"delta\":{\"type\":\"tool_use\",\"name\":\"read\",\"index\":0}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"input\":\"{\\\"p\\\":1}\",\"index\":0}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"delta\":{\"index\":0}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let chunks = collect(data).await;
+        let calls: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| c.tool_calls.clone())
+            .flatten()
+            .collect();
+        assert_eq!(calls[0].args["p"], 1);
+    }
+
+    #[test]
+    fn test_other_provider_reasoning_not_replayed() {
+        let msg = ModelMessage {
+            role: ModelRole::Assistant,
+            content: "x".into(),
+            extras: crate::model::MessageExtras {
+                reasoning: vec![ReasoningBlock {
+                    provider: "openai".into(),
+                    signature: Some("enc".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_, out) = AnthropicModel::to_anthropic_messages(&[msg]);
+        assert_eq!(out[0].content.len(), 1);
+    }
+
+    #[test]
+    fn test_thinking_request_constraints_and_auth() {
+        let model = AnthropicModel::new(
+            reqwest::Client::new(),
+            DEFAULT_BASE_URL,
+            "k",
+            "claude",
+            test_capabilities(),
+            None,
+        );
+        let params = GenerationParams {
+            temperature: Some(0.2),
+            max_tokens: Some(4096),
+            reasoning: Some(crate::model::ReasoningLevel::High),
+            tool_choice: Some(ToolChoice::Required),
+            ..Default::default()
+        };
+        let msgs = vec![ModelMessage {
+            role: ModelRole::User,
+            content: "hi".into(),
+            ..Default::default()
+        }];
+        let tools = vec![ToolSpec::new(
+            "t",
+            "d",
+            serde_json::json!({"type": "object"}),
+        )];
+        let body =
+            AnthropicModel::request_body(&model.build_request(&msgs, &params, Some(&tools), true));
+        assert_eq!(body["thinking"]["budget_tokens"], 24576);
+        assert!(body["max_tokens"].as_u64().unwrap() > 24576);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+
+        let headers = model.auth_headers();
+        assert_eq!(headers["x-api-key"], "k");
+        assert!(headers.get(header::AUTHORIZATION).is_none());
     }
 }

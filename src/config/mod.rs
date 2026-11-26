@@ -236,6 +236,9 @@ pub struct Config {
     pub model: Option<ModelSection>,
     #[serde(default)]
     pub provider: Option<ProviderSection>,
+    /// Additional named providers, addressable as `model.name = "<name>/<model>"`.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub providers: std::collections::HashMap<String, ProviderSection>,
     #[serde(default)]
     pub context: Option<ContextSection>,
     #[serde(default)]
@@ -278,6 +281,14 @@ impl std::fmt::Debug for Config {
                 "provider",
                 &self.provider.as_ref().map(RedactedProviderSection),
             )
+            .field(
+                "providers",
+                &self
+                    .providers
+                    .iter()
+                    .map(|(k, v)| (k, RedactedProviderSection(v)))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
             .field("context", &self.context)
             .field("permissions", &self.permissions)
             .field("cost", &self.cost)
@@ -300,6 +311,7 @@ impl std::fmt::Debug for RedactedProviderSection<'_> {
         f.debug_struct("ProviderSection")
             .field("kind", &self.0.kind)
             .field("base_url", &self.0.base_url)
+            .field("wire_api", &self.0.wire_api)
             .field(
                 "api_key",
                 &self.0.api_key.as_ref().map(|_| "***REDACTED***"),
@@ -316,6 +328,13 @@ pub struct ModelSection {
     pub max_context: Option<usize>,
     pub max_output: Option<usize>,
     pub temperature: Option<f64>,
+    /// Reasoning effort: "off", "low", "medium" or "high". Unset keeps provider defaults.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Refresh the models.dev catalog cache in the background (default true).
+    /// `OKEANOS_OFFLINE=1` also disables it.
+    #[serde(default)]
+    pub catalog_refresh: Option<bool>,
     pub edit_format: Option<String>,
     pub skills_dir: Option<PathBuf>,
     /// Explicit model capabilities override (required for local/self-hosted models).
@@ -352,6 +371,9 @@ pub struct ModelCapabilitiesSection {
 pub struct ProviderSection {
     pub kind: Option<String>,
     pub base_url: Option<String>,
+    /// OpenAI only: "chat" (default) or "responses".
+    #[serde(default)]
+    pub wire_api: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -835,16 +857,49 @@ impl Config {
         }
 
         // Validate provider section
-        if let Some(provider) = &self.provider
-            && let Some(kind) = &provider.kind
-            && !matches!(
-                kind.as_str(),
-                "openai-compatible" | "anthropic" | "openai" | "google"
+        for (label, section) in self
+            .provider
+            .iter()
+            .map(|p| ("provider".to_string(), p))
+            .chain(
+                self.providers
+                    .iter()
+                    .map(|(k, p)| (format!("providers.{k}"), p)),
             )
+        {
+            if let Some(kind) = &section.kind
+                && !matches!(
+                    kind.as_str(),
+                    "openai-compatible" | "anthropic" | "openai" | "google"
+                )
+            {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "{label}.kind must be 'openai-compatible', 'anthropic', 'openai', or 'google', got '{kind}'"
+                    ),
+                });
+            }
+            if let Some(wire) = &section.wire_api {
+                if !matches!(wire.as_str(), "chat" | "responses") {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "{label}.wire_api must be 'chat' or 'responses', got '{wire}'"
+                        ),
+                    });
+                }
+                if wire == "responses" && section.kind.as_deref() != Some("openai") {
+                    return Err(ConfigError::Validation {
+                        message: format!("{label}.wire_api = 'responses' requires kind = 'openai'"),
+                    });
+                }
+            }
+        }
+        if let Some(r) = self.model.as_ref().and_then(|m| m.reasoning.as_deref())
+            && !matches!(r, "off" | "low" | "medium" | "high")
         {
             return Err(ConfigError::Validation {
                 message: format!(
-                    "provider.kind must be 'openai-compatible', 'anthropic', 'openai', or 'google', got '{kind}'"
+                    "model.reasoning must be 'off', 'low', 'medium', or 'high', got '{r}'"
                 ),
             });
         }
@@ -1016,82 +1071,91 @@ impl Config {
     /// If `api_key` is provided and no explicit capabilities are set, attempts to discover
     /// model metadata from OpenRouter (async version recommended for discovery).
     pub fn to_model_capabilities(&self, _api_key: Option<&str>) -> ModelCapabilities {
-        let mut caps = ModelCapabilities::default();
-
-        // Start with tier-based defaults
-        let tier = self
+        let classification = self
             .model
             .as_ref()
+            .and_then(|m| m.name.as_deref())
+            .map(crate::model::classify_model);
+        self.build_capabilities(classification)
+    }
+
+    /// Layering: tier defaults < bundled catalog < explicit config overrides.
+    /// Explicit `max_context`/`max_output`/`edit_format` always win.
+    fn build_capabilities(
+        &self,
+        classification: Option<crate::model::ModelClassification>,
+    ) -> ModelCapabilities {
+        let model = self.model.as_ref();
+        let explicit_tier = model
             .and_then(|m| m.tier.as_deref())
-            .and_then(|t| t.parse::<ModelTier>().ok())
+            .and_then(|t| t.parse::<ModelTier>().ok());
+        let tier = explicit_tier
+            .or(classification.as_ref().map(|c| c.tier))
             .unwrap_or(ModelTier::Frontier);
-        caps.tier = tier;
+        let mut caps = crate::model::default_capabilities_for_tier(tier);
 
-        // Apply tier-based defaults as baseline
-        caps = crate::model::default_capabilities_for_tier(caps.tier);
+        let Some(model) = model else {
+            return caps;
+        };
 
-        // Apply explicit capabilities if provided
-        if let Some(model) = &self.model {
-            if let Some(c) = &model.capabilities {
-                if let Some(v) = c.tool_calling {
-                    caps.tool_calling = v;
-                }
-                if let Some(v) = c.structured_output {
-                    caps.structured_output = v;
-                }
-                if let Some(v) = c.thinking {
-                    caps.thinking = v;
-                }
-                if let Some(v) = c.max_context {
-                    caps.max_context = v;
-                }
-                if let Some(v) = c.max_output {
-                    caps.max_output = v;
-                }
-                if let Some(v) = c.temperature_supported {
-                    caps.temperature_supported = v;
-                }
-                if let Some(t) = &c.tier
-                    && let Ok(parsed_tier) = t.parse::<ModelTier>()
-                {
-                    caps.tier = parsed_tier;
-                }
-                if let Some(ef) = &c.edit_format
-                    && let Ok(parsed) = ef.parse::<EditFormat>()
-                {
-                    caps.edit_format = parsed;
-                }
+        if model.capabilities.is_none()
+            && let Some(name) = &model.name
+        {
+            let model_id = crate::model::registry::resolve(self, name).1;
+            if let Some(entry) = crate::model::catalog::lookup(&model_id) {
+                caps.max_context = entry.context;
+                caps.max_output = entry.max_output;
+                caps.tool_calling = entry.tool_calling;
+                caps.thinking = entry.reasoning;
+            } else if explicit_tier.is_none()
+                && classification.as_ref().is_some_and(|c| c.confidence < 0.5)
+            {
+                // Unknown model: never assume a reasoning channel exists.
+                caps.thinking = false;
             }
+        }
 
-            // Override with model section values if set
-            if let Some(v) = model.max_context {
+        if let Some(c) = &model.capabilities {
+            if let Some(v) = c.tool_calling {
+                caps.tool_calling = v;
+            }
+            if let Some(v) = c.structured_output {
+                caps.structured_output = v;
+            }
+            if let Some(v) = c.thinking {
+                caps.thinking = v;
+            }
+            if let Some(v) = c.max_context {
                 caps.max_context = v;
             }
-            if let Some(v) = model.max_output {
+            if let Some(v) = c.max_output {
                 caps.max_output = v;
             }
-            if let Some(ef) = &model.edit_format
+            if let Some(v) = c.temperature_supported {
+                caps.temperature_supported = v;
+            }
+            if let Some(t) = &c.tier
+                && let Ok(parsed_tier) = t.parse::<ModelTier>()
+            {
+                caps.tier = parsed_tier;
+            }
+            if let Some(ef) = &c.edit_format
                 && let Ok(parsed) = ef.parse::<EditFormat>()
             {
                 caps.edit_format = parsed;
             }
+        }
 
-            // If no explicit capabilities, use auto-classification (with discovery if API key available)
-            if model.capabilities.is_none() {
-                if let Some(name) = &model.name {
-                    // Use async discovery - for sync context, fall back to static classification
-                    // In async contexts, callers should use discover_and_classify directly
-                    let classification = crate::model::classify_model(name);
-                    caps = crate::model::default_capabilities_for_tier(classification.tier);
-
-                    // If API key is provided, we could enhance this with discovered capabilities
-                    // but that requires async. For now, we use static classification.
-                    // The async discovery is available via crate::model::discover_and_classify
-                } else {
-                    // No name provided, use tier from model section or default
-                    caps = crate::model::default_capabilities_for_tier(caps.tier);
-                }
-            }
+        if let Some(v) = model.max_context {
+            caps.max_context = v;
+        }
+        if let Some(v) = model.max_output {
+            caps.max_output = v;
+        }
+        if let Some(ef) = &model.edit_format
+            && let Ok(parsed) = ef.parse::<EditFormat>()
+        {
+            caps.edit_format = parsed;
         }
 
         caps
@@ -1099,76 +1163,11 @@ impl Config {
 
     /// Async version that uses OpenRouter discovery when API key is available.
     pub async fn to_model_capabilities_async(&self, api_key: Option<&str>) -> ModelCapabilities {
-        let mut caps = ModelCapabilities::default();
-
-        let tier = self
-            .model
-            .as_ref()
-            .and_then(|m| m.tier.as_deref())
-            .and_then(|t| t.parse::<ModelTier>().ok())
-            .unwrap_or(ModelTier::Frontier);
-        caps.tier = tier;
-
-        if let Some(model) = &self.model {
-            if let Some(c) = &model.capabilities {
-                if let Some(v) = c.tool_calling {
-                    caps.tool_calling = v;
-                }
-                if let Some(v) = c.structured_output {
-                    caps.structured_output = v;
-                }
-                if let Some(v) = c.thinking {
-                    caps.thinking = v;
-                }
-                if let Some(v) = c.max_context {
-                    caps.max_context = v;
-                }
-                if let Some(v) = c.max_output {
-                    caps.max_output = v;
-                }
-                if let Some(v) = c.temperature_supported {
-                    caps.temperature_supported = v;
-                }
-                if let Some(t) = &c.tier
-                    && let Ok(parsed_tier) = t.parse::<ModelTier>()
-                {
-                    caps.tier = parsed_tier;
-                }
-                if let Some(ef) = &c.edit_format
-                    && let Ok(parsed) = ef.parse::<EditFormat>()
-                {
-                    caps.edit_format = parsed;
-                }
-            }
-
-            if let Some(v) = model.max_context {
-                caps.max_context = v;
-            }
-            if let Some(v) = model.max_output {
-                caps.max_output = v;
-            }
-            if let Some(ef) = &model.edit_format
-                && let Ok(parsed) = ef.parse::<EditFormat>()
-            {
-                caps.edit_format = parsed;
-            }
-
-            if model.capabilities.is_none() {
-                if let Some(name) = &model.name {
-                    // Use async discovery with cache
-                    let classification = crate::model::discover_and_classify(name, api_key).await;
-                    caps = crate::model::default_capabilities_for_tier(classification.tier);
-
-                    // Override with discovered capabilities if available
-                    // We'd need to fetch the full DiscoveredModel for this
-                    // For now, tier is the main signal
-                } else {
-                    caps = crate::model::default_capabilities_for_tier(caps.tier);
-                }
-            }
-        }
-
-        caps
+        let classification = match self.model.as_ref().and_then(|m| m.name.as_deref()) {
+            Some(name) => Some(crate::model::discover_and_classify(name, api_key).await),
+            None => None,
+        };
+        self.build_capabilities(classification)
     }
 
     /// Load the agent registry from project and user directories.
@@ -1792,8 +1791,37 @@ name = "gpt-4o"
             let caps = config.to_model_capabilities(None);
             assert!(caps.tool_calling);
             assert!(caps.structured_output);
-            assert_eq!(caps.max_context, 200000); // Frontier default from classifier
+            assert_eq!(caps.max_context, 128_000); // bundled catalog value
+            assert_eq!(caps.max_output, 16_384);
             assert_eq!(caps.tier, crate::model::ModelTier::Frontier);
+        }
+
+        #[test]
+        fn test_model_section_overrides_survive_catalog_and_validate_wire_api() {
+            let dir = tmp_dir();
+            let path = dir.join("config.toml");
+            write_file(
+                &path,
+                r#"
+[model]
+name = "gpt-4o"
+max_context = 50000
+reasoning = "high"
+"#,
+            );
+            let config = Config::load_from_raw(None, Some(&path)).unwrap();
+            let caps = config.to_model_capabilities(None);
+            assert_eq!(caps.max_context, 50_000);
+            assert_eq!(caps.max_output, 16_384);
+            config.validate().unwrap();
+
+            let mut bad = config.clone();
+            bad.provider = Some(ProviderSection {
+                kind: Some("anthropic".into()),
+                wire_api: Some("responses".into()),
+                ..Default::default()
+            });
+            assert!(bad.validate().is_err());
         }
 
         #[test]

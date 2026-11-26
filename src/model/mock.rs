@@ -109,6 +109,7 @@ impl MockModel {
                 prompt_tokens: 100,
                 completion_tokens: content_str.len() / 4,
                 total_tokens: 100 + content_str.len() / 4,
+                ..Default::default()
             }),
             should_error: None,
         }
@@ -128,6 +129,7 @@ impl MockModel {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                ..Default::default()
             }),
             should_error: None,
         }
@@ -180,6 +182,7 @@ impl Model for MockModel {
                 prompt_tokens: 0,
                 completion_tokens: 10,
                 total_tokens: 10,
+                ..Default::default()
             }),
             should_error: None,
         });
@@ -192,6 +195,7 @@ impl Model for MockModel {
             content: response.content,
             tool_calls: response.tool_calls,
             thinking: response.thinking,
+            reasoning: Vec::new(),
             usage: response.usage,
         })
     }
@@ -248,6 +252,7 @@ impl Model for MockModel {
                     finished,
                     usage: if finished { response.usage.clone() } else { None },
                     truncated: false,
+                    ..Default::default()
                 });
 
                 // Yield control between chunks when streaming to allow interruption

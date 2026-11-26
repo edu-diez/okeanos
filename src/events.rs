@@ -16,6 +16,9 @@ pub struct Message {
     /// Optional thinking/reasoning content (for frontier models with thinking capability).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// Reasoning blocks, images and error flag (omitted from logs when empty).
+    #[serde(default, skip_serializing_if = "crate::model::MessageExtras::is_empty")]
+    pub extras: crate::model::MessageExtras,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

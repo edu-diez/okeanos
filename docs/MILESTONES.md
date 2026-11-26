@@ -736,6 +736,14 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ Secret substitution works with `{env:VAR}` and `{file:path}` for all providers
 - ✅ Unit tests for all three providers (construction, error mapping, request/response conversion, cost estimation, streaming)
 
+**Portability follow-up (post-M19):**
+- Adapters carry provider-native reasoning (Anthropic signed thinking, OpenAI Responses encrypted reasoning, Gemini thought signatures) as `MessageExtras.reasoning`, replayed only to the originating provider; images ride the same extras (`ImagePart`), and tool results carry `is_error`.
+- `GenerationParams` gained `reasoning` (`model.reasoning = "off|low|medium|high"`) and `tool_choice`; `Usage` reports cache read/write and reasoning tokens.
+- New `OpenAIResponsesModel` (`provider.wire_api = "responses"`, openai kind only).
+- `model::registry` replaces duplicated provider construction; extra providers via `[providers.<name>]` addressed as `model.name = "<name>/<model>"`.
+- `assets/models.json` (bundled snapshot generated from models.dev, first-party providers only) feeds capabilities, pricing and tier; a user cache (`okeanos models update`, or a best-effort background refresh when older than 24h) overrides it per id. Opt out with `model.catalog_refresh = false` or `OKEANOS_OFFLINE=1`. Tier comes from capabilities (no tools/<32k/<$1 per M output = Small; >=128k and >=$2 = Frontier; else Mid); name heuristics remain only for models absent from the catalog. Regenerate the snapshot with `okeanos models update --out assets/models.json`. Layering is tier defaults < catalog < explicit config, so explicit `max_context`/`max_output`/`edit_format` always win. Unknown low-confidence models never assume a thinking channel.
+- ACP advertises `promptCapabilities.image = true`; resumed sessions keep reasoning blocks and images.
+- Known gaps: no vision-capability gating (`ModelCapabilities` has no vision flag); adapters verified by fixtures only, not live APIs.
 **Testing requirements:** Unit tests for each provider's request building, response parsing, error mapping, streaming, tool calling, cost estimation. No network (mock HTTP not needed as tests use static responses).
 
 **Definition of Done:** CI green; all three providers verified via unit tests; milestone tagged.

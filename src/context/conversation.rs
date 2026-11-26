@@ -214,7 +214,10 @@ impl Conversation {
     }
 
     fn message_tokens(&self, msg: &Message) -> usize {
+        // Images are not text; charge a flat estimate per image.
+        const IMAGE_TOKENS: usize = 1_500;
         self.scaled(self.token_counter.count_event_message(msg))
+            + msg.extras.images.len() * IMAGE_TOKENS
     }
 
     fn fixed_tokens_raw(&self) -> usize {
@@ -225,6 +228,15 @@ impl Conversation {
 
     /// Add a user message.
     pub fn add_user_message(&mut self, content: String) -> Result<(), ConversationError> {
+        self.add_user_message_with_images(content, Vec::new())
+    }
+
+    /// Add a user message with attached images.
+    pub fn add_user_message_with_images(
+        &mut self,
+        content: String,
+        images: Vec<crate::model::ImagePart>,
+    ) -> Result<(), ConversationError> {
         let msg = Message {
             role: MessageRole::User,
             content,
@@ -232,6 +244,10 @@ impl Conversation {
             tool_call_id: None,
             ts: current_timestamp(),
             thinking: None,
+            extras: crate::model::MessageExtras {
+                images,
+                ..Default::default()
+            },
         };
         self.add_message(msg)
     }
@@ -243,6 +259,17 @@ impl Conversation {
         tool_calls: Option<Vec<crate::events::ToolCall>>,
         thinking: Option<String>,
     ) -> Result<(), ConversationError> {
+        self.add_assistant_message_with(content, tool_calls, thinking, Default::default())
+    }
+
+    /// Add an assistant message carrying provider reasoning blocks.
+    pub fn add_assistant_message_with(
+        &mut self,
+        content: String,
+        tool_calls: Option<Vec<crate::events::ToolCall>>,
+        thinking: Option<String>,
+        extras: crate::model::MessageExtras,
+    ) -> Result<(), ConversationError> {
         let msg = Message {
             role: MessageRole::Assistant,
             content,
@@ -250,6 +277,7 @@ impl Conversation {
             tool_call_id: None,
             ts: current_timestamp(),
             thinking,
+            extras,
         };
         self.add_message(msg)
     }
@@ -260,6 +288,16 @@ impl Conversation {
         content: String,
         tool_call_id: String,
     ) -> Result<(), ConversationError> {
+        self.add_tool_message_with_status(content, tool_call_id, false)
+    }
+
+    /// Add a tool result message, flagging failures so providers can mark them as errors.
+    pub fn add_tool_message_with_status(
+        &mut self,
+        content: String,
+        tool_call_id: String,
+        is_error: bool,
+    ) -> Result<(), ConversationError> {
         let msg = Message {
             role: MessageRole::Tool,
             content,
@@ -267,7 +305,16 @@ impl Conversation {
             tool_call_id: Some(tool_call_id),
             ts: current_timestamp(),
             thinking: None,
+            extras: crate::model::MessageExtras {
+                is_error,
+                ..Default::default()
+            },
         };
+        self.add_message(msg)
+    }
+
+    /// Re-add a message loaded from a session log (keeps reasoning blocks and images).
+    pub fn add_restored_message(&mut self, msg: Message) -> Result<(), ConversationError> {
         self.add_message(msg)
     }
 
@@ -448,12 +495,15 @@ impl Conversation {
         result.push(crate::model::ModelMessage {
             role: crate::model::ModelRole::System,
             content: self.system_prompt.clone(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         });
 
         for msg in &self.messages {
+            let mut extras = msg.extras.clone();
+            // Provider reasoning blocks only matter for models that think.
+            if !self.capabilities.thinking {
+                extras.reasoning.clear();
+            }
             result.push(crate::model::ModelMessage {
                 role: match msg.role {
                     MessageRole::User => crate::model::ModelRole::User,
@@ -470,6 +520,7 @@ impl Conversation {
                 } else {
                     None
                 },
+                extras,
             });
         }
 

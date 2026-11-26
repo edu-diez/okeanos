@@ -692,6 +692,7 @@ mod tests {
             tool_call_id: None,
             ts: 1,
             thinking: None,
+            extras: Default::default(),
         };
         pane.handle_event(&crate::events::Event::Message(msg));
         assert_eq!(pane.len(), 1);
@@ -707,6 +708,7 @@ mod tests {
             tool_call_id: None,
             ts: 1,
             thinking: None,
+            extras: Default::default(),
         };
         pane.handle_event(&crate::events::Event::Message(msg));
         assert_eq!(pane.len(), 1);
@@ -722,6 +724,7 @@ mod tests {
             tool_call_id: None,
             ts: 1,
             thinking: None,
+            extras: Default::default(),
         };
         pane.handle_event(&crate::events::Event::Message(msg));
         pane.handle_event(&crate::events::Event::Token(crate::events::Token {
@@ -749,6 +752,7 @@ mod tests {
             tool_call_id: None,
             ts: 1,
             thinking: None,
+            extras: Default::default(),
         };
         pane.handle_event(&crate::events::Event::Message(msg));
 
@@ -790,6 +794,7 @@ mod tests {
                 tool_call_id: None,
                 ts: i as u64,
                 thinking: None,
+                extras: Default::default(),
             }));
         }
         pane.scroll_to_bottom();
@@ -811,6 +816,7 @@ mod tests {
                 tool_call_id: None,
                 ts: i as u64,
                 thinking: None,
+                extras: Default::default(),
             }));
         }
         pane.scroll_to_bottom();

@@ -48,6 +48,7 @@ impl TierConfig {
                 max_tokens: Some(2048),
                 stop_sequences: None,
                 top_p: Some(0.9),
+                ..Default::default()
             },
             selective_context: SelectiveContextConfig {
                 max_files: 5,
@@ -78,6 +79,7 @@ impl TierConfig {
                 max_tokens: Some(4096),
                 stop_sequences: None,
                 top_p: Some(0.95),
+                ..Default::default()
             },
             selective_context: SelectiveContextConfig {
                 max_files: 10,
@@ -108,6 +110,7 @@ impl TierConfig {
                 max_tokens: Some(8192),
                 stop_sequences: None,
                 top_p: Some(0.95),
+                ..Default::default()
             },
             selective_context: SelectiveContextConfig {
                 max_files: 20,

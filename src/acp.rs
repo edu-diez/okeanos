@@ -25,6 +25,7 @@ pub enum AcpRequest {
         id: Value,
         session_id: String,
         text: String,
+        images: Vec<crate::model::ImagePart>,
     },
     Cancel {
         session_id: String,
@@ -64,6 +65,7 @@ pub fn parse_request(line: &str) -> Result<AcpRequest, String> {
             id,
             session_id: session_id()?,
             text: prompt_text(&params),
+            images: prompt_images(&params),
         },
         ("session/cancel", _) => AcpRequest::Cancel {
             session_id: session_id()?,
@@ -88,6 +90,31 @@ fn prompt_text(params: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Inline base64 image blocks of a prompt (`data` + `mimeType`); other block
+/// types, URI-only images and non-image MIME types are ignored.
+fn prompt_images(params: &Value) -> Vec<crate::model::ImagePart> {
+    params
+        .get("prompt")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+                .filter_map(|b| {
+                    let data = b.get("data").and_then(Value::as_str)?;
+                    let media_type = b.get("mimeType").and_then(Value::as_str)?;
+                    (media_type.starts_with("image/") && !data.is_empty()).then(|| {
+                        crate::model::ImagePart {
+                            media_type: media_type.to_string(),
+                            data: data.to_string(),
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn response(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -102,7 +129,7 @@ pub fn initialize_result() -> Value {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
             "loadSession": false,
-            "promptCapabilities": {"image": false, "audio": false, "embeddedContext": false}
+            "promptCapabilities": {"image": true, "audio": false, "embeddedContext": false}
         },
         "authMethods": []
     })
@@ -234,7 +261,8 @@ mod tests {
         );
         let p = parse_request(
             r#"{"id":"a","method":"session/prompt","params":{"sessionId":"s1","prompt":[
-                {"type":"text","text":"hi"},{"type":"image","data":"x"},{"type":"text","text":"there"}]}}"#,
+                {"type":"text","text":"hi"},{"type":"image","data":"QUJD","mimeType":"image/png"},
+                {"type":"image","data":"x"},{"type":"text","text":"there"}]}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -242,7 +270,11 @@ mod tests {
             AcpRequest::Prompt {
                 id: json!("a"),
                 session_id: "s1".into(),
-                text: "hi\nthere".into()
+                text: "hi\nthere".into(),
+                images: vec![crate::model::ImagePart {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into()
+                }],
             }
         );
         assert!(matches!(

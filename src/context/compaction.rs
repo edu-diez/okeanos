@@ -718,6 +718,7 @@ impl CompactionManager {
             tool_call_id: None,
             ts: current_timestamp(),
             thinking: None,
+            extras: Default::default(),
         }];
         new_messages.extend(conversation.messages()[plan.cut_index..].iter().cloned());
         conversation.replace_messages(new_messages);
@@ -925,6 +926,7 @@ fn to_model_message(m: &Message) -> ModelMessage {
         tool_calls: m.tool_calls.clone(),
         tool_call_id: m.tool_call_id.clone(),
         thinking: None,
+        extras: Default::default(),
     }
 }
 
@@ -1100,16 +1102,12 @@ pub async fn summarize_plan<M: Model + ?Sized>(
         ModelMessage {
             role: ModelRole::System,
             content: SUMMARIZER_SYSTEM_PROMPT.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         },
         ModelMessage {
             role: ModelRole::User,
             content: build_summary_request(plan),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         },
     ];
     let params = crate::model::GenerationParams {
@@ -1117,6 +1115,7 @@ pub async fn summarize_plan<M: Model + ?Sized>(
         max_tokens: Some(plan.max_output_tokens),
         stop_sequences: None,
         top_p: Some(0.9),
+        ..Default::default()
     };
     let response = model.complete(&messages, &params, None).await?;
     let text = response.content.trim().to_string();
@@ -1264,6 +1263,7 @@ mod tests {
             tool_call_id: None,
             ts: 0,
             thinking: None,
+            extras: Default::default(),
         }];
         let ops = extract_file_ops(&msgs);
         assert_eq!(ops.read_files, vec!["c", "a"]);
@@ -1441,6 +1441,7 @@ mod tests {
             tool_call_id: None,
             ts: 0,
             thinking: None,
+            extras: Default::default(),
         };
         assert_eq!(previous_summary_body(&msg).as_deref(), Some("body text"));
     }
@@ -1455,6 +1456,7 @@ mod tests {
                 tool_call_id: Some("c".into()),
                 ts: 0,
                 thinking: None,
+                extras: Default::default(),
             })
             .collect();
         let out = render_messages(&msgs, 10_000);

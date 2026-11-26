@@ -857,10 +857,11 @@ impl<M: Model + 'static> ReactLoop<M> {
         &mut self,
         output: String,
         id: String,
+        is_error: bool,
     ) -> Result<(), ReactError> {
-        let Err(first) = self
-            .conversation
-            .add_tool_message(output.clone(), id.clone())
+        let Err(first) =
+            self.conversation
+                .add_tool_message_with_status(output.clone(), id.clone(), is_error)
         else {
             return Ok(());
         };
@@ -868,7 +869,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             let _ = self.compact_with(CompactionTrigger::OverflowRecovery).await;
             if self
                 .conversation
-                .add_tool_message(output.clone(), id.clone())
+                .add_tool_message_with_status(output.clone(), id.clone(), is_error)
                 .is_ok()
             {
                 return Ok(());
@@ -880,7 +881,8 @@ impl<M: Model + 'static> ReactLoop<M> {
             return Err(first.into());
         }
         let (clipped, _) = crate::tool::builtin::truncate_output(&output, keep);
-        self.conversation.add_tool_message(clipped, id)?;
+        self.conversation
+            .add_tool_message_with_status(clipped, id, is_error)?;
         Ok(())
     }
 
@@ -1007,7 +1009,18 @@ impl<M: Model + 'static> ReactLoop<M> {
         prompt: String,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
-        let result = self.run_turn_inner(prompt, shutdown_rx).await;
+        self.run_turn_with_images(prompt, Vec::new(), shutdown_rx)
+            .await
+    }
+
+    /// Like [`run_turn`](Self::run_turn), attaching images to the user message.
+    pub async fn run_turn_with_images(
+        &mut self,
+        prompt: String,
+        images: Vec<crate::model::ImagePart>,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<LoopDecision, ReactError> {
+        let result = self.run_turn_inner(prompt, images, shutdown_rx).await;
         if !matches!(result, Ok(LoopDecision::Complete(_))) {
             // Dropping the handles aborts any sub-agent still running.
             self.subagent_handles.clear();
@@ -1018,6 +1031,7 @@ impl<M: Model + 'static> ReactLoop<M> {
     async fn run_turn_inner(
         &mut self,
         prompt: String,
+        images: Vec<crate::model::ImagePart>,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
         let prompt = match self.begin_prompt(prompt).await {
@@ -1031,7 +1045,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         // Expand @file mentions (and optional scan) into the user message
         let prompt = self.expand_prompt(&prompt).await;
         self.conversation
-            .add_user_message(prompt)
+            .add_user_message_with_images(prompt, images)
             .context("failed to add user prompt")?;
 
         // Emit status update
@@ -1133,10 +1147,14 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         // Add assistant message to conversation
         self.conversation
-            .add_assistant_message(
+            .add_assistant_message_with(
                 response.content.clone(),
                 response.tool_calls.clone(),
                 response.thinking.clone(),
+                crate::model::MessageExtras {
+                    reasoning: response.reasoning.clone(),
+                    ..Default::default()
+                },
             )
             .context("failed to add assistant message")?;
 
@@ -1154,6 +1172,10 @@ impl<M: Model + 'static> ReactLoop<M> {
             tool_call_id: None,
             ts: current_timestamp(),
             thinking: response.thinking.clone(),
+            extras: crate::model::MessageExtras {
+                reasoning: response.reasoning.clone(),
+                ..Default::default()
+            },
         })
         .await;
 
@@ -1236,10 +1258,14 @@ impl<M: Model + 'static> ReactLoop<M> {
 
                 // Add assistant message from fallback attempt.
                 self.conversation
-                    .add_assistant_message(
+                    .add_assistant_message_with(
                         simpler_response.content.clone(),
                         simpler_response.tool_calls.clone(),
                         simpler_response.thinking.clone(),
+                        crate::model::MessageExtras {
+                            reasoning: simpler_response.reasoning.clone(),
+                            ..Default::default()
+                        },
                     )
                     .context("failed to add fallback assistant message")?;
                 self.emit_message(Message {
@@ -1249,6 +1275,10 @@ impl<M: Model + 'static> ReactLoop<M> {
                     tool_call_id: None,
                     ts: current_timestamp(),
                     thinking: simpler_response.thinking.clone(),
+                    extras: crate::model::MessageExtras {
+                        reasoning: simpler_response.reasoning.clone(),
+                        ..Default::default()
+                    },
                 })
                 .await;
 
@@ -1365,9 +1395,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         messages.push(ModelMessage {
             role: ModelRole::System,
             content: simpler_prompt.to_string(),
-            tool_calls: None,
-            tool_call_id: None,
-            thinking: None,
+            ..Default::default()
         });
 
         // Include recent history only (fewer turns for simpler prompt).
@@ -1387,6 +1415,11 @@ impl<M: Model + 'static> ReactLoop<M> {
                 tool_call_id: msg.tool_call_id.clone(),
                 // For simpler prompt (Small tier), don't include thinking
                 thinking: None,
+                extras: crate::model::MessageExtras {
+                    images: msg.extras.images.clone(),
+                    is_error: msg.extras.is_error,
+                    ..Default::default()
+                },
             });
         }
 
@@ -1465,6 +1498,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             let mut content = String::new();
             let mut tool_calls: Option<Vec<ToolCall>> = None;
             let mut thinking: Option<String> = None;
+            let mut reasoning: Vec<crate::model::ReasoningBlock> = Vec::new();
             let mut usage: Option<crate::model::Usage> = None;
             let mut finished = false;
 
@@ -1503,7 +1537,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                             tool_calls.get_or_insert_with(Vec::new).extend(tc);
                         }
                         if let Some(th) = chunk.thinking {
-                            thinking = Some(th.clone());
+                            thinking.get_or_insert_with(String::new).push_str(&th);
                             // Emit thinking event for TUI/headless parity
                             let thinking_event =
                                 crate::events::Event::thinking(th, current_timestamp());
@@ -1512,6 +1546,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                                 let _ = session.lock().unwrap().log_event(thinking_event);
                             }
                         }
+                        reasoning.extend(chunk.reasoning);
                         if chunk.usage.is_some() {
                             usage = chunk.usage;
                         }
@@ -1553,6 +1588,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
+                    ..Default::default()
                 }
             });
 
@@ -1560,6 +1596,7 @@ impl<M: Model + 'static> ReactLoop<M> {
                 content,
                 tool_calls,
                 thinking,
+                reasoning,
                 usage: Some(usage),
             });
         }
@@ -2059,7 +2096,7 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Add a tool result to the conversation and emit its event.
     async fn record_tool_result(&mut self, result: ToolResult) -> Result<(), ReactError> {
-        self.add_tool_result_message(result.output.clone(), result.id.clone())
+        self.add_tool_result_message(result.output.clone(), result.id.clone(), !result.ok)
             .await?;
         self.emit_tool_result(result).await;
         Ok(())
