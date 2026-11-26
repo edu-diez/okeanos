@@ -486,6 +486,15 @@ impl Hooks {
 mod tests {
     use super::*;
 
+    /// `echo` a JSON document portably (sh strips bare double quotes).
+    fn echo_json(json: &str) -> String {
+        if cfg!(windows) {
+            format!("echo {json}")
+        } else {
+            format!("echo '{json}'")
+        }
+    }
+
     fn cfg(event: HookEvent, matcher: Option<&str>, command: &str) -> HookConfig {
         HookConfig {
             event,
@@ -568,8 +577,8 @@ mod tests {
 
     #[tokio::test]
     async fn json_stdout_decides_and_rewrites_input() {
-        let cmd = r#"echo {"decision":"allow","updated_input":{"path":"safe.txt"}}"#;
-        let hooks = Hooks::new(&[cfg(HookEvent::PreToolUse, None, cmd)], None).unwrap();
+        let cmd = echo_json(r#"{"decision":"allow","updated_input":{"path":"safe.txt"}}"#);
+        let hooks = Hooks::new(&[cfg(HookEvent::PreToolUse, None, &cmd)], None).unwrap();
         let out = hooks.pre_tool_use("write", &json!({"path": "x"})).await;
         assert_eq!(out.decision, HookDecision::Allow);
         assert_eq!(out.updated_input, Some(json!({"path": "safe.txt"})));
@@ -577,9 +586,10 @@ mod tests {
 
     #[tokio::test]
     async fn ask_beats_allow_and_block_beats_all() {
-        let allow = r#"echo {"decision":"allow"}"#;
-        let ask = r#"echo {"decision":"ask"}"#;
-        let deny = r#"echo {"decision":"deny","reason":"no"}"#;
+        let allow = echo_json(r#"{"decision":"allow"}"#);
+        let ask = echo_json(r#"{"decision":"ask"}"#);
+        let deny = echo_json(r#"{"decision":"deny","reason":"no"}"#);
+        let (allow, ask, deny) = (allow.as_str(), ask.as_str(), deny.as_str());
         let hooks = Hooks::new(
             &[
                 cfg(HookEvent::PreToolUse, None, allow),

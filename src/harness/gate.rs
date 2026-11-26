@@ -78,11 +78,16 @@ mod tests {
     }
 
     fn hooks(command: &str) -> Hooks {
+        // JSON payloads are passed as `echo {...}`; quote them for sh.
+        let command = match command.strip_prefix("echo {") {
+            Some(rest) if !cfg!(windows) => format!("echo '{{{rest}'"),
+            _ => command.to_string(),
+        };
         Hooks::new(
             &[HookConfig {
                 event: HookEvent::PreToolUse,
                 matcher: None,
-                command: command.into(),
+                command,
                 timeout_secs: Some(5),
                 fail_closed: false,
             }],
