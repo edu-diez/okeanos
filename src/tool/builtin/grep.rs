@@ -166,8 +166,12 @@ fn search(p: &Params) -> Result<(Vec<String>, bool), ToolError> {
     let mut matches = 0usize;
     let mut capped = false;
 
+    let protect = crate::tool::workspace::protects_secrets();
     'files: for entry in walker.build().flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if protect && crate::tool::workspace::is_secret_path(entry.path()) {
             continue;
         }
         let Ok(bytes) = std::fs::read(entry.path()) else {

@@ -23,6 +23,7 @@ pub struct StatusBar {
     reduced_motion: bool,
     last_render: Instant,
     mode: String, // "interactive" | "headless" | "rpc"
+    permission: Option<crate::harness::ModeHandle>,
     width: u16,
 }
 
@@ -35,7 +36,28 @@ impl StatusBar {
             reduced_motion,
             last_render: Instant::now(),
             mode: "interactive".to_string(),
+            permission: None,
             width: 80,
+        }
+    }
+
+    /// Show the live permission mode (Shift+Tab cycles it).
+    pub fn set_permission_mode(&mut self, handle: crate::harness::ModeHandle) {
+        self.permission = Some(handle);
+    }
+
+    fn permission_span(&self) -> Span<'static> {
+        match &self.permission {
+            Some(h) => {
+                let mode = h.get();
+                let role = match mode {
+                    crate::harness::PermissionMode::Yolo => SemanticRole::Error,
+                    crate::harness::PermissionMode::Default => SemanticRole::CanvasMuted,
+                    _ => SemanticRole::Tool,
+                };
+                Span::styled(format!("[{mode}]"), self.theme.style(role))
+            }
+            None => Span::raw(""),
         }
     }
 
@@ -143,6 +165,8 @@ impl StatusBar {
             Span::styled(status.retries.to_string(), self.retry_style(status.retries)),
             Span::raw(" "),
             self.mode_dot(),
+            Span::raw(" "),
+            self.permission_span(),
         ])
     }
 
@@ -182,6 +206,8 @@ impl StatusBar {
             Span::raw("  "),
             Span::styled("mode: ", self.theme.style(SemanticRole::CanvasMuted)),
             Span::styled(self.mode.clone(), self.theme.style(SemanticRole::Tool)),
+            Span::raw("  "),
+            self.permission_span(),
         ])
     }
 

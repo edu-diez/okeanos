@@ -110,6 +110,7 @@ impl Tool for RunTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
+        crate::tool::workspace::guard_run(command, &args_vec)?;
         let wrapped = crate::tool::sandbox::apply(command, &args_vec)?;
         let mut cmd = Command::new(&wrapped.program);
         cmd.args(&wrapped.args);

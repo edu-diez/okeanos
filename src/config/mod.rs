@@ -11,6 +11,7 @@
 
 mod agent_profile;
 mod secret;
+pub mod trust;
 
 #[cfg(feature = "config-file")]
 pub mod file_load {
@@ -86,7 +87,26 @@ pub mod file_load {
         global: Option<&Path>,
         project: Option<&Path>,
     ) -> Result<Config, ConfigError> {
+        load_merged(global, project, false).map(|(c, _)| c)
+    }
+
+    /// Load with the project overlay reduced to safe, restrictive settings.
+    pub(crate) fn load_untrusted(
+        global: Option<&Path>,
+        project: Option<&Path>,
+    ) -> Result<Config, ConfigError> {
+        let (mut config, dropped) = load_merged(global, project, true)?;
+        config.dropped_project_keys = dropped;
+        Ok(config)
+    }
+
+    fn load_merged(
+        global: Option<&Path>,
+        project: Option<&Path>,
+        sanitize: bool,
+    ) -> Result<(Config, Vec<String>), ConfigError> {
         let mut merged = toml::Value::Table(Default::default());
+        let mut dropped = Vec::new();
 
         if let Some(path) = global {
             let text = read_file(path)?;
@@ -96,7 +116,12 @@ pub mod file_load {
 
         if let Some(path) = project {
             let text = read_file(path)?;
-            let value = parse_toml(path, &text)?;
+            let mut value = parse_toml(path, &text)?;
+            if sanitize {
+                let (safe, d) = super::trust::sanitize_untrusted(value);
+                value = safe;
+                dropped = d;
+            }
             merged = deep_merge(merged, value);
         }
 
@@ -109,10 +134,8 @@ pub mod file_load {
             message: format!("failed to deserialize configuration: {e}"),
         })?;
 
-        Ok(config)
+        Ok((config, dropped))
     }
-
-    /// Discover the XDG global config path.
     pub fn discover_global_config() -> Option<PathBuf> {
         let config_home = std::env::var("XDG_CONFIG_HOME")
             .ok()
@@ -238,6 +261,12 @@ pub struct Config {
     /// Lifecycle hooks ([[hooks]]).
     #[serde(default)]
     pub hooks: Vec<crate::harness::hooks::HookConfig>,
+    /// Trust state of the project-level config (not read from files).
+    #[serde(skip)]
+    pub project_trust: trust::ProjectTrust,
+    /// Settings dropped from an untrusted project config.
+    #[serde(skip)]
+    pub dropped_project_keys: Vec<String>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -344,6 +373,16 @@ pub struct PermissionsSection {
     pub sandbox: Option<String>,
     /// Allow network access inside the sandbox (default: false).
     pub sandbox_network: Option<bool>,
+    /// Rules that are always refused, e.g. `run:git push*`, `write:src/secret/**`.
+    pub deny: Option<Vec<String>>,
+    /// Rules that always prompt, even in `yolo` mode or with a grant.
+    pub ask: Option<Vec<String>>,
+    /// Rules that are auto-approved (same syntax as `deny`).
+    pub allow: Option<Vec<String>>,
+    /// Permission mode: "default", "accept-edits", "plan" or "yolo".
+    pub mode: Option<String>,
+    /// Block reading credential files such as `.env`, `~/.ssh/*` (default: true).
+    pub protect_secrets: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -610,7 +649,16 @@ impl Config {
     pub fn load_raw(root: Option<&Path>) -> Result<Self, ConfigError> {
         let global = discover_global_config();
         let project = discover_project_config(root);
-        Self::load_from_raw(global.as_deref(), project.as_deref())
+        let dir = trust::project_dir(root);
+        let state = trust::status(&dir);
+        if state.is_untrusted() {
+            let mut config = file_load::load_untrusted(global.as_deref(), project.as_deref())?;
+            config.project_trust = state;
+            return Ok(config);
+        }
+        let mut config = Self::load_from_raw(global.as_deref(), project.as_deref())?;
+        config.project_trust = state;
+        Ok(config)
     }
 
     /// Load from explicit paths without validation (primarily for tests).
@@ -930,6 +978,23 @@ impl Config {
                 })?;
         }
 
+        if let Some(p) = &self.permissions {
+            crate::harness::rules::Rules::parse(
+                p.deny.as_deref().unwrap_or_default(),
+                p.ask.as_deref().unwrap_or_default(),
+                p.allow.as_deref().unwrap_or_default(),
+            )
+            .map_err(|message| ConfigError::Validation {
+                message: format!("permissions: {message}"),
+            })?;
+            if let Some(mode) = p.mode.as_deref() {
+                mode.parse::<crate::harness::policy::PermissionMode>()
+                    .map_err(|message| ConfigError::Validation {
+                        message: format!("permissions.mode: {message}"),
+                    })?;
+            }
+        }
+
         // Validate memory section
         if let Some(memory) = &self.memory {
             if memory.max_instruction_bytes == Some(0) {
@@ -1118,7 +1183,13 @@ impl Config {
         let project_dir = agents_section
             .and_then(|a| a.project_dir.as_deref())
             .map(PathBuf::from)
-            .or_else(|| file_load::discover_project_agents_dir(None));
+            .or_else(|| {
+                if self.project_trust.is_untrusted() {
+                    None
+                } else {
+                    file_load::discover_project_agents_dir(None)
+                }
+            });
 
         let user_dir = agents_section
             .and_then(|a| a.user_dir.as_deref())

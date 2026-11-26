@@ -71,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Doctor) => {
             return cmd_doctor(&cli).await;
         }
+        Some(Command::Trust { revoke }) => {
+            return cmd_trust(&cli, *revoke);
+        }
         Some(Command::Sessions) => {
             return cmd_sessions(&cli).await;
         }
@@ -209,11 +212,22 @@ fn build_summarizer(config: &Config) -> Option<Arc<dyn Model>> {
 }
 
 async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()> {
-    let config = Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+    let mut config =
+        Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+    if handle_untrusted_project(cli, &config) {
+        config = Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+    }
     config
         .validate()
         .context("configuration validation failed")?;
     tracing::info!("configuration loaded");
+    okeanos::tool::workspace::set_protect_secrets(
+        config
+            .permissions
+            .as_ref()
+            .and_then(|p| p.protect_secrets)
+            .unwrap_or(true),
+    );
 
     let mut write_roots = vec![
         cli.root
@@ -382,6 +396,17 @@ max_elapsed_sec = 300
 # Allow-list of tools that can run without approval
 # Tools not on this list require interactive approval
 allow_list = ["todo", "read", "grep"]
+# Rules: `tool` or `tool:pattern` (`*`/`?` wildcards). Evaluation: deny > ask > allow.
+# `run` patterns match the program and subcommand, so `run:git push*` also catches
+# `git -C repo push`. Paths for file tools are matched relative to the project.
+# deny = ["run:git push*", "write:secrets/**"]
+# ask = ["run:git commit*"]   # always prompts, even in yolo mode
+# allow = ["run:cargo test*", "run:cargo check*"]
+# Mode: "default", "accept-edits" (auto-approve file edits), "plan" (read-only), "yolo".
+# Shift+Tab cycles it in the TUI; --permission-mode overrides.
+# mode = "default"
+# Refuse to read .env*, ~/.ssh, key files, token files (default: true).
+# protect_secrets = true
 # OS sandbox for `run`: "none" (default), "read-only" or "workspace-write".
 # Linux needs bwrap, macOS uses sandbox-exec; unsupported platforms refuse to run.
 # sandbox = "workspace-write"
@@ -508,6 +533,63 @@ async fn cmd_doctor(cli: &Cli) -> anyhow::Result<()> {
         println!("✓ API Key: Present (validity check requires network)");
     } else {
         println!("⚠ API Key: Not configured (mock provider will be used)");
+    }
+    println!();
+
+    // Permissions, sandbox and project trust
+    println!("Permissions:");
+    if let Ok(config) = &config_result {
+        let perms = config.permissions.as_ref();
+        let mode = cli
+            .permission_mode
+            .as_deref()
+            .or(perms.and_then(|p| p.mode.as_deref()))
+            .unwrap_or("default");
+        println!("  └─ Mode: {mode}");
+        println!(
+            "  └─ Rules: {} deny, {} ask, {} allow",
+            perms.and_then(|p| p.deny.as_ref()).map_or(0, Vec::len),
+            perms.and_then(|p| p.ask.as_ref()).map_or(0, Vec::len),
+            perms.and_then(|p| p.allow.as_ref()).map_or(0, Vec::len)
+                + perms
+                    .and_then(|p| p.allow_list.as_ref())
+                    .map_or(0, Vec::len),
+        );
+        println!(
+            "  └─ Credential-file protection: {}",
+            if perms.and_then(|p| p.protect_secrets).unwrap_or(true) {
+                "on"
+            } else {
+                "OFF"
+            }
+        );
+        let sandbox_mode = perms.and_then(|p| p.sandbox.as_deref()).unwrap_or("none");
+        let (available, detail) = okeanos::tool::sandbox::availability();
+        if sandbox_mode == "none" {
+            let hint = if available {
+                "set permissions.sandbox = \"workspace-write\" to enable"
+            } else {
+                "unavailable here"
+            };
+            println!("⚠ Sandbox: off ({hint}); {detail}");
+        } else if available {
+            println!("✓ Sandbox: {sandbox_mode} ({detail})");
+        } else {
+            println!("✗ Sandbox: {sandbox_mode} requested but {detail}");
+        }
+        match &config.project_trust {
+            okeanos::config::trust::ProjectTrust::NoProjectFiles => {
+                println!("✓ Project trust: no project config files");
+            }
+            okeanos::config::trust::ProjectTrust::Trusted => {
+                println!("✓ Project trust: trusted");
+            }
+            okeanos::config::trust::ProjectTrust::Untrusted { .. } => {
+                println!(
+                    "⚠ Project trust: NOT trusted (hooks, MCP servers, agents ignored); run `okeanos trust`"
+                );
+            }
+        }
     }
     println!();
 
@@ -901,7 +983,8 @@ async fn run_interactive_tui(
         .as_ref()
         .and_then(|p| p.allow_list.clone())
         .unwrap_or_else(|| vec!["todo".to_string()]);
-    let policy = Policy::new(allow_list);
+    let policy = build_policy(config, cli, allow_list);
+    let permission_mode = policy.mode_handle();
 
     // Configure ReAct loop from config + CLI overrides
     let react_config = ReactConfig {
@@ -944,6 +1027,7 @@ async fn run_interactive_tui(
         .context("failed to create TUI app")?;
 
     // Set provider/model configuration status for welcome screen
+    tui_app.set_permission_mode(permission_mode);
     tui_app.set_config_status(provider_configured, configured_model);
 
     // Get the approval receiver from the TUI app for the ReAct loop
@@ -1585,7 +1669,7 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
         .as_ref()
         .and_then(|p| p.allow_list.clone())
         .unwrap_or_else(|| vec!["todo".to_string()]);
-    let policy = Policy::new(allow_list);
+    let policy = build_policy(config, cli, allow_list);
 
     // Channel for external approval decisions (TUI modal, RPC `approve`/`deny`, headless stdin).
     // ReactLoop waits for Approval on this receiver.
@@ -2050,7 +2134,7 @@ async fn acp_new_session(
     };
 
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
-        .with_policy(Policy::new(allow_list))
+        .with_policy(build_policy(config, cli, allow_list))
         .with_hooks(build_hooks(config, &project_root))
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
@@ -2255,6 +2339,83 @@ async fn run_acp(cli: &Cli, config: &Config) -> anyhow::Result<()> {
 }
 
 /// Compile [[hooks]] from config; invalid hooks are reported and skipped.
+/// Build the permission policy: allow-list and `allow`/`ask`/`deny` rules from
+/// config, with the mode from `--permission-mode` or `permissions.mode`.
+fn build_policy(config: &Config, cli: &Cli, allow_list: Vec<String>) -> Policy {
+    use okeanos::harness::{PermissionMode, Rules};
+    let perms = config.permissions.as_ref();
+    let list = |v: Option<&Vec<String>>| v.cloned().unwrap_or_default();
+    let rules = Rules::parse(
+        &list(perms.and_then(|p| p.deny.as_ref())),
+        &list(perms.and_then(|p| p.ask.as_ref())),
+        &list(perms.and_then(|p| p.allow.as_ref())),
+    )
+    .unwrap_or_default();
+    let mode = cli
+        .permission_mode
+        .as_deref()
+        .or(perms.and_then(|p| p.mode.as_deref()))
+        .and_then(|m| m.parse::<PermissionMode>().ok())
+        .unwrap_or_default();
+    Policy::new(allow_list).with_rules(rules).with_mode(mode)
+}
+
+/// `okeanos trust [--revoke]`.
+fn cmd_trust(cli: &Cli, revoke: bool) -> anyhow::Result<()> {
+    use okeanos::config::trust;
+    let dir = trust::project_dir(cli.root.as_deref());
+    if revoke {
+        if trust::revoke(&dir).map_err(anyhow::Error::msg)? {
+            println!("Revoked trust for {}", dir.display());
+        } else {
+            println!("{} was not trusted", dir.display());
+        }
+        return Ok(());
+    }
+    let files = trust::project_files(&dir);
+    if files.is_empty() {
+        println!("No project config files found in {}", dir.display());
+        return Ok(());
+    }
+    trust::trust(&dir).map_err(anyhow::Error::msg)?;
+    println!("Trusted {}:", dir.display());
+    for f in files {
+        println!("  {}", f.display());
+    }
+    println!("Trust is re-checked whenever these files change.");
+    Ok(())
+}
+
+/// Warn about (or, on a terminal, offer to trust) an untrusted project config.
+/// Returns true when the config should be reloaded because trust was granted.
+fn handle_untrusted_project(cli: &Cli, config: &Config) -> bool {
+    use std::io::{IsTerminal, Write};
+    let okeanos::config::trust::ProjectTrust::Untrusted { files } = &config.project_trust else {
+        return false;
+    };
+    let dir = okeanos::config::trust::project_dir(cli.root.as_deref());
+    eprintln!("This project has configuration that can run code or reach the network:");
+    for f in files {
+        eprintln!("  {}", f.display());
+    }
+    if cli.mode() == Mode::Interactive && std::io::stdin().is_terminal() {
+        eprint!("Trust it? Hooks, MCP servers and custom agents will be enabled. [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_ok()
+            && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+            && okeanos::config::trust::trust(&dir).is_ok()
+        {
+            return true;
+        }
+    }
+    eprintln!(
+        "Running restricted: hooks, MCP servers, providers, custom agents and allow rules from \
+         the project are ignored. Run `okeanos trust` to enable them."
+    );
+    false
+}
+
 fn build_hooks(config: &Config, project_root: &std::path::Path) -> Arc<okeanos::harness::Hooks> {
     match okeanos::harness::Hooks::new(&config.hooks, Some(project_root.to_path_buf())) {
         Ok(h) => Arc::new(h),
@@ -2360,7 +2521,9 @@ async fn init_mcp_client(
 ) -> anyhow::Result<Option<Arc<McpClient>>> {
     let mut client_config = config_to_mcp_client_config(config);
     // `.mcp.json` servers are added unless config.toml already defines the name.
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = std::env::current_dir()
+        && !config.project_trust.is_untrusted()
+    {
         for server in okeanos::tool::mcp::load_project_mcp_json(&cwd) {
             if !client_config.servers.iter().any(|s| s.name == server.name) {
                 client_config.servers.push(server);
@@ -2737,7 +2900,7 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
         .as_ref()
         .and_then(|p| p.allow_list.clone())
         .unwrap_or_else(|| vec!["todo".to_string()]);
-    let policy = Policy::new(allow_list);
+    let policy = build_policy(config, cli, allow_list);
 
     // Channel for approval decisions to ReactLoop
     let (approval_tx, approval_rx) = mpsc::channel(16);
@@ -3296,7 +3459,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
         .as_ref()
         .and_then(|p| p.allow_list.clone())
         .unwrap_or_else(|| vec!["todo".to_string()]);
-    let policy = Policy::new(allow_list);
+    let policy = build_policy(config, cli, allow_list);
 
     // Channel for approval decisions to ReactLoop
     let (approval_tx, approval_rx) = mpsc::channel(16);

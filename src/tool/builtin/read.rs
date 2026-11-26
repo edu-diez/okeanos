@@ -69,6 +69,7 @@ impl Tool for ReadTool {
                 (v.max(1) as usize).min(DEFAULT_LIMIT * 5)
             });
 
+        crate::tool::workspace::guard_read(std::path::Path::new(path))?;
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("failed to read '{path}': {e}")))?;

@@ -96,6 +96,32 @@ fn apply_with(
     sandbox.wrap(program, args, policy)
 }
 
+/// Human-readable description of the OS sandbox available on this platform,
+/// and whether one is usable.
+pub fn availability() -> (bool, String) {
+    if cfg!(target_os = "linux") {
+        if helper_exists("bwrap") {
+            (true, "bubblewrap (bwrap) available".into())
+        } else {
+            (
+                false,
+                "bubblewrap (bwrap) not found; install it to enable the sandbox".into(),
+            )
+        }
+    } else if cfg!(target_os = "macos") {
+        if helper_exists("sandbox-exec") {
+            (true, "seatbelt (sandbox-exec) available".into())
+        } else {
+            (false, "sandbox-exec not found".into())
+        }
+    } else {
+        (
+            false,
+            "no OS sandbox backend on this platform; `run` is only guarded by permissions and path checks (consider WSL or a container)".into(),
+        )
+    }
+}
+
 fn platform_sandbox() -> Box<dyn Sandbox> {
     if cfg!(target_os = "linux") {
         Box::new(Bwrap)

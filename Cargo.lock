@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "okeanos"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2941,6 +2941,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "shellexpand",
  "syntect",
  "tempfile",
@@ -3657,7 +3658,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.12",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3872,9 +3873,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+checksum = "5b0e5c7d67bc53f435386b2130fdc900488c5703770f6d8a4633060e34288a27"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",

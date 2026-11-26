@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use super::gate::GateVerdict;
 use super::policy::{Policy, PolicyDecision};
 
 /// Errors from the ReAct loop.
@@ -131,6 +132,8 @@ pub struct ReactLoop<M: Model> {
     shutdown_rx: Option<mpsc::Receiver<()>>,
     policy: Policy,
     hooks: Arc<crate::harness::hooks::Hooks>,
+    /// Whether `SessionStart` hooks already ran.
+    session_started: bool,
     approval_rx: Option<mpsc::Receiver<Approval>>,
     /// Optional session manager for logging events to session log.
     session: Option<Arc<Mutex<SessionManager>>>,
@@ -235,6 +238,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             shutdown_rx: None,
             policy: Policy::new(vec![]),
             hooks: Arc::new(crate::harness::hooks::Hooks::default()),
+            session_started: false,
             approval_rx: None,
             session: None,
             cost_tracker: None,
@@ -293,6 +297,53 @@ impl<M: Model + 'static> ReactLoop<M> {
     /// Get the project root.
     pub fn project_root(&self) -> Option<&std::path::PathBuf> {
         self.project_root.as_ref()
+    }
+
+    /// Get the permission policy.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// Get the lifecycle hooks.
+    pub fn hooks(&self) -> Arc<crate::harness::hooks::Hooks> {
+        self.hooks.clone()
+    }
+
+    /// Run `SessionStart` (once) and `UserPromptSubmit` hooks for a new user
+    /// prompt. Returns the prompt with any hook context appended, or the
+    /// reason a hook rejected it.
+    async fn begin_prompt(&mut self, prompt: String) -> Result<String, String> {
+        if self.hooks.is_empty() {
+            return Ok(prompt);
+        }
+        let mut extra = Vec::new();
+        if !self.session_started {
+            self.session_started = true;
+            extra.extend(self.hooks.session_start().await);
+        }
+        let outcome = self.hooks.user_prompt_submit(&prompt).await;
+        if let Some(reason) = outcome.blocked {
+            return Err(reason);
+        }
+        extra.extend(outcome.context);
+        if extra.is_empty() {
+            Ok(prompt)
+        } else {
+            Ok(format!("{prompt}\n\n[hook context]\n{}", extra.join("\n")))
+        }
+    }
+
+    /// Run `Stop` hooks when the model finishes. Returns feedback to send
+    /// back to the model if a hook wants it to keep going; bounded so a hook
+    /// cannot loop the agent forever.
+    async fn stop_hook_feedback(&mut self, last_message: &str, rounds: &mut u32) -> Option<String> {
+        const MAX_STOP_ROUNDS: u32 = 3;
+        if self.hooks.is_empty() || *rounds >= MAX_STOP_ROUNDS {
+            return None;
+        }
+        let reason = self.hooks.stop(last_message).await?;
+        *rounds += 1;
+        Some(format!("[Stop hook] {reason}"))
     }
 
     /// Get the session manager.
@@ -759,6 +810,14 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Run the ReAct loop until completion or termination.
     pub async fn run(&mut self, initial_prompt: String) -> Result<String, ReactError> {
+        let initial_prompt = match self.begin_prompt(initial_prompt).await {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                return Err(ReactError::Stopped {
+                    reason: format!("prompt blocked by hook: {reason}"),
+                });
+            }
+        };
         // Expand @file mentions (and optional scan) into the user message
         let initial_prompt = self.expand_prompt(&initial_prompt).await;
         self.conversation
@@ -802,6 +861,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             }
         }));
 
+        let mut stop_rounds = 0u32;
         loop {
             // Check for completed sub-agents
             self.check_subagent_completion().await?;
@@ -825,6 +885,13 @@ impl<M: Model + 'static> ReactLoop<M> {
                     continue;
                 }
                 LoopDecision::Complete(result) => {
+                    if let Some(reason) = self.stop_hook_feedback(&result, &mut stop_rounds).await {
+                        self.conversation
+                            .add_user_message(reason)
+                            .context("failed to add Stop hook feedback")?;
+                        self.iteration += 1;
+                        continue;
+                    }
                     // Take final snapshot before completing
                     self.take_snapshot("Session complete").await?;
                     return Ok(result);
@@ -851,6 +918,14 @@ impl<M: Model + 'static> ReactLoop<M> {
         prompt: String,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
+        let prompt = match self.begin_prompt(prompt).await {
+            Ok(prompt) => prompt,
+            Err(reason) => {
+                return Ok(LoopDecision::Stop(format!(
+                    "prompt blocked by hook: {reason}"
+                )));
+            }
+        };
         // Expand @file mentions (and optional scan) into the user message
         let prompt = self.expand_prompt(&prompt).await;
         self.conversation
@@ -867,6 +942,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         self.repeat_count = 0;
 
         let mut shutdown_rx = shutdown_rx;
+        let mut stop_rounds = 0u32;
         loop {
             self.prepare_iteration().await?;
 
@@ -877,6 +953,15 @@ impl<M: Model + 'static> ReactLoop<M> {
                     self.maybe_start_background_compaction();
                 }
                 decision @ LoopDecision::Complete(_) => {
+                    if let LoopDecision::Complete(text) = &decision
+                        && let Some(reason) = self.stop_hook_feedback(text, &mut stop_rounds).await
+                    {
+                        self.conversation
+                            .add_user_message(reason)
+                            .context("failed to add Stop hook feedback")?;
+                        self.iteration += 1;
+                        continue;
+                    }
                     self.take_snapshot("Session complete").await?;
                     self.maybe_start_background_compaction();
                     return Ok(decision);
@@ -1512,55 +1597,9 @@ impl<M: Model + 'static> ReactLoop<M> {
                 .await;
         }
 
-        if let crate::harness::hooks::PreToolOutcome::Block(reason) = self
-            .hooks
-            .pre_tool_use(&tool_call.name, &tool_call.args)
-            .await
-        {
-            return Err(ReactError::Tool(format!(
-                "blocked by PreToolUse hook: {reason}"
-            )));
-        }
-
-        // Gate execution behind the permission policy.
-        match self
-            .policy
-            .check_call(&tool_call.name, &spec, &tool_call.args)
-        {
-            PolicyDecision::Allow => {}
-            PolicyDecision::Deny => {
-                return Err(ReactError::Tool(format!(
-                    "permission denied: {}",
-                    tool_call.name
-                )));
-            }
-            PolicyDecision::RequireApproval => {
-                // Emit approval request and pause the loop until a decision arrives.
-                let approval_id = format!("approval-{}", self.iteration);
-                self.emit_approval_request(ApprovalRequest {
-                    id: approval_id.clone(),
-                    tool: tool_call.name.clone(),
-                    args: tool_call.args.clone(),
-                })
-                .await;
-
-                let decision = self.wait_for_approval(&approval_id).await?;
-
-                match decision {
-                    ApprovalDecision::Allow => {}
-                    ApprovalDecision::AllowAlways => {
-                        self.policy
-                            .allow_always_call(&tool_call.name, &tool_call.args);
-                    }
-                    ApprovalDecision::Deny => {
-                        return Err(ReactError::Tool(format!(
-                            "permission denied: {}",
-                            tool_call.name
-                        )));
-                    }
-                }
-            }
-        }
+        // Hooks, then the permission policy (and approval when required).
+        let mut tool_call = tool_call;
+        self.authorize(&mut tool_call, &spec).await?;
 
         // Check expensive call confirmation before executing the tool.
         self.check_expensive_call_confirmation(&tool_call).await?;
@@ -1627,6 +1666,55 @@ impl<M: Model + 'static> ReactLoop<M> {
         Ok(self
             .finish_tool_execution(tool_call, &spec, exec_result, duration_ms)
             .await)
+    }
+
+    /// Run the shared gate (PreToolUse hooks + permission policy) for a call and
+    /// obtain approval when it is required. Hook-rewritten arguments are
+    /// written back into `tool_call`.
+    async fn authorize(
+        &mut self,
+        tool_call: &mut ToolCall,
+        spec: &crate::tool::tool_trait::ToolSpec,
+    ) -> Result<(), ReactError> {
+        let outcome = crate::harness::gate::evaluate(
+            &self.policy,
+            &self.hooks,
+            &tool_call.name,
+            spec,
+            tool_call.args.clone(),
+        )
+        .await;
+        tool_call.args = outcome.args;
+
+        match outcome.verdict {
+            GateVerdict::Allow => Ok(()),
+            GateVerdict::Deny(reason) => {
+                Err(ReactError::Tool(format!("permission denied: {reason}")))
+            }
+            GateVerdict::Ask => {
+                // Emit approval request and pause the loop until a decision arrives.
+                let approval_id = format!("approval-{}", self.iteration);
+                self.emit_approval_request(ApprovalRequest {
+                    id: approval_id.clone(),
+                    tool: tool_call.name.clone(),
+                    args: tool_call.args.clone(),
+                })
+                .await;
+
+                match self.wait_for_approval(&approval_id).await? {
+                    ApprovalDecision::Allow => Ok(()),
+                    ApprovalDecision::AllowAlways => {
+                        self.policy
+                            .allow_always_call(&tool_call.name, &tool_call.args);
+                        Ok(())
+                    }
+                    ApprovalDecision::Deny => Err(ReactError::Tool(format!(
+                        "permission denied: {}",
+                        tool_call.name
+                    ))),
+                }
+            }
+        }
     }
 
     /// Return a cached result for an idempotent tool call, recording cost and
@@ -1794,7 +1882,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         };
         let spec = tool.spec();
         spec.category == ToolCategory::Read
-            && self.policy.check(&tool_call.name, &spec) == PolicyDecision::Allow
+            && self
+                .policy
+                .check_call(&tool_call.name, &spec, &tool_call.args)
+                == PolicyDecision::Allow
     }
 
     /// Execute all tool calls of an assistant turn in order, running runs of
@@ -1847,7 +1938,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
 
         let mut slots = Vec::with_capacity(calls.len());
-        for call in calls {
+        for mut call in calls {
             if let Some(result) = self.check_doom_loop(&call).await? {
                 slots.push(Slot::Done(result));
                 continue;
@@ -1856,12 +1947,22 @@ impl<M: Model + 'static> ReactLoop<M> {
                 slots.push(Slot::Done(result));
                 continue;
             }
-            self.check_expensive_call_confirmation(&call).await?;
-            self.check_cost_budget(&call).await?;
             let tool = self
                 .tools
                 .get(&call.name)
                 .expect("checked by is_parallel_safe");
+            // The same hooks and policy as the serial path.
+            match self.authorize(&mut call, &tool.spec()).await {
+                Ok(()) => {}
+                Err(ReactError::Tool(msg)) => {
+                    let result = self.error_tool_result(&call, msg).await;
+                    slots.push(Slot::Done(result));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            self.check_expensive_call_confirmation(&call).await?;
+            self.check_cost_budget(&call).await?;
             self.emit_tool_call(ToolCall {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -1894,8 +1995,16 @@ impl<M: Model + 'static> ReactLoop<M> {
             let result = match slot {
                 Slot::Done(result) => result,
                 Slot::Run(call, tool) => match outcomes.next().expect("one outcome per run slot") {
-                    Ok(exec) => {
+                    Ok(mut exec) => {
                         let spec = tool.spec();
+                        if let Some(feedback) = self
+                            .hooks
+                            .post_tool_use(&call.name, &call.args, &exec.output)
+                            .await
+                        {
+                            exec.output
+                                .push_str(&format!("\n[PostToolUse hook]\n{feedback}"));
+                        }
                         self.finish_tool_execution(call, &spec, exec, duration_ms)
                             .await
                     }
@@ -2158,6 +2267,9 @@ impl<M: Model + 'static> ReactLoop<M> {
                         ts: current_timestamp(),
                     };
                     self.emit_subagent_complete(complete_event).await;
+                    self.hooks
+                        .subagent_stop(&subagent_id, &result.summary)
+                        .await;
 
                     // Complete the todo item
                     if let Some(todo_list) = self.get_todo_list() {

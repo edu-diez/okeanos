@@ -48,6 +48,8 @@ pub struct TerminalApp {
     pub todo_panel: TodoPanel,
     pub fleet_view: FleetView,
     pub status_bar: StatusBar,
+    /// Shared permission mode, cycled with Shift+Tab.
+    pub permission_mode: Option<crate::harness::ModeHandle>,
     pub log_tail: LogTailPanel,
     pub approval_modal: ApprovalModal,
     pub command_palette: CommandPalette,
@@ -181,6 +183,7 @@ impl TerminalApp {
             todo_panel,
             fleet_view,
             status_bar,
+            permission_mode: None,
             log_tail,
             approval_modal,
             command_palette,
@@ -264,6 +267,12 @@ impl TerminalApp {
     /// Get a reference to the pending turn decision.
     pub fn pending_decision(&self) -> Option<&crate::harness::react::LoopDecision> {
         self.pending_decision.as_ref()
+    }
+
+    /// Share the policy's permission mode so Shift+Tab can cycle it.
+    pub fn set_permission_mode(&mut self, handle: crate::harness::ModeHandle) {
+        self.status_bar.set_permission_mode(handle.clone());
+        self.permission_mode = Some(handle);
     }
 
     /// Set provider/model configuration status for welcome screen.
@@ -587,6 +596,17 @@ impl TerminalApp {
                 // Ctrl+D: exit
                 if !self.turn_in_progress && self.input_composer.get_input().is_empty() {
                     self.running = false;
+                }
+                return Ok(true);
+            }
+            (KeyCode::BackTab, _)
+                if !self.approval_modal.is_visible() && !self.command_palette.is_visible() =>
+            {
+                // Shift+Tab: cycle the permission mode (default → accept-edits → plan → yolo)
+                if let Some(handle) = &self.permission_mode {
+                    let mode = handle.cycle();
+                    self.input_composer
+                        .set_error(format!("Permission mode: {mode}"));
                 }
                 return Ok(true);
             }

@@ -61,6 +61,12 @@ pub enum Command {
     },
     /// Health check: verify API keys, config, and dependencies.
     Doctor,
+    /// Trust (or with --revoke, untrust) this project's okeanos.toml, .mcp.json and agent profiles.
+    Trust {
+        /// Remove the trust record instead of adding it.
+        #[arg(long)]
+        revoke: bool,
+    },
     /// List resumable sessions.
     Sessions,
     /// Generate shell completions.
@@ -286,6 +292,10 @@ pub struct Cli {
     /// Approval policy for headless/RPC mode: auto (allow all), deny (block all), prompt (wait for stdin JSON).
     #[arg(long, value_name = "POLICY", global = true, default_value = "prompt")]
     pub approval_policy: ApprovalPolicy,
+
+    /// Permission mode: default, accept-edits, plan or yolo (overrides config).
+    #[arg(long, value_name = "MODE", global = true)]
+    pub permission_mode: Option<String>,
 
     /// Timeout for approval prompts in seconds (when policy is 'prompt').
     #[arg(long, value_name = "SECS", global = true, default_value = "30")]

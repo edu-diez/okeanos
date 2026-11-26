@@ -362,6 +362,10 @@ pub struct SpawnConfig {
     pub compaction_config: Option<crate::context::compaction::CompactionConfig>,
     /// Parent's tool cache config (optional).
     pub tool_cache_config: Option<CacheConfig>,
+    /// Parent's permission policy (deny/ask rules and mode are inherited).
+    pub parent_policy: crate::harness::policy::Policy,
+    /// Parent's hooks (tool events apply to sub-agent calls too).
+    pub parent_hooks: Arc<crate::harness::hooks::Hooks>,
     /// Maximum sub-agent delegation depth allowed globally.
     pub global_max_depth: u32,
 }
@@ -414,6 +418,8 @@ pub async fn spawn_subagent<M: Model + 'static>(
         snapshot_store: parent.snapshot_store(),
         compaction_config: parent.compaction_config(),
         tool_cache_config: parent.tool_cache_config(),
+        parent_policy: parent.policy().clone(),
+        parent_hooks: parent.hooks(),
         global_max_depth: 10, // Hard limit per architecture
     };
 
@@ -725,9 +731,14 @@ where
         loop_
     };
 
-    // Set policy with sub-agent's allowlist (profile.tools)
-    let policy = crate::harness::policy::Policy::new(profile.tools.clone());
-    let loop_ = loop_.with_policy(policy);
+    // Sub-agent allowlist (profile.tools) plus the parent's deny/ask rules and
+    // mode; tool hooks apply to its calls as well.
+    let policy = config
+        .parent_policy
+        .derive_for_subagent(profile.tools.clone());
+    let loop_ = loop_
+        .with_policy(policy)
+        .with_hooks(Arc::new(config.parent_hooks.tool_events_only()));
 
     Ok(loop_)
 }

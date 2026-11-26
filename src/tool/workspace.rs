@@ -3,14 +3,133 @@
 //! Writes must land inside the configured roots (project root plus any
 //! `permissions.extra_write_roots`). Paths are resolved through symlinks, `..`
 //! cannot be used to escape, and `.git` internals and `.env*` files are always
-//! protected. Reads stay unrestricted. When no roots are installed (library
+//! protected. Reads of credential files (`.env*`, `~/.ssh`, keys, tokens) are
+//! refused unless `permissions.protect_secrets = false`; other reads stay
+//! unrestricted. When no roots are installed (library
 //! use, unit tests) nothing is confined.
 
 use crate::tool::tool_trait::ToolError;
 use std::path::{Component, Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static ROOTS: RwLock<Option<Vec<PathBuf>>> = RwLock::new(None);
+static PROTECT_SECRETS: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable the credential-file read guard (default: enabled).
+pub fn set_protect_secrets(on: bool) {
+    PROTECT_SECRETS.store(on, Ordering::Relaxed);
+}
+
+/// Whether credential files are currently hidden from `read` and `grep`.
+pub fn protects_secrets() -> bool {
+    PROTECT_SECRETS.load(Ordering::Relaxed)
+}
+
+/// Whether `path` looks like a credential file: `.env*` (except templates),
+/// SSH/cloud config dirs, key material, token files and okeanos' own config.
+pub fn is_secret_path(path: &Path) -> bool {
+    let comps: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let Some((name, dirs)) = comps.split_last() else {
+        return false;
+    };
+    if dirs
+        .iter()
+        .any(|d| matches!(d.as_str(), ".ssh" | ".aws" | ".gnupg" | ".kube" | ".azure"))
+    {
+        return true;
+    }
+    if name == ".env" {
+        return true;
+    }
+    if let Some(suffix) = name.strip_prefix(".env.") {
+        return !matches!(
+            suffix,
+            "example" | "sample" | "template" | "dist" | "defaults"
+        );
+    }
+    if matches!(
+        name.as_str(),
+        ".netrc"
+            | "_netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".git-credentials"
+            | "id_rsa"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ed25519"
+            | "credentials"
+            | "credentials.json"
+    ) {
+        return true;
+    }
+    if name == "config.toml" && dirs.last().is_some_and(|d| d == "okeanos") {
+        return true;
+    }
+    matches!(
+        Path::new(name).extension().and_then(|e| e.to_str()),
+        Some("pem" | "p12" | "pfx" | "key")
+    )
+}
+
+/// Refuse to read credential files (see [`is_secret_path`]). Symlinks are
+/// resolved so a link cannot hide the target's name.
+pub fn guard_read(path: &Path) -> Result<(), ToolError> {
+    if !PROTECT_SECRETS.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let target = std::fs::canonicalize(path).ok();
+    if is_secret_path(path) || target.as_deref().is_some_and(is_secret_path) {
+        return Err(ToolError::ExecutionFailed(format!(
+            "read of '{}' blocked: it looks like a credentials file \
+             (set permissions.protect_secrets = false to allow)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Best-effort check of the paths a mutating command line will touch, so
+/// `run` cannot trivially bypass the write confinement of `write`/`edit`.
+/// It only knows common programs; the OS sandbox is the real boundary.
+pub fn guard_run(program: &str, args: &[String]) -> Result<(), ToolError> {
+    let name = Path::new(program)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let operands = || {
+        args.iter()
+            .filter(|a| !a.starts_with('-') && !a.is_empty())
+            .map(String::as_str)
+    };
+    let targets: Vec<&str> = match name.as_str() {
+        "tee" | "touch" | "mkdir" | "truncate" | "rm" | "rmdir" | "del" | "erase" | "rd"
+        | "ren" | "rename" | "mv" | "move" => operands().collect(),
+        "cp" | "copy" | "ln" | "rsync" | "install" => operands().next_back().into_iter().collect(),
+        "chmod" | "chown" | "chgrp" => operands().skip(1).collect(),
+        "sed"
+            if args
+                .iter()
+                .any(|a| a == "--in-place" || (a.starts_with("-i"))) =>
+        {
+            operands().skip(1).collect()
+        }
+        "dd" => args.iter().filter_map(|a| a.strip_prefix("of=")).collect(),
+        _ => return Ok(()),
+    };
+    for t in targets {
+        guard_write(Path::new(t))
+            .map_err(|e| ToolError::ExecutionFailed(format!("`{name}` blocked: {e}")))?;
+    }
+    Ok(())
+}
 
 /// Install the writable roots for this process. Roots that cannot be
 /// canonicalized are skipped; an empty result leaves writes unconfined.
@@ -137,6 +256,30 @@ mod tests {
         assert!(check_write_in(&r, &dir.path().join("sub/.env.local")).is_err());
         assert!(check_write_in(&r, dir.path()).is_err());
         assert!(check_write_in(&r, &dir.path().join(".gitignore")).is_ok());
+    }
+
+    #[test]
+    fn secret_paths() {
+        for p in [
+            ".env",
+            "app/.env.local",
+            "/home/u/.ssh/config",
+            "id_ed25519",
+            "certs/server.pem",
+            "/home/u/.config/okeanos/config.toml",
+            ".npmrc",
+        ] {
+            assert!(is_secret_path(Path::new(p)), "{p}");
+        }
+        for p in [
+            ".env.example",
+            "src/main.rs",
+            "id_rsa.pub",
+            "config.toml",
+            "README.md",
+        ] {
+            assert!(!is_secret_path(Path::new(p)), "{p}");
+        }
     }
 
     #[cfg(unix)]
