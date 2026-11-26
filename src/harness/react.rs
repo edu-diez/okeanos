@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use super::gate::GateVerdict;
 use super::policy::{Policy, PolicyDecision};
@@ -174,6 +175,22 @@ pub struct ReactLoop<M: Model> {
     repeat_count: u32,
     /// Whether the last model response was cut off by the output token limit.
     last_truncated: bool,
+    /// Provider-reported prompt/completion tokens summed over the loop's calls.
+    tokens_in_total: u64,
+    tokens_out_total: u64,
+    /// Whether `RunMeta` was logged.
+    meta_emitted: bool,
+    /// Timing of the last successful model call, consumed by `iterate`.
+    last_call: Option<CallTiming>,
+}
+
+/// Timing of one successful model attempt.
+struct CallTiming {
+    attempt: usize,
+    ttft_ms: Option<u64>,
+    total_ms: u64,
+    usage_estimated: bool,
+    stop_reason: &'static str,
 }
 
 /// Identical consecutive tool calls before the model is told to change course.
@@ -277,6 +294,10 @@ impl<M: Model + 'static> ReactLoop<M> {
             last_call_sig: None,
             repeat_count: 0,
             last_truncated: false,
+            tokens_in_total: 0,
+            tokens_out_total: 0,
+            meta_emitted: false,
+            last_call: None,
         }
     }
 
@@ -740,6 +761,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         };
         let result = compaction_manager
             .compact_now(summarizer, &mut self.conversation, trigger)
+            .instrument(tracing::info_span!("compaction", trigger = ?trigger))
             .await
             .map_err(|e| ReactError::Other(anyhow::anyhow!(e)))?;
         if let Some(result) = &result {
@@ -888,7 +910,8 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Run the ReAct loop until completion or termination.
     pub async fn run(&mut self, initial_prompt: String) -> Result<String, ReactError> {
-        let result = self.run_inner(initial_prompt).await;
+        let span = tracing::info_span!("run", model = %self.model.model_id());
+        let result = self.run_inner(initial_prompt).instrument(span).await;
         if result.is_err() {
             // Dropping the handles aborts any sub-agent still running.
             self.subagent_handles.clear();
@@ -963,7 +986,8 @@ impl<M: Model + 'static> ReactLoop<M> {
             self.prepare_iteration().await?;
 
             // Run one iteration
-            match self.iterate(&mut shutdown_rx).await? {
+            let iter_span = tracing::info_span!("iteration", n = self.iteration);
+            match self.iterate(&mut shutdown_rx).instrument(iter_span).await? {
                 LoopDecision::Continue => {
                     self.iteration += 1;
                     // Take snapshot at loop boundary
@@ -1020,7 +1044,11 @@ impl<M: Model + 'static> ReactLoop<M> {
         images: Vec<crate::model::ImagePart>,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
-        let result = self.run_turn_inner(prompt, images, shutdown_rx).await;
+        let span = tracing::info_span!("turn", model = %self.model.model_id());
+        let result = self
+            .run_turn_inner(prompt, images, shutdown_rx)
+            .instrument(span)
+            .await;
         if !matches!(result, Ok(LoopDecision::Complete(_))) {
             // Dropping the handles aborts any sub-agent still running.
             self.subagent_handles.clear();
@@ -1063,7 +1091,8 @@ impl<M: Model + 'static> ReactLoop<M> {
             self.drain_subagents().await?;
             self.prepare_iteration().await?;
 
-            match self.iterate(&mut shutdown_rx).await? {
+            let iter_span = tracing::info_span!("iteration", n = self.iteration);
+            match self.iterate(&mut shutdown_rx).instrument(iter_span).await? {
                 LoopDecision::Continue => {
                     self.iteration += 1;
                     self.take_boundary_snapshot().await?;
@@ -1137,12 +1166,54 @@ impl<M: Model + 'static> ReactLoop<M> {
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
         // THINK: Get model completion
+        self.emit_run_meta_once();
         let model_messages = self.build_model_messages();
-        let response = self.call_model(&model_messages, shutdown_rx).await?;
+        let call_span = tracing::info_span!(
+            "model_call",
+            model = %self.model.model_id(),
+            ttft_ms = tracing::field::Empty,
+            prompt_tokens = tracing::field::Empty,
+            completion_tokens = tracing::field::Empty,
+            cache_read_tokens = tracing::field::Empty,
+        );
+        self.last_call = None;
+        let response = self
+            .call_model(&model_messages, shutdown_rx)
+            .instrument(call_span.clone())
+            .await?;
 
         // Record model usage cost
+        let cost_before = self.cost_tracker.as_ref().map(|t| t.spent_usd());
         if let Some(usage) = &response.usage {
             self.record_model_usage(usage).await;
+            self.tokens_in_total += usage.prompt_tokens as u64;
+            self.tokens_out_total += usage.completion_tokens as u64;
+        }
+        let call_cost = match (cost_before, self.cost_tracker.as_ref()) {
+            (Some(before), Some(t)) => Some(t.spent_usd() - before),
+            _ => None,
+        };
+        if let Some(call) = self.last_call.take() {
+            if let Some(u) = &response.usage {
+                call_span.record("prompt_tokens", u.prompt_tokens as u64);
+                call_span.record("completion_tokens", u.completion_tokens as u64);
+                call_span.record("cache_read_tokens", u.cache_read_tokens as u64);
+            }
+            call_span.record("ttft_ms", call.ttft_ms);
+            self.emit_event(Event::ModelCall(crate::events::ModelCall {
+                iteration: self.iteration,
+                attempt: call.attempt,
+                model: self.model.model_id().to_string(),
+                ttft_ms: call.ttft_ms,
+                total_ms: call.total_ms,
+                usage: response.usage.clone(),
+                usage_estimated: call.usage_estimated,
+                cost_usd: call_cost,
+                stop_reason: Some(call.stop_reason.to_string()),
+                error: None,
+                retried: false,
+                ts: current_timestamp(),
+            }));
         }
 
         // Add assistant message to conversation
@@ -1455,6 +1526,8 @@ impl<M: Model + 'static> ReactLoop<M> {
         };
 
         'attempt: loop {
+            let attempt_start = Instant::now();
+            let attempt_no = attempt;
             // Get a streaming response from the model
             let stream_result = tokio::select! {
                 biased;
@@ -1478,7 +1551,8 @@ impl<M: Model + 'static> ReactLoop<M> {
             let mut stream = match stream_result {
                 Ok(s) => s,
                 Err(error) => {
-                    if self
+                    let total = attempt_start.elapsed();
+                    let retry = self
                         .recover_from_model_error(
                             &error,
                             &mut attempt,
@@ -1486,8 +1560,9 @@ impl<M: Model + 'static> ReactLoop<M> {
                             &mut messages,
                             shutdown_rx,
                         )
-                        .await?
-                    {
+                        .await?;
+                    self.emit_failed_call(attempt_no, total, None, &error, retry);
+                    if retry {
                         continue 'attempt;
                     }
                     return Err(ReactError::Model(error));
@@ -1495,6 +1570,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             };
 
             // Consume the stream, emitting Token events and building the response
+            let mut ttft_ms: Option<u64> = None;
             let mut content = String::new();
             let mut tool_calls: Option<Vec<ToolCall>> = None;
             let mut thinking: Option<String> = None;
@@ -1520,6 +1596,13 @@ impl<M: Model + 'static> ReactLoop<M> {
 
                 match chunk_result {
                     Some(Ok(chunk)) => {
+                        if ttft_ms.is_none()
+                            && (!chunk.delta.is_empty()
+                                || chunk.thinking.is_some()
+                                || chunk.tool_calls.is_some())
+                        {
+                            ttft_ms = Some(attempt_start.elapsed().as_millis() as u64);
+                        }
                         // Emit token delta event for TUI streaming render
                         if !chunk.delta.is_empty() {
                             let token_event = crate::events::Event::token(
@@ -1560,7 +1643,8 @@ impl<M: Model + 'static> ReactLoop<M> {
                     Some(Err(e)) => {
                         // Only safe to restart when no tool call has been
                         // observed: partial text is simply discarded.
-                        if tool_calls.is_none()
+                        let total = attempt_start.elapsed();
+                        let retry = tool_calls.is_none()
                             && self
                                 .recover_from_model_error(
                                     &e,
@@ -1569,8 +1653,9 @@ impl<M: Model + 'static> ReactLoop<M> {
                                     &mut messages,
                                     shutdown_rx,
                                 )
-                                .await?
-                        {
+                                .await?;
+                        self.emit_failed_call(attempt_no, total, ttft_ms, &e, retry);
+                        if retry {
                             continue 'attempt;
                         }
                         return Err(ReactError::Model(e));
@@ -1580,6 +1665,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             }
 
             // Providers that don't report usage fall back to an estimate.
+            let usage_estimated = usage.is_none();
             let usage = usage.unwrap_or_else(|| {
                 let counter = crate::context::tokens::TokenCounter;
                 let prompt_tokens: usize = messages.iter().map(|m| counter.count(&m.content)).sum();
@@ -1592,6 +1678,20 @@ impl<M: Model + 'static> ReactLoop<M> {
                 }
             });
 
+            self.last_call = Some(CallTiming {
+                attempt: attempt_no,
+                ttft_ms,
+                total_ms: attempt_start.elapsed().as_millis() as u64,
+                usage_estimated,
+                stop_reason: if self.last_truncated {
+                    "length"
+                } else if tool_calls.is_some() {
+                    "tool_use"
+                } else {
+                    "end_turn"
+                },
+            });
+
             return Ok(ModelResponse {
                 content,
                 tool_calls,
@@ -1600,6 +1700,31 @@ impl<M: Model + 'static> ReactLoop<M> {
                 usage: Some(usage),
             });
         }
+    }
+
+    /// Log a failed model attempt (before any retry backoff has elapsed).
+    fn emit_failed_call(
+        &self,
+        attempt: usize,
+        total: Duration,
+        ttft_ms: Option<u64>,
+        error: &ModelError,
+        retried: bool,
+    ) {
+        self.emit_event(Event::ModelCall(crate::events::ModelCall {
+            iteration: self.iteration,
+            attempt,
+            model: self.model.model_id().to_string(),
+            ttft_ms,
+            total_ms: total.as_millis() as u64,
+            usage: None,
+            usage_estimated: false,
+            cost_usd: None,
+            stop_reason: None,
+            error: Some(error.to_string()),
+            retried,
+            ts: current_timestamp(),
+        }));
     }
 
     /// Decide whether a failed model call can be retried, performing the
@@ -1668,11 +1793,7 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Emit an interrupted event to the event stream.
     async fn emit_interrupted(&mut self, user_initiated: bool) {
-        let event = crate::events::Event::interrupted(user_initiated);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(crate::events::Event::interrupted(user_initiated));
     }
 
     /// Build the model messages, injecting a text-based tool schema into the
@@ -1965,7 +2086,20 @@ impl<M: Model + 'static> ReactLoop<M> {
         if let Some(result) = self.check_doom_loop(&tool_call).await? {
             return Ok(result);
         }
-        match self.execute_tool(tool_call.clone(), shutdown_rx).await {
+        let span = tracing::info_span!(
+            "tool_call",
+            tool = %tool_call.name,
+            id = %tool_call.id,
+            ok = tracing::field::Empty
+        );
+        let outcome = self
+            .execute_tool(tool_call.clone(), shutdown_rx)
+            .instrument(span.clone())
+            .await;
+        if let Ok(result) = &outcome {
+            span.record("ok", result.ok);
+        }
+        match outcome {
             Err(ReactError::Tool(msg)) => Ok(self.error_tool_result(&tool_call, msg).await),
             other => other,
         }
@@ -2162,7 +2296,8 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         let outcomes = tokio::select! {
             biased;
-            outcomes = futures::future::join_all(futures) => outcomes,
+            outcomes = futures::future::join_all(futures)
+                .instrument(tracing::info_span!("tool_batch", calls = slots.len())) => outcomes,
             _ = shutdown_rx.recv() => return Err(ReactError::Interrupted),
         };
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -2916,22 +3051,22 @@ impl<M: Model + 'static> ReactLoop<M> {
         })
     }
 
-    /// Emit a message event.
-    async fn emit_message(&mut self, msg: Message) {
-        let event = Event::Message(msg);
+    /// Broadcast an event and append it to the session log (if any).
+    fn emit_event(&self, event: Event) {
         let _ = self.event_tx.send(event.clone());
         if let Some(session) = &self.session {
             let _ = session.lock().unwrap().log_event(event);
         }
     }
 
+    /// Emit a message event.
+    async fn emit_message(&mut self, msg: Message) {
+        self.emit_event(Event::Message(msg));
+    }
+
     /// Emit a tool call event.
     async fn emit_tool_call(&mut self, call: ToolCall) {
-        let event = Event::ToolCall(call);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(Event::ToolCall(call));
     }
 
     /// Emit a live tool output chunk. Ephemeral: broadcast only, never session-logged.
@@ -2949,11 +3084,7 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Emit a tool result event.
     async fn emit_tool_result(&mut self, result: ToolResult) {
-        let event = Event::ToolResult(result);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(Event::ToolResult(result));
     }
 
     /// Record a sub-agent completion in the session log. The event itself was
@@ -2969,20 +3100,12 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Emit a sub-agent error event.
     async fn emit_subagent_error(&mut self, event: SubAgentError) {
-        let event = Event::SubAgentError(event);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(Event::SubAgentError(event));
     }
 
     /// Emit an approval request event.
     async fn emit_approval_request(&mut self, req: ApprovalRequest) {
-        let event = Event::ApprovalRequest(req);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(Event::ApprovalRequest(req));
     }
 
     /// Emit a status event.
@@ -2993,48 +3116,76 @@ impl<M: Model + 'static> ReactLoop<M> {
             self.conversation.cost_estimate().total_cost_usd()
         };
 
-        let status = crate::events::Status {
+        // Provider-reported totals once a call completed; the context
+        // estimate before that so the first status isn't empty.
+        let tokens_in = if self.tokens_in_total > 0 {
+            self.tokens_in_total
+        } else {
+            self.conversation.estimated_tokens() as u64
+        };
+
+        self.emit_event(Event::Status(crate::events::Status {
             model: self.model.model_id().to_string(),
             provider_configured: !self.model.model_id().is_empty(),
-            tokens_in: self.conversation.estimated_tokens() as u64,
-            tokens_out: 0,
+            tokens_in,
+            tokens_out: self.tokens_out_total,
             cost_usd,
             elapsed_ms: self.start_time.elapsed().as_millis() as u64,
             retries: self.retries,
-            mode: "headless".to_string(),
-        };
-        let event = Event::Status(status);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+            mode: self.policy.mode().as_str().to_string(),
+        }));
     }
 
     /// Emit an error event to the event stream.
     async fn emit_error(&mut self, code: &str, message: &str) {
-        let event = Event::error(code.to_string(), message.to_string());
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(Event::error(code.to_string(), message.to_string()));
     }
 
     /// Emit a log event.
     async fn emit_log(&mut self, level: crate::events::LogLevel, message: String) {
-        let event = Event::Log(crate::events::Log { level, message });
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
-        }
+        self.emit_event(Event::Log(crate::events::Log { level, message }));
     }
 
     /// Emit a compaction event.
     async fn emit_compaction(&mut self, event: CompactionEvent) {
-        let event = Event::Compaction(event);
-        let _ = self.event_tx.send(event.clone());
-        if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
+        self.emit_event(Event::Compaction(event));
+    }
+
+    /// Log reproducibility metadata once, before the first model request.
+    fn emit_run_meta_once(&mut self) {
+        if self.meta_emitted {
+            return;
         }
+        self.meta_emitted = true;
+        let sha = |bytes: &[u8]| -> String {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let specs = self.tools.specs();
+        let params = &self.config.generation_params;
+        let system = self
+            .conversation
+            .to_model_messages()
+            .into_iter()
+            .next()
+            .map(|m| m.content)
+            .unwrap_or_default();
+        self.emit_event(Event::RunMeta(crate::events::RunMeta {
+            okeanos_version: env!("CARGO_PKG_VERSION").to_string(),
+            model: self.model.model_id().to_string(),
+            tier: self.model.capabilities().tier.to_string(),
+            system_prompt_sha256: sha(system.as_bytes()),
+            tools_sha256: sha(serde_json::to_string(&specs).unwrap_or_default().as_bytes()),
+            tool_count: specs.len(),
+            permission_mode: self.policy.mode().as_str().to_string(),
+            temperature: params.temperature,
+            max_tokens: params.max_tokens,
+            reasoning: params.reasoning.map(|r| format!("{r:?}").to_lowercase()),
+            ts: current_timestamp(),
+        }));
     }
 }
 

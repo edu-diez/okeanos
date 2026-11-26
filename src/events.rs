@@ -227,6 +227,55 @@ pub struct SubAgentError {
     pub ts: u64,
 }
 
+/// One model request attempt: timing, token usage and outcome.
+///
+/// Logged for every attempt (including failed/retried ones) so cost, cache hit
+/// rate and latency can be recomputed from a session log alone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelCall {
+    /// ReAct iteration within the current turn.
+    pub iteration: usize,
+    /// Retry attempt for this iteration (0 = first try).
+    pub attempt: usize,
+    pub model: String,
+    /// Time from request start to the first streamed output, if any arrived.
+    pub ttft_ms: Option<u64>,
+    /// Time from request start to end of stream (or failure).
+    pub total_ms: u64,
+    /// Provider-reported usage, or an estimate when `usage_estimated`.
+    pub usage: Option<crate::model::Usage>,
+    #[serde(default)]
+    pub usage_estimated: bool,
+    /// Cost of this call; only known when cost tracking is enabled.
+    pub cost_usd: Option<f64>,
+    /// `end_turn`, `tool_use` or `length`.
+    pub stop_reason: Option<String>,
+    /// Failure message when the attempt did not complete.
+    pub error: Option<String>,
+    /// Whether the harness retried after this failure.
+    #[serde(default)]
+    pub retried: bool,
+    pub ts: u64,
+}
+
+/// Reproducibility metadata, logged once when a loop starts its first turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunMeta {
+    pub okeanos_version: String,
+    pub model: String,
+    pub tier: String,
+    /// SHA-256 of the system prompt (first message sent to the model).
+    pub system_prompt_sha256: String,
+    /// SHA-256 of the serialized tool specs.
+    pub tools_sha256: String,
+    pub tool_count: usize,
+    pub permission_mode: String,
+    pub temperature: Option<f64>,
+    pub max_tokens: Option<usize>,
+    pub reasoning: Option<String>,
+    pub ts: u64,
+}
+
 /// Context compaction event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompactionEvent {
@@ -323,6 +372,8 @@ pub enum Event {
     Interrupted(Interrupted),
     Thinking(Thinking),
     Compaction(CompactionEvent),
+    ModelCall(ModelCall),
+    RunMeta(RunMeta),
     SubAgentProgress(SubAgentProgress),
     SubAgentComplete(SubAgentComplete),
     SubAgentError(SubAgentError),
@@ -430,5 +481,5 @@ pub type EventReceiver = tokio::sync::broadcast::Receiver<Event>;
 
 /// Create a new event broadcast channel with a reasonable buffer.
 pub fn event_channel() -> (EventSender, EventReceiver) {
-    tokio::sync::broadcast::channel(256)
+    tokio::sync::broadcast::channel(4096)
 }

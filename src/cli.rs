@@ -76,6 +76,39 @@ pub enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// Show token, cache, cost, latency and tool statistics for a session.
+    Stats {
+        /// Session ID or path to a session .jsonl file.
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a session as a Markdown transcript or raw JSON.
+    Export {
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// Output format: md | json.
+        #[arg(long, value_name = "FORMAT", default_value = "md")]
+        format: String,
+    },
+    /// Print a read-only timeline of a recorded session.
+    Replay {
+        #[arg(value_name = "SESSION")]
+        session: String,
+    },
+    /// Run an eval suite (TOML) against fixtures and report pass/fail and metrics.
+    Eval {
+        #[arg(value_name = "SUITE")]
+        suite: std::path::PathBuf,
+        /// Compare against a previous results file; exit non-zero on regressions.
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<std::path::PathBuf>,
+        /// Write results JSON here.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+    },
     /// Generate shell completions.
     #[command(name = "completions")]
     Completions {
@@ -127,6 +160,10 @@ pub struct Cli {
         help = "Resume a previous session by ID"
     )]
     pub resume: Option<String>,
+
+    /// Write a span trace (JSONL) to PATH; with no value, to .okeanos/traces/. Also: OKEANOS_TRACE.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true, default_missing_value = "auto", global = true)]
+    pub trace: Option<String>,
 
     /// Verbosity: -q (quiet/warn), -v (info), -vv (debug).
     #[arg(short = 'q', long = "quiet", action = clap::ArgAction::SetTrue, conflicts_with = "verbose", global = true)]

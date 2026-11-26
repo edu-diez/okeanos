@@ -492,7 +492,13 @@ impl SessionManager {
     /// Returns true if rotation occurred.
     pub fn log_event(&mut self, event: Event) -> Result<bool, SessionError> {
         // Live tool output is ephemeral; `tool_result` carries the final output.
-        if matches!(event, Event::ToolOutput(_)) {
+        // Streaming deltas are ephemeral too: the final `Message` carries the
+        // full text and thinking, so persisting each chunk only costs a write
+        // and a flush per token.
+        if matches!(
+            event,
+            Event::ToolOutput(_) | Event::Token(_) | Event::Thinking(_)
+        ) {
             return Ok(false);
         }
 
@@ -533,6 +539,11 @@ impl SessionManager {
 
         let line = serde_json::to_string(&entry)
             .map_err(|source| SessionError::SerializeEvent { source })?;
+        let line = if crate::observability::redact::enabled() {
+            crate::observability::redact::scrub(&line).into_owned()
+        } else {
+            line
+        };
 
         session
             .writer
@@ -946,6 +957,43 @@ impl SessionManager {
         path: &Path,
         segment_index: u32,
     ) -> Result<(SessionHeader, Vec<Event>, Vec<String>), SessionError> {
+        let (header, entries, warnings) = self.load_segment_entries(path, segment_index)?;
+        Ok((
+            header,
+            entries.into_iter().map(|e| e.event).collect(),
+            warnings,
+        ))
+    }
+
+    /// Like [`load_session`](Self::load_session) but keeps each event's timestamp.
+    pub fn load_session_entries(
+        &self,
+        session_id: &str,
+    ) -> Result<(SessionHeader, Vec<SessionEntry>, Vec<String>), SessionError> {
+        let segments = self.find_session_segments(session_id)?;
+        if segments.is_empty() {
+            return Err(SessionError::NotFound {
+                id: session_id.to_string(),
+            });
+        }
+        let mut entries = Vec::new();
+        let mut warnings = Vec::new();
+        let mut header = None;
+        for (segment_index, path) in segments {
+            let (seg_header, seg_entries, seg_warnings) =
+                self.load_segment_entries(&path, segment_index)?;
+            header.get_or_insert(seg_header);
+            entries.extend(seg_entries);
+            warnings.extend(seg_warnings);
+        }
+        Ok((header.unwrap(), entries, warnings))
+    }
+
+    fn load_segment_entries(
+        &self,
+        path: &Path,
+        segment_index: u32,
+    ) -> Result<(SessionHeader, Vec<SessionEntry>, Vec<String>), SessionError> {
         let is_compressed = path.extension().and_then(|s| s.to_str()) == Some("zst")
             || path.extension().and_then(|s| s.to_str()) == Some("gz");
 
@@ -1032,7 +1080,7 @@ impl SessionManager {
             }
 
             match serde_json::from_str::<SessionEntry>(line) {
-                Ok(entry) => events.push(entry.event),
+                Ok(entry) => events.push(entry),
                 Err(e) => {
                     warnings.push(format!(
                         "segment {} line {}: corrupted entry skipped: {}",

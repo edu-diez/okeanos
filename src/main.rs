@@ -48,10 +48,17 @@ use {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    let result = real_main().await;
+    okeanos::observability::shutdown();
+    result
+}
+
+#[allow(clippy::needless_return)]
+async fn real_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize tracing based on verbosity
-    init_tracing(cli.verbosity())?;
+    init_tracing(&cli)?;
 
     tracing::info!(mode = ?cli.mode(), "okeanos starting");
 
@@ -79,6 +86,23 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Models { action }) => {
             return cmd_models(action).await;
+        }
+        Some(Command::Stats { session, json }) => {
+            return cmd_stats(&cli, session, *json);
+        }
+        Some(Command::Export { session, format }) => {
+            return cmd_export(&cli, session, format);
+        }
+        Some(Command::Replay { session }) => {
+            return cmd_replay(&cli, session);
+        }
+        Some(Command::Eval {
+            suite,
+            baseline,
+            out,
+        }) => {
+            let ok = okeanos::eval::run_suite(suite, baseline.as_deref(), out.as_deref())?;
+            std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Run { prompt }) => run_with_prompt(&cli, prompt.clone()).await,
         None => {
@@ -246,19 +270,84 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
 }
 
 /// Initialize tracing subscriber based on verbosity level.
-fn init_tracing(verbosity: Verbosity) -> anyhow::Result<()> {
-    let filter = match verbosity {
+fn init_tracing(cli: &Cli) -> anyhow::Result<()> {
+    let filter = match cli.verbosity() {
         Verbosity::Quiet => EnvFilter::new("warn"),
         Verbosity::Info => EnvFilter::new("info"),
         Verbosity::Debug => EnvFilter::new("debug"),
     };
+    let sink = if cli.mode() == Mode::Interactive {
+        okeanos::observability::LogSink::FileOnly
+    } else {
+        okeanos::observability::LogSink::Stderr
+    };
+    let root = cli
+        .root
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let trace_path = okeanos::observability::resolve_trace_path(cli.trace.as_deref(), &root);
+    okeanos::observability::init_tracing(filter, sink, trace_path.as_deref())
+}
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("failed to install tracing subscriber: {e}"))?;
+/// Load session entries from a session id or a `.jsonl` file path.
+fn load_entries_for(
+    cli: &Cli,
+    session: &str,
+) -> anyhow::Result<(String, Vec<okeanos::session::header::SessionEntry>)> {
+    let path = std::path::Path::new(session);
+    if path.is_file() {
+        let text = std::fs::read_to_string(path).context("failed to read session file")?;
+        let entries = text
+            .lines()
+            .skip(1)
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        return Ok((session.to_string(), entries));
+    }
+    let config = Config::load_raw(cli.root.as_deref()).context("failed to load configuration")?;
+    let root = std::fs::canonicalize(cli.root.as_deref().unwrap_or(std::path::Path::new(".")))
+        .context("failed to resolve project root")?;
+    let sm = SessionManager::new_with_config(&root, config.rotation.clone())
+        .context("failed to create session manager")?;
+    let (_, entries, warnings) = sm
+        .load_session_entries(session)
+        .with_context(|| format!("failed to load session {session}"))?;
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok((session.to_string(), entries))
+}
 
+fn cmd_stats(cli: &Cli, session: &str, json: bool) -> anyhow::Result<()> {
+    let (_, entries) = load_entries_for(cli, session)?;
+    let stats = okeanos::observability::stats::SessionStats::from_entries(&entries);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        println!("{}", stats.render());
+    }
+    Ok(())
+}
+
+fn cmd_export(cli: &Cli, session: &str, format: &str) -> anyhow::Result<()> {
+    let (id, entries) = load_entries_for(cli, session)?;
+    match format {
+        "md" | "markdown" => println!(
+            "{}",
+            okeanos::observability::export::render_markdown(&id, &entries)
+        ),
+        "json" => println!("{}", serde_json::to_string_pretty(&entries)?),
+        other => anyhow::bail!("unknown export format '{other}' (use md or json)"),
+    }
+    Ok(())
+}
+
+fn cmd_replay(cli: &Cli, session: &str) -> anyhow::Result<()> {
+    let (_, entries) = load_entries_for(cli, session)?;
+    println!(
+        "{}",
+        okeanos::observability::export::render_timeline(&entries)
+    );
     Ok(())
 }
 
@@ -1594,6 +1683,9 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
                             _ => {}
                         }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(dropped = n, "event receiver lagged");
+                    }
                     Err(_) => break, // Channel closed
                 }
             }
@@ -1761,6 +1853,19 @@ fn build_active_model(
         Some(model) => Arc::new(ActiveModel::Provider(model)),
         None => {
             let m = MockModel::new(caps.clone(), model_name.to_string());
+            if let Ok(path) = std::env::var("OKEANOS_REPLAY_SESSION") {
+                // Deterministic re-run: feed recorded assistant turns to the mock.
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    let entries: Vec<okeanos::session::header::SessionEntry> = text
+                        .lines()
+                        .skip(1)
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect();
+                    m.push_responses(okeanos::observability::export::replay_responses(&entries));
+                    return Arc::new(ActiveModel::Mock(m));
+                }
+                tracing::warn!(path = %path, "OKEANOS_REPLAY_SESSION unreadable");
+            }
             m.push_response(okeanos::model::mock::MockModel::text_response(
                 "Task complete. I've finished the requested work.",
             ));

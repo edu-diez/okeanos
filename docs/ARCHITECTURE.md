@@ -346,6 +346,14 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 3. **Compaction:** instructions/memory live in the system prompt, outside the compactable history, so they are re-sent verbatim after every compaction and never summarised away.
 4. **Write:** `remember` → `Policy::check` (approval) → write `<scope dir>/<slug>.md` + upsert the index line. Takes effect next session.
 5. **Out of scope (deferred):** sub-agent inheritance of instructions/memory, background memory extraction/consolidation, session titles/search, `--continue`, dedicated todo-state log events.
+## Observability, tracing and evals
+
+- **Logs** go to stderr (never stdout); in TUI mode only to `OKEANOS_LOG_FILE`.
+- **Span trace:** `--trace[=PATH]` or `OKEANOS_TRACE` writes JSONL spans (`run`, `iteration`, `model_call`, `tool_call`, `compaction`) to `.okeanos/traces/`.
+- **Session log** records `RunMeta` (version, model, prompt/tool hashes) and a per-attempt `ModelCall` (TTFT, latency, usage, cost, errors). `Token`/`Thinking`/`ToolOutput` deltas are not persisted. Lines are scrubbed of secrets; set `OKEANOS_LOG_REDACT=0` to disable.
+- **OTLP export (optional):** build with `--features otel` and set `OTEL_EXPORTER_OTLP_ENDPOINT`; the same spans are sent over OTLP/HTTP.
+- **Commands:** `okeanos stats|export|replay <session>` and `okeanos eval <suite.json> [--baseline F] [--out F]`. Eval runs tasks on fixture copies, optionally replaying a recorded session via `OKEANOS_REPLAY_SESSION`.
+
 ## Dependency rules
 
 - **Primary crates (Phase 2 recommendation):** ratatui + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC).
