@@ -130,6 +130,7 @@ pub struct ReactLoop<M: Model> {
     start_time: Instant,
     shutdown_rx: Option<mpsc::Receiver<()>>,
     policy: Policy,
+    hooks: Arc<crate::harness::hooks::Hooks>,
     approval_rx: Option<mpsc::Receiver<Approval>>,
     /// Optional session manager for logging events to session log.
     session: Option<Arc<Mutex<SessionManager>>>,
@@ -233,6 +234,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             start_time: Instant::now(),
             shutdown_rx: None,
             policy: Policy::new(vec![]),
+            hooks: Arc::new(crate::harness::hooks::Hooks::default()),
             approval_rx: None,
             session: None,
             cost_tracker: None,
@@ -334,6 +336,12 @@ impl<M: Model + 'static> ReactLoop<M> {
     /// Set the permission policy used to gate tool execution.
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Set the lifecycle hooks run around tool calls.
+    pub fn with_hooks(mut self, hooks: Arc<crate::harness::hooks::Hooks>) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -1504,6 +1512,16 @@ impl<M: Model + 'static> ReactLoop<M> {
                 .await;
         }
 
+        if let crate::harness::hooks::PreToolOutcome::Block(reason) = self
+            .hooks
+            .pre_tool_use(&tool_call.name, &tool_call.args)
+            .await
+        {
+            return Err(ReactError::Tool(format!(
+                "blocked by PreToolUse hook: {reason}"
+            )));
+        }
+
         // Gate execution behind the permission policy.
         match self
             .policy
@@ -1576,7 +1594,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         let exec = tool.execute_streaming(tool_call.args.clone(), sink);
         tokio::pin!(exec);
         let mut seq = 0u64;
-        let exec_result = loop {
+        let mut exec_result = loop {
             tokio::select! {
                 biased;
                 Some(chunk) = output_rx.recv() => {
@@ -1593,6 +1611,16 @@ impl<M: Model + 'static> ReactLoop<M> {
         while let Ok(chunk) = output_rx.try_recv() {
             self.emit_tool_output(&tool_call, seq, chunk);
             seq += 1;
+        }
+
+        if let Some(feedback) = self
+            .hooks
+            .post_tool_use(&tool_call.name, &tool_call.args, &exec_result.output)
+            .await
+        {
+            exec_result
+                .output
+                .push_str(&format!("\n[PostToolUse hook]\n{feedback}"));
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;

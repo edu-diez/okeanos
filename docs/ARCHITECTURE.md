@@ -371,3 +371,13 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 - **Transport:** stdio JSON-RPC first; HTTP/WebSocket via `jsonrpsee` behind the `rpc` feature. Adding a transport means implementing `HeadlessDriver`, not touching the loop.
 - **Session log:** Append-only JSONL is unbounded by design at MVP; rotation/archiving can be added in `src/session/` without affecting the loop. **Sub-agent events are tagged with `subagent_id` in the parent's log for traceability.**
 - **Workspace isolation:** `branch` mode creates git worktrees via gix; cleanup on sub-agent completion. Number of concurrent worktrees bounded by spawn budget. No persistent disk growth.
+
+## Tooling, skills and extensibility (update)
+
+- **Tool order** is deterministic (BTreeMap) for prompt-cache stability; per-tier sets come from 	ool::builtin_registry.
+- **read** is line-numbered with offset/limit; **grep** uses the ignore crate (gitignore, glob filter, context); **glob** finds files; **edit** is available on every tier.
+- **MCP**: parallel connect, per-call 	imeout_secs, one reconnect, stderr drained, spec cache (DeferCached), tool deferral behind 	ool_search when more than defer_tools_over tools exist, project .mcp.json. Unannotated MCP tools require approval (Network). Streamable HTTP is not enabled in this build (needs a C toolchain for ws-lc-rs).
+- **Built-in MCP servers**: `context7` (library docs, `https://mcp.context7.com/mcp`) and `gh_grep` (GitHub code search, `https://mcp.grep.app`) are connected by default as read-only Streamable HTTP servers (no login, no approval prompts, 8s connect budget, `DeferCached` startup unless `[mcp] startup_policy` is set; tools are deferred behind `tool_search`). Failures are non-fatal (offline works). Query text is sent to those third-party services: disable all with `[mcp] builtin_servers = false` or one via `[[mcp.servers]] name = "gh_grep" enabled = false`. `read_only = true` on any server downgrades its tools to the Read category.
+- **Skills**: <root>/<name>/SKILL.md with frontmatter; only a name/description index is in the system prompt and the skill tool loads bodies. Roots: configured dir, .okeanos/, .claude/, .agents/ skills (project, then home).
+- **Hooks**: [[hooks]] (PreToolUse/PostToolUse, regex matcher, command); exit 2 blocks or feeds back stderr.
+- **ACP**: okeanos::acp provides the JSON-RPC/event translation layer; run it with `okeanos --acp` (stdio, newline-delimited JSON-RPC; supports session/new, session/prompt, session/cancel and session/request_permission).

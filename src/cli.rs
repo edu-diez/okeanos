@@ -124,6 +124,17 @@ pub struct Cli {
     )]
     pub rpc: bool,
 
+    /// Run as an Agent Client Protocol (ACP) agent over stdio (for editors/IDEs).
+    #[arg(
+        long,
+        conflicts_with = "headless",
+        conflicts_with = "interactive",
+        conflicts_with = "rpc",
+        conflicts_with = "rpc_ws",
+        global = true
+    )]
+    pub acp: bool,
+
     /// Run in JSON-RPC mode over WebSocket (requires 'rpc' feature).
     #[arg(
         long,
@@ -312,11 +323,14 @@ pub enum Mode {
     Headless,
     Rpc,
     RpcWs,
+    Acp,
 }
 
 impl Cli {
     pub fn mode(&self) -> Mode {
-        if self.rpc {
+        if self.acp {
+            Mode::Acp
+        } else if self.rpc {
             Mode::Rpc
         } else if self.rpc_ws.is_some() {
             Mode::RpcWs

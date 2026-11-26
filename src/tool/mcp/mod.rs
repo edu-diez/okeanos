@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) client integration.
 //!
-//! Provides lazy MCP server handling behind the `mcp` feature flag.
-//! - MCP client with stdio transport
+//! Provides lazy, deferred MCP server handling behind the `mcp` feature flag.
+//! - MCP client with stdio and Streamable HTTP transports
 //! - Tool discovery from MCP servers at runtime
 //! - Register discovered tools in `ToolRegistry`
 
@@ -9,10 +9,22 @@
 pub mod client;
 
 #[cfg(feature = "mcp")]
+pub mod presets;
+
+#[cfg(feature = "mcp")]
+pub mod project_config;
+
+#[cfg(feature = "mcp")]
 pub mod tool;
 
 #[cfg(feature = "mcp")]
-pub use client::{McpClient, McpClientConfig, McpError, McpServerConfig, McpStartupPolicy};
+pub use project_config::{load_project_mcp_json, parse_mcp_json};
 
 #[cfg(feature = "mcp")]
-pub use tool::McpTool;
+pub use client::{
+    DiscoveredTool, McpClient, McpClientConfig, McpError, McpServerConfig, McpStartupPolicy,
+    prefixed_tool_name,
+};
+
+#[cfg(feature = "mcp")]
+pub use tool::{McpTool, register_mcp_tools};

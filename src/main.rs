@@ -21,12 +21,11 @@ use okeanos::model::{
 };
 use okeanos::session::{SessionManager, replay_events};
 use okeanos::snapshot::store::SnapshotStore;
-use okeanos::tool::builtin::{DeleteTool, EditTool, GrepTool, ReadTool, RunTool, WriteTool};
-use okeanos::tool::{TodoList, TodoTool};
+use okeanos::tool::TodoList;
 use okeanos::tool::{ToolRegistry, ToolSpec};
 
 #[cfg(feature = "mcp")]
-use okeanos::tool::mcp::{McpClient, McpClientConfig, McpServerConfig, McpStartupPolicy, McpTool};
+use okeanos::tool::mcp::{McpClient, McpClientConfig, McpServerConfig, McpStartupPolicy};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -246,6 +245,7 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
         Mode::Headless => run_headless(cli, &config, prompt).await,
         Mode::Rpc => run_rpc(cli, &config, prompt).await,
         Mode::RpcWs => run_rpc_ws(cli, &config, prompt).await,
+        Mode::Acp => run_acp(cli, &config).await,
     }
 }
 
@@ -410,6 +410,9 @@ allow_list = ["todo", "read", "grep"]
 # [mcp]
 # Startup policy: "eager", "defer_cached", or "defer_explicit" (default: "eager")
 # startup_policy = "eager"
+# Above this many MCP tools, schemas are withheld and found via `tool_search` (0 = off)
+# defer_tools_over = 12
+# Servers in <project>/.mcp.json are also loaded (config.toml wins on name clashes).
 # List of MCP servers to connect to
 # [[mcp.servers]]
 # name = "filesystem"
@@ -427,6 +430,12 @@ allow_list = ["todo", "read", "grep"]
 # env = { GITHUB_PERSONAL_ACCESS_TOKEN = "{env:GITHUB_TOKEN}" }
 # enabled = true
 # timeout_secs = 30
+#
+# Streamable HTTP server:
+# [[mcp.servers]]
+# name = "remote"
+# url = "https://example.com/mcp"
+# bearer_token = "{env:REMOTE_MCP_TOKEN}"
 "#
     .to_string()
 }
@@ -866,54 +875,14 @@ async fn run_interactive_tui(
 
     // Create tool registry with tier-appropriate tools (using restored todo list)
     let todo_list = restored_todos;
-    let mut tools = ToolRegistry::new();
-
-    // Register tools based on model tier
-    let _allowed_tools = match model_tier {
-        okeanos::model::ModelTier::Small => {
-            // Small: read, edit, run
-            tools.register(ReadTool::new());
-            tools.register(EditTool::with_format(edit_format));
-            tools.register(RunTool::new());
-            vec!["read".to_string(), "edit".to_string(), "run".to_string()]
-        }
-        okeanos::model::ModelTier::Mid => {
-            // Mid: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-            vec![
-                "todo".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-                "delete".to_string(),
-                "run".to_string(),
-                "grep".to_string(),
-            ]
-        }
-        okeanos::model::ModelTier::Frontier => {
-            // Frontier: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-            vec![
-                "todo".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-                "delete".to_string(),
-                "run".to_string(),
-                "grep".to_string(),
-            ]
-        }
-    };
+    let mut tools = okeanos::tool::builtin_registry(model_tier, edit_format, &todo_list);
 
     register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
+    register_skill_tool(
+        &mut tools,
+        config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_root,
+    );
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -993,6 +962,7 @@ async fn run_interactive_tui(
     // log events to the session_manager in run_tui_and_loop.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
+        .with_hooks(build_hooks(config, &project_root))
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
         .with_compaction(okeanos::context::CompactionConfig::from_section(
@@ -1589,54 +1559,14 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
 
     // Create tool registry with tier-appropriate tools (using restored todo list)
     let todo_list = restored_todos;
-    let mut tools = ToolRegistry::new();
-
-    // Register tools based on model tier
-    let _allowed_tools = match model_tier {
-        okeanos::model::ModelTier::Small => {
-            // Small: read, edit, run
-            tools.register(ReadTool::new());
-            tools.register(EditTool::with_format(edit_format));
-            tools.register(RunTool::new());
-            vec!["read".to_string(), "edit".to_string(), "run".to_string()]
-        }
-        okeanos::model::ModelTier::Mid => {
-            // Mid: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-            vec![
-                "todo".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-                "delete".to_string(),
-                "run".to_string(),
-                "grep".to_string(),
-            ]
-        }
-        okeanos::model::ModelTier::Frontier => {
-            // Frontier: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-            vec![
-                "todo".to_string(),
-                "read".to_string(),
-                "write".to_string(),
-                "delete".to_string(),
-                "run".to_string(),
-                "grep".to_string(),
-            ]
-        }
-    };
+    let mut tools = okeanos::tool::builtin_registry(model_tier, edit_format, &todo_list);
 
     register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
+    register_skill_tool(
+        &mut tools,
+        config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_root,
+    );
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -1693,6 +1623,7 @@ async fn run_headless(cli: &Cli, config: &Config, prompt: Option<String>) -> any
     // for end_session() at the end. Instead, we manually log events.
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
         .with_policy(policy)
+        .with_hooks(build_hooks(config, &project_root))
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
         .with_compaction(okeanos::context::CompactionConfig::from_section(
@@ -1899,7 +1830,454 @@ fn apply_cli_overrides(
     (model_name, model_capabilities, generation_params)
 }
 
-/// List of available tools for dry-run display.
+/// Build the active model: a real provider when an API key is configured,
+/// otherwise the mock model.
+fn build_active_model(
+    config: &Config,
+    model_name: &str,
+    caps: &ModelCapabilities,
+) -> Arc<ActiveModel> {
+    if let Some(provider) = &config.provider
+        && let Some(api_key) = &provider.api_key
+        && !api_key.is_empty()
+    {
+        let base_url = provider
+            .base_url
+            .as_deref()
+            .unwrap_or(match provider.kind.as_deref() {
+                Some("anthropic") => okeanos::model::ANTHROPIC_DEFAULT_BASE_URL,
+                Some("openai") => okeanos::model::OPENAI_DEFAULT_BASE_URL,
+                Some("google") => okeanos::model::GOOGLE_DEFAULT_BASE_URL,
+                _ => okeanos::model::DEFAULT_BASE_URL,
+            });
+        let client = reqwest::Client::new();
+        let caps = caps.clone();
+        return match provider.kind.as_deref().unwrap_or("openai-compatible") {
+            "anthropic" => Arc::new(ActiveModel::Anthropic(AnthropicModel::new(
+                client, base_url, api_key, model_name, caps, None,
+            ))),
+            "openai" => Arc::new(ActiveModel::OpenAI(OpenAIModel::new(
+                client, base_url, api_key, model_name, caps, None,
+            ))),
+            "google" => Arc::new(ActiveModel::Google(GoogleModel::new(
+                client, base_url, api_key, model_name, caps, None,
+            ))),
+            _ => Arc::new(ActiveModel::OpenRouter(OpenRouterModel::new(
+                client, base_url, api_key, model_name, caps, None,
+            ))),
+        };
+    }
+    let m = MockModel::new(caps.clone(), model_name.to_string());
+    m.push_response(okeanos::model::mock::MockModel::text_response(
+        "Task complete. I've finished the requested work.",
+    ));
+    Arc::new(ActiveModel::Mock(m))
+}
+
+struct AcpPrompt {
+    id: serde_json::Value,
+    text: String,
+}
+
+struct AcpSession {
+    prompt_tx: mpsc::Sender<AcpPrompt>,
+    cancel: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>>,
+}
+
+type AcpPending = Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+    >,
+>;
+
+static ACP_PERM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone)]
+struct AcpCtx {
+    session_id: String,
+    out_tx: mpsc::UnboundedSender<serde_json::Value>,
+    pending: AcpPending,
+    approval_tx: mpsc::Sender<Approval>,
+    /// `Some` when the CLI approval policy decides without asking the client.
+    auto_decision: Option<ApprovalDecision>,
+    session: Arc<Mutex<SessionManager>>,
+}
+
+impl AcpCtx {
+    async fn handle_event(&self, event: Event) {
+        self.session.lock().await.log_event(event.clone()).ok();
+
+        if let Event::ApprovalRequest(req) = &event {
+            let ctx = self.clone();
+            let req = req.clone();
+            tokio::spawn(async move {
+                let decision = match ctx.auto_decision.clone() {
+                    Some(d) => d,
+                    None => {
+                        let rpc_id = format!(
+                            "perm-{}",
+                            ACP_PERM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        );
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        ctx.pending.lock().unwrap().insert(rpc_id.clone(), tx);
+                        let _ = ctx.out_tx.send(okeanos::acp::permission_request(
+                            &rpc_id,
+                            &ctx.session_id,
+                            &req,
+                        ));
+                        match rx.await {
+                            Ok(v) => okeanos::acp::permission_decision(&v),
+                            Err(_) => ApprovalDecision::Deny,
+                        }
+                    }
+                };
+                let _ = ctx
+                    .approval_tx
+                    .send(Approval {
+                        id: req.id,
+                        decision,
+                    })
+                    .await;
+            });
+            return;
+        }
+
+        if let Some(update) = okeanos::acp::event_to_update(&self.session_id, &event) {
+            let _ = self.out_tx.send(update);
+        }
+    }
+}
+
+/// Create one ACP session: a fully wired `ReactLoop` owned by a task that
+/// serves prompts sequentially and streams events as `session/update`.
+async fn acp_new_session(
+    cli: &Cli,
+    config: &Config,
+    cwd: Option<String>,
+    out_tx: mpsc::UnboundedSender<serde_json::Value>,
+    pending: AcpPending,
+) -> anyhow::Result<(String, AcpSession)> {
+    let (model_name, model_capabilities, generation_params) = apply_cli_overrides(cli, config);
+
+    let root = match cwd {
+        Some(c) => std::path::PathBuf::from(c),
+        None => cli
+            .root
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    };
+    let project_root = std::fs::canonicalize(&root).context("failed to resolve session cwd")?;
+    let cwd = project_root.clone();
+
+    let mut session_manager =
+        SessionManager::new_with_config(&project_root, config.rotation.clone())
+            .context("failed to create session manager")?;
+    let session_id = session_manager
+        .start_session(&cwd, &project_root)
+        .context("failed to start session")?;
+    let session = Arc::new(Mutex::new(session_manager));
+
+    let (event_tx, event_rx) = okeanos::events::event_channel();
+    let model_tier = model_capabilities.tier;
+    let context_cap = config
+        .context
+        .as_ref()
+        .and_then(|c| c.cap)
+        .unwrap_or(model_capabilities.max_context)
+        .max(1);
+    let model = build_active_model(config, &model_name, &model_capabilities);
+
+    let memory_cfg = MemoryConfig::from_section(config.memory.as_ref());
+    let project_ctx = ProjectContext::load(
+        &project_root,
+        &cwd,
+        user_config_dir().as_deref(),
+        model_tier,
+        &memory_cfg,
+    );
+    let skills_dir = config.model.as_ref().and_then(|m| m.skills_dir.as_deref());
+    let system_prompt = build_system_prompt_with_context(model_tier, skills_dir, &project_ctx)
+        .context("failed to build system prompt")?;
+
+    let cost_tracker = config.cost.as_ref().and_then(|c| {
+        let cfg = CostBudgetConfig::from_config_section(c);
+        cfg.is_enabled().then(|| {
+            CostTracker::new(
+                cfg,
+                model_name.clone(),
+                Arc::new(default_pricing_table()),
+                model_capabilities.clone(),
+            )
+        })
+    });
+
+    let edit_format = model_capabilities.edit_format;
+    let conversation =
+        Conversation::with_system_prompt(system_prompt, context_cap, model_capabilities);
+
+    let todo_list = TodoList::new();
+    let mut tools = okeanos::tool::builtin_registry(model_tier, edit_format, &todo_list);
+    register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
+    register_skill_tool(&mut tools, skills_dir, &project_root);
+    #[cfg(feature = "mcp")]
+    let _mcp_client = { init_mcp_client(&mut tools, config).await? };
+
+    let agent_registry = Arc::new(
+        config
+            .load_agent_registry(Arc::new(tools.clone()))
+            .context("failed to load agent registry")?,
+    );
+    let allow_list = config
+        .permissions
+        .as_ref()
+        .and_then(|p| p.allow_list.clone())
+        .unwrap_or_else(|| vec!["todo".to_string()]);
+
+    let (approval_tx, approval_rx) = mpsc::channel(16);
+    let react_config = ReactConfig {
+        max_iterations: config
+            .context
+            .as_ref()
+            .and_then(|c| c.max_iterations)
+            .unwrap_or(50),
+        max_elapsed_sec: config
+            .context
+            .as_ref()
+            .and_then(|c| c.max_elapsed_sec)
+            .unwrap_or(300),
+        generation_params,
+        ..Default::default()
+    };
+
+    let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx)
+        .with_policy(Policy::new(allow_list))
+        .with_hooks(build_hooks(config, &project_root))
+        .with_approval_receiver(approval_rx)
+        .with_project_root(project_root.clone())
+        .with_compaction(okeanos::context::CompactionConfig::from_section(
+            config.compaction.as_ref(),
+        ))
+        .with_agent_registry(agent_registry);
+    if let Some(summarizer) = build_summarizer(config) {
+        loop_ = loop_.with_summarizer_model(summarizer);
+    }
+    if config
+        .snapshots
+        .as_ref()
+        .and_then(|s| s.enabled)
+        .unwrap_or(false)
+        || cli.snapshots
+    {
+        loop_ = loop_.with_snapshot_store(
+            SnapshotStore::new(&project_root).context("failed to create snapshot store")?,
+        );
+    }
+    if let Some(tracker) = cost_tracker {
+        loop_ = loop_.with_cost_tracker(tracker);
+    }
+
+    let ctx = AcpCtx {
+        session_id: session_id.clone(),
+        out_tx: out_tx.clone(),
+        pending,
+        approval_tx,
+        auto_decision: match cli.approval_policy {
+            okeanos::cli::ApprovalPolicy::Auto => Some(ApprovalDecision::Allow),
+            okeanos::cli::ApprovalPolicy::Deny => Some(ApprovalDecision::Deny),
+            okeanos::cli::ApprovalPolicy::Prompt => None,
+        },
+        session,
+    };
+
+    let (prompt_tx, mut prompt_rx) = mpsc::channel::<AcpPrompt>(8);
+    let cancel: Arc<std::sync::Mutex<Option<mpsc::Sender<()>>>> = Arc::default();
+    let cancel_task = cancel.clone();
+
+    tokio::spawn(async move {
+        use okeanos::harness::{LoopDecision, ReactError};
+        let mut event_rx = event_rx;
+        while let Some(job) = prompt_rx.recv().await {
+            let (stop_tx, stop_rx) = mpsc::channel(1);
+            *cancel_task.lock().unwrap() = Some(stop_tx);
+
+            let result = {
+                let turn = loop_.run_turn(job.text, stop_rx);
+                tokio::pin!(turn);
+                loop {
+                    tokio::select! {
+                        biased;
+                        ev = event_rx.recv() => {
+                            if let Ok(ev) = ev {
+                                ctx.handle_event(ev).await;
+                            }
+                        }
+                        r = &mut turn => break r,
+                    }
+                }
+            };
+            *cancel_task.lock().unwrap() = None;
+            while let Ok(ev) = event_rx.try_recv() {
+                ctx.handle_event(ev).await;
+            }
+
+            let reply = match result {
+                Ok(LoopDecision::Complete(_) | LoopDecision::Continue) => {
+                    okeanos::acp::response(&job.id, okeanos::acp::prompt_result("end_turn"))
+                }
+                Ok(LoopDecision::Stop(_)) | Err(ReactError::MaxIterations { .. }) => {
+                    okeanos::acp::response(
+                        &job.id,
+                        okeanos::acp::prompt_result("max_turn_requests"),
+                    )
+                }
+                Err(ReactError::Interrupted) => {
+                    okeanos::acp::response(&job.id, okeanos::acp::prompt_result("cancelled"))
+                }
+                Err(e) => okeanos::acp::error_response(&job.id, -32000, &e.to_string()),
+            };
+            let _ = ctx.out_tx.send(reply);
+        }
+        ctx.session.lock().await.end_session().ok();
+    });
+
+    Ok((session_id, AcpSession { prompt_tx, cancel }))
+}
+
+/// Agent Client Protocol server over stdio (newline-delimited JSON-RPC).
+/// stdout carries protocol messages only; diagnostics go to stderr.
+async fn run_acp(cli: &Cli, config: &Config) -> anyhow::Result<()> {
+    use okeanos::acp::{self, AcpRequest};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(msg) = out_rx.recv().await {
+            let mut line = msg.to_string();
+            line.push('\n');
+            if stdout.write_all(line.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let pending: AcpPending = Arc::default();
+    let mut sessions: std::collections::HashMap<String, AcpSession> =
+        std::collections::HashMap::new();
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Replies to requests we sent (permission prompts).
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+            && let Some((id, res)) = acp::parse_client_response(&v)
+        {
+            let waiter = pending.lock().unwrap().remove(&id);
+            if let Some(tx) = waiter {
+                let _ =
+                    tx.send(res.unwrap_or_else(
+                        |_| serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+                    ));
+            }
+            continue;
+        }
+
+        let request = match acp::parse_request(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[ACP] ignoring malformed message: {e}");
+                continue;
+            }
+        };
+        match request {
+            AcpRequest::Initialize { id } => {
+                let _ = out_tx.send(acp::response(&id, acp::initialize_result()));
+            }
+            AcpRequest::NewSession { id, cwd } => {
+                match acp_new_session(cli, config, cwd, out_tx.clone(), pending.clone()).await {
+                    Ok((sid, session)) => {
+                        let _ =
+                            out_tx.send(acp::response(&id, serde_json::json!({"sessionId": sid})));
+                        sessions.insert(sid, session);
+                    }
+                    Err(e) => {
+                        let _ = out_tx.send(acp::error_response(&id, -32000, &format!("{e:#}")));
+                    }
+                }
+            }
+            AcpRequest::Prompt {
+                id,
+                session_id,
+                text,
+            } => match sessions.get(&session_id) {
+                Some(s) => {
+                    if s.prompt_tx
+                        .try_send(AcpPrompt {
+                            id: id.clone(),
+                            text,
+                        })
+                        .is_err()
+                    {
+                        let _ = out_tx.send(acp::error_response(&id, -32000, "session is busy"));
+                    }
+                }
+                None => {
+                    let _ = out_tx.send(acp::error_response(&id, -32602, "unknown sessionId"));
+                }
+            },
+            AcpRequest::Cancel { session_id } => {
+                if let Some(s) = sessions.get(&session_id)
+                    && let Some(stop) = s.cancel.lock().unwrap().clone()
+                {
+                    let _ = stop.try_send(());
+                }
+            }
+            AcpRequest::Unsupported { id, method } => {
+                if let Some(id) = id {
+                    let _ = out_tx.send(acp::error_response(
+                        &id,
+                        -32601,
+                        &format!("method not found: {method}"),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Stdin closed: stop sessions and flush pending output.
+    drop(sessions);
+    drop(out_tx);
+    let _ = writer.await;
+    Ok(())
+}
+
+/// Compile [[hooks]] from config; invalid hooks are reported and skipped.
+fn build_hooks(config: &Config, project_root: &std::path::Path) -> Arc<okeanos::harness::Hooks> {
+    match okeanos::harness::Hooks::new(&config.hooks, Some(project_root.to_path_buf())) {
+        Ok(h) => Arc::new(h),
+        Err(e) => {
+            eprintln!("[WARN] {e}; hooks disabled");
+            Arc::new(okeanos::harness::Hooks::default())
+        }
+    }
+}
+
+/// Register the skill tool when any skills are discoverable.
+fn register_skill_tool(
+    tools: &mut ToolRegistry,
+    configured: Option<&std::path::Path>,
+    project_root: &std::path::Path,
+) {
+    let roots = okeanos::context::skills::skill_roots(configured, project_root);
+    let skills = okeanos::context::skills::discover_skills(&roots);
+    if !skills.is_empty() {
+        tools.register(okeanos::tool::builtin::SkillTool::new(skills));
+    }
+}
+
 /// Register the `remember` tool for tiers that load the memory index.
 fn register_memory_tool(
     tools: &mut ToolRegistry,
@@ -1915,6 +2293,7 @@ fn register_memory_tool(
     }
 }
 
+/// List of available tools for dry-run display.
 fn tools_list() -> Vec<&'static str> {
     vec!["todo", "read", "write", "edit", "delete", "run", "grep"]
 }
@@ -1943,6 +2322,10 @@ fn config_to_mcp_client_config(config: &Config) -> McpClientConfig {
             };
         }
 
+        if let Some(limit) = mcp_section.defer_tools_over {
+            client_config.defer_tools_over = limit;
+        }
+
         // Convert servers
         for server_section in &mcp_section.servers {
             let mut env = HashMap::new();
@@ -1958,6 +2341,9 @@ fn config_to_mcp_client_config(config: &Config) -> McpClientConfig {
                 cwd: server_section.cwd.clone(),
                 enabled: server_section.enabled,
                 timeout_secs: server_section.timeout_secs,
+                url: server_section.url.clone(),
+                bearer_token: server_section.bearer_token.clone(),
+                read_only: server_section.read_only,
             };
             client_config.servers.push(server_config);
         }
@@ -1972,7 +2358,36 @@ async fn init_mcp_client(
     tools: &mut ToolRegistry,
     config: &Config,
 ) -> anyhow::Result<Option<Arc<McpClient>>> {
-    let client_config = config_to_mcp_client_config(config);
+    let mut client_config = config_to_mcp_client_config(config);
+    // `.mcp.json` servers are added unless config.toml already defines the name.
+    if let Ok(cwd) = std::env::current_dir() {
+        for server in okeanos::tool::mcp::load_project_mcp_json(&cwd) {
+            if !client_config.servers.iter().any(|s| s.name == server.name) {
+                client_config.servers.push(server);
+            }
+        }
+    }
+    // Built-ins last, so user/project definitions of the same name win.
+    if config
+        .mcp
+        .as_ref()
+        .and_then(|m| m.builtin_servers)
+        .unwrap_or(true)
+    {
+        let builtins = okeanos::tool::mcp::presets::builtin_servers(&client_config.servers);
+        if !builtins.is_empty() {
+            if config
+                .mcp
+                .as_ref()
+                .and_then(|m| m.startup_policy.as_ref())
+                .is_none()
+            {
+                // Avoid network round-trips on every start once tools are cached.
+                client_config.startup_policy = McpStartupPolicy::DeferCached;
+            }
+            client_config.servers.extend(builtins);
+        }
+    }
     if client_config.servers.is_empty() {
         return Ok(None);
     }
@@ -1984,22 +2399,7 @@ async fn init_mcp_client(
         eprintln!("[WARN] Some MCP servers failed to connect: {}", e);
     }
 
-    // Register discovered tools
-    let discovered_tools = client.discovered_tools().await;
-    for spec in discovered_tools {
-        // Extract server name and tool name from the prefixed name (mcp__{server}__{tool})
-        if let Some(rest) = spec.name.strip_prefix("mcp__")
-            && let Some((server_name, tool_name)) = rest.split_once("__")
-        {
-            let mcp_tool = McpTool::new(
-                client.clone(),
-                server_name.to_string(),
-                tool_name.to_string(),
-                spec,
-            );
-            tools.register(mcp_tool);
-        }
-    }
+    okeanos::tool::mcp::register_mcp_tools(&client, tools).await;
 
     Ok(Some(client))
 }
@@ -2311,37 +2711,14 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
 
     // Create tool registry with tier-appropriate tools
     let todo_list = restored_todos;
-    let mut tools = ToolRegistry::new();
-
-    // Register tools based on model tier
-    match model_tier {
-        okeanos::model::ModelTier::Small => {
-            // Small: read, edit, run
-            tools.register(ReadTool::new());
-            tools.register(EditTool::with_format(edit_format));
-            tools.register(RunTool::new());
-        }
-        okeanos::model::ModelTier::Mid => {
-            // Mid: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-        }
-        okeanos::model::ModelTier::Frontier => {
-            // Frontier: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-        }
-    }
+    let mut tools = okeanos::tool::builtin_registry(model_tier, edit_format, &todo_list);
 
     register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
+    register_skill_tool(
+        &mut tools,
+        config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_root,
+    );
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -2448,6 +2825,7 @@ async fn run_rpc(cli: &Cli, config: &Config, prompt: Option<String>) -> anyhow::
     let event_tx_for_loop = event_tx.clone();
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx_for_loop)
         .with_policy(policy)
+        .with_hooks(build_hooks(config, &project_root))
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
         .with_compaction(okeanos::context::CompactionConfig::from_section(
@@ -2892,37 +3270,14 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
 
     // Create tool registry with tier-appropriate tools
     let todo_list = restored_todos;
-    let mut tools = ToolRegistry::new();
-
-    // Register tools based on model tier
-    match model_tier {
-        okeanos::model::ModelTier::Small => {
-            // Small: read, edit, run
-            tools.register(ReadTool::new());
-            tools.register(EditTool::with_format(edit_format));
-            tools.register(RunTool::new());
-        }
-        okeanos::model::ModelTier::Mid => {
-            // Mid: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-        }
-        okeanos::model::ModelTier::Frontier => {
-            // Frontier: todo, read, write, delete, run, grep
-            tools.register(TodoTool::new(todo_list.clone()));
-            tools.register(ReadTool::new());
-            tools.register(WriteTool::new());
-            tools.register(DeleteTool::new());
-            tools.register(RunTool::new());
-            tools.register(GrepTool::new());
-        }
-    }
+    let mut tools = okeanos::tool::builtin_registry(model_tier, edit_format, &todo_list);
 
     register_memory_tool(&mut tools, &memory_cfg, model_tier, &project_root);
+    register_skill_tool(
+        &mut tools,
+        config.model.as_ref().and_then(|m| m.skills_dir.as_deref()),
+        &project_root,
+    );
 
     // Initialize MCP client and register discovered tools (feature-gated)
     #[cfg(feature = "mcp")]
@@ -3041,6 +3396,7 @@ async fn run_rpc_ws(cli: &Cli, config: &Config, prompt: Option<String>) -> anyho
     let event_tx_for_loop = event_tx.clone();
     let mut loop_ = ReactLoop::new(model, conversation, tools, react_config, event_tx_for_loop)
         .with_policy(policy)
+        .with_hooks(build_hooks(config, &project_root))
         .with_approval_receiver(approval_rx)
         .with_project_root(project_root.clone())
         .with_compaction(okeanos::context::CompactionConfig::from_section(

@@ -571,6 +571,15 @@ pub fn build_system_prompt_with_context(
 ) -> Result<String, ConversationError> {
     let mut prompt = build_system_prompt(tier, skills_dir)?;
     prompt.push_str(&project.render());
+    let root = project
+        .project_root
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let skills = crate::context::skills::discover_skills(&crate::context::skills::skill_roots(
+        skills_dir, &root,
+    ));
+    prompt.push_str(&crate::context::skills::render_index(&skills));
     Ok(prompt)
 }
 fn system_prompt_for_tier(tier: ModelTier) -> &'static str {

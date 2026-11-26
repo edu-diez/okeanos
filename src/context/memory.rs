@@ -91,6 +91,8 @@ pub struct ProjectContext {
     pub instructions: Vec<InstructionFile>,
     /// `None` when memory is disabled or the tier does not support it.
     pub memory: Option<Vec<MemoryIndex>>,
+    /// Project root the context was loaded for (used to locate skills).
+    pub project_root: Option<PathBuf>,
 }
 
 /// User-level okeanos directory (`$XDG_CONFIG_HOME/okeanos` or `~/.config/okeanos`).
@@ -128,7 +130,10 @@ impl ProjectContext {
         tier: ModelTier,
         cfg: &MemoryConfig,
     ) -> Self {
-        let mut ctx = Self::default();
+        let mut ctx = Self {
+            project_root: Some(project_root.to_path_buf()),
+            ..Self::default()
+        };
 
         if cfg.instructions {
             let mut dirs: Vec<PathBuf> = Vec::new();

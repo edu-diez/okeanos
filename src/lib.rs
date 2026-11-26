@@ -3,6 +3,7 @@
 //! Milestone 1: config layering + secret substitution.
 //! Milestone 2: core harness loop (Model, Context, ReAct).
 
+pub mod acp;
 pub mod cli;
 pub mod config;
 pub mod context;

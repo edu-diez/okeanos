@@ -1009,6 +1009,17 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.15.0`
 - ☐ Tag `v0.15.0`
 
+### Milestone 32a — Tooling, skills and protocol extensibility
+**Status:** complete - v0.16.0
+
+**Scope:** stable (sorted) tool order; line-numbered `read` with offset/limit; `.gitignore`-aware `grep` and new `glob` (pure-Rust `ignore` crate); tier-based `builtin_registry`; built-in no-login MCP servers (context7, gh_grep); MCP overhaul (parallel connect, timeouts, reconnect, spec cache, `tool_search` deferral, `.mcp.json`, Streamable HTTP over rustls/ring, unannotated tools gated as `Network`); skills as progressive disclosure (`SKILL.md` index + `skill` tool); `[[hooks]]` PreToolUse/PostToolUse; `okeanos --acp` (ACP over stdio).
+- **Out of scope:** MCP image/audio content (→ M34), OAuth for HTTP MCP servers (→ M35).
+
+**Definition of Done:**
+- ✅ ARCHITECTURE.md, PRODUCT_SPEC.md (FR-13/14), AGENTS.md updated
+- ✅ Unit tests for skills, hooks, ACP translation, grep/read/glob, tool registry
+- ✅ `Cargo.toml` bumped to `0.16.0`; tag `v0.16.0`
+
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
 
@@ -1018,6 +1029,8 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | M31 | Incremental output: `Tool` trait gains an output-event channel; `run` streams chunks as `ToolOutput` events (TUI + headless parity per DESIGN.md §7). | AGENTS.md already requires streaming; currently output is returned at completion. Needs DESIGN.md §7 update first. |
 | M32 | Background processes: `run` `background: true` + poll/kill handle; Job Object/process group reuse. | Needed for dev servers/watchers. |
 | M33 | Policy depth: file-based exec-policy rules (allow/ask/deny, prefix/glob), compound-command parsing for shell-style invocations, env allowlist mode, dedicated `Process` tool category (today `run` is categorised `Network`), persistent shell session (optional). | Config schema change → document in ARCHITECTURE config section. |
+| M34 | Multimodal MCP results: map MCP image/audio content blocks to model image inputs (instead of flattening to text) for providers that support them; text placeholder otherwise. | Depends on Message content-part support in the Model trait; capability-gated per DESIGN of ModelCapabilities. |
+| M35 | MCP OAuth for Streamable HTTP servers: rmcp auth flow, token store (0600), refresh, okeanos mcp login <server>. | Secrets stay out of config; must stay pure Rust (no C deps). |
 
 ---
 
@@ -1067,6 +1080,8 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 31 | ✅ Incremental tool output events | 1–2 | M29, M12 |
 | 32 | Background processes | 1–2 | M29 |
 | 33 | Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
+| 34 | Multimodal MCP results | 1–2 | M32a |
+| 35 | MCP OAuth (Streamable HTTP) | 2 | M32a |
 
 ---
 
@@ -1117,7 +1132,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M29 Execution environment hardening | `0.13.0` | ✅ Complete. Minor bump (pre-1.0 convention for user-visible behaviour change): `run` now defaults to a 120 s timeout, scrubs secret env vars and closes stdin; `write`/`edit`/`delete` refuse paths outside the project root/`.git`/`.env*`; `allow-always` on `run` is command-scoped. New optional `permissions.extra_write_roots`. Not a patch bump because behaviour changes; not 1.0 because still pre-stability. |
 | M30 OS sandbox | `0.14.0` | ✅ Complete. Minor bump: additive, opt-in (`permissions.sandbox`, default `none`). |
 | M31 Incremental tool output | `0.15.0` | ✅ Complete. Minor bump: additive `tool_output` event; consumers matching `Event` exhaustively must handle it. |
-| M32–M33 | `0.16.0`+ | Planned, one minor each |
+| M32–M35 | `0.16.0`+ | Planned, one minor each |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 

@@ -235,6 +235,9 @@ pub struct Config {
     pub agents: Option<AgentsSection>,
     #[serde(default)]
     pub memory: Option<MemorySection>,
+    /// Lifecycle hooks ([[hooks]]).
+    #[serde(default)]
+    pub hooks: Vec<crate::harness::hooks::HookConfig>,
 }
 
 // Custom Debug impl that redacts sensitive fields (api_key)
@@ -256,6 +259,7 @@ impl std::fmt::Debug for Config {
             .field("rotation", &self.rotation)
             .field("tool_cache", &self.tool_cache)
             .field("memory", &self.memory)
+            .field("hooks", &self.hooks)
             .finish()
     }
 }
@@ -501,6 +505,13 @@ pub struct McpSection {
     /// Startup policy for MCP connections.
     #[serde(default)]
     pub startup_policy: Option<String>,
+    /// Withhold MCP tool schemas (use `tool_search`) above this many tools; 0 disables (default 12).
+    #[serde(default)]
+    pub defer_tools_over: Option<usize>,
+    /// Connect the built-in no-login docs/code-search servers (context7,
+    /// gh_grep) when true (default). Query text is sent to those services.
+    #[serde(default)]
+    pub builtin_servers: Option<bool>,
     /// List of MCP servers to connect to.
     #[serde(default)]
     pub servers: Vec<McpServerConfigSection>,
@@ -511,8 +522,18 @@ pub struct McpSection {
 pub struct McpServerConfigSection {
     /// Unique name for this server (used in tool name prefixing).
     pub name: String,
-    /// Command to execute for the MCP server.
+    /// Command to execute for a stdio MCP server.
+    #[serde(default)]
     pub command: String,
+    /// Endpoint of a Streamable HTTP MCP server (instead of `command`).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Bearer token for a Streamable HTTP MCP server (supports `{env:VAR}`).
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    /// Treat all tools of this server as read-only (no approval prompts).
+    #[serde(default)]
+    pub read_only: bool,
     /// Arguments to pass to the command.
     #[serde(default)]
     pub args: Vec<String>,

@@ -51,8 +51,8 @@ A single static Rust binary that turns a language model into an autonomous codin
 | FR-10 | TUI: conversation pane, streaming token render, tool-call panel, approval modal, todo panel, status bar, command palette, log tail; responsive at 80×24 minimum / 120×40 comfortable. |
 | FR-11 | Headless/RPC: identical JSON event stream to TUI (per DESIGN.md §7) over stdout or JSON-RPC (stdio/HTTP, feature-gated). |
 | FR-12 | Logging: `tracing` JSON structured logs to file/stdout; levels filterable via `RUST_LOG`. |
-| FR-13 | Extensibility: `Tool` trait implementations register new tools; lazy MCP server handling deferred behind a feature flag. |
-| FR-14 | Static system prompt + optional `skills/` directory concatenated into context. |
+| FR-13 | Extensibility: `Tool` trait implementations register new tools; MCP servers (stdio and Streamable HTTP, `mcp` feature) via `[[mcp.servers]]` or project `.mcp.json`, with deferred tool loading behind `tool_search`; `[[hooks]]` PreToolUse/PostToolUse commands; `okeanos --acp` exposes the agent over the Agent Client Protocol. |
+| FR-14 | Static system prompt plus skills discovered from `SKILL.md` directories (or flat `*.md`) in `.okeanos/`, `.claude/`, `.agents/` skill roots; only a name/description index is in the prompt, bodies load on demand via the `skill` tool. |
 | FR-15 | Configuration: XDG global config (`~/.config/okeanos/config.toml`) + optional project-local config (`okeanos.toml` walked up from git root). Env var and file substitution for secrets (`{env:VAR}`, `{file:path}`). Secrets never committed to config. |
 | FR-16 | Token counting & cost estimation: conservative approximate token count enforced against hard context cap; per-model cost estimate shown in status bar; counts are estimates, not provider-authoritative. |
 | FR-17 | Session resume: `--resume <session-id>` continues a prior session; sessions stored as JSONL per project under the okeanos home dir; header line records cwd + format version for migration. |

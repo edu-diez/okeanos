@@ -3,9 +3,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Category of a tool operation, used by the permission layer to decide
@@ -166,10 +166,75 @@ pub trait Tool: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// Shared state for tools whose schemas are withheld from the model until it
+/// asks for them (`tool_search`). Cheap to clone; all clones share state.
+#[derive(Clone, Default)]
+pub struct DeferredTools {
+    hidden: Arc<RwLock<BTreeSet<String>>>,
+    catalog: Arc<RwLock<BTreeMap<String, ToolSpec>>>,
+}
+
+impl DeferredTools {
+    /// Whether any tool is deferred (hidden or already revealed).
+    pub fn is_empty(&self) -> bool {
+        self.catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    fn is_hidden(&self, name: &str) -> bool {
+        self.hidden
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
+    }
+
+    fn catalog_spec(&self, name: &str) -> Option<ToolSpec> {
+        self.catalog
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    fn hide_copy(&self, name: &str, spec: Option<ToolSpec>) {
+        self.hidden
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string());
+        if let Some(spec) = spec {
+            self.catalog
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.to_string(), spec);
+        }
+    }
+
+    /// Specs of tools still hidden from the model.
+    pub fn hidden_specs(&self) -> Vec<ToolSpec> {
+        let hidden = self.hidden.read().unwrap_or_else(|e| e.into_inner());
+        let catalog = self.catalog.read().unwrap_or_else(|e| e.into_inner());
+        hidden
+            .iter()
+            .filter_map(|n| catalog.get(n).cloned())
+            .collect()
+    }
+
+    /// Make a tool's schema visible to the model from the next request on.
+    pub fn reveal(&self, name: &str) -> bool {
+        self.hidden
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+    }
+}
+
 /// Registry of available tools.
 #[derive(Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<dyn Tool>>,
+    deferred: DeferredTools,
 }
 
 impl fmt::Debug for ToolRegistry {
@@ -190,7 +255,8 @@ impl ToolRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: BTreeMap::new(),
+            deferred: DeferredTools::default(),
         }
     }
 
@@ -198,6 +264,20 @@ impl ToolRegistry {
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         let spec = tool.spec();
         self.tools.insert(spec.name.clone(), Arc::new(tool));
+    }
+
+    /// Register a tool that stays callable but is hidden from the model's tool
+    /// list until revealed through [`DeferredTools::reveal`].
+    pub fn register_deferred<T: Tool + 'static>(&mut self, tool: T) {
+        let spec = tool.spec();
+        let name = spec.name.clone();
+        self.tools.insert(name.clone(), Arc::new(tool));
+        self.deferred.hide_copy(&name, Some(spec));
+    }
+
+    /// Handle to the deferred-tool state (for `tool_search`).
+    pub fn deferred(&self) -> DeferredTools {
+        self.deferred.clone()
     }
 
     /// Get a tool by name.
@@ -210,9 +290,14 @@ impl ToolRegistry {
         self.tools.get(name).map(|a| a.as_ref())
     }
 
-    /// Get all tool specs.
+    /// Get all tool specs, sorted by name so the provider's cached tool-block
+    /// prefix is byte-stable across processes.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|t| t.spec()).collect()
+        self.tools
+            .iter()
+            .filter(|(name, _)| !self.deferred.is_hidden(name))
+            .map(|(_, t)| t.spec())
+            .collect()
     }
 
     /// Get tool names.
@@ -236,6 +321,11 @@ impl ToolRegistry {
         for name in names {
             if let Some(tool) = self.get(name) {
                 filtered.tools.insert(name.clone(), tool);
+                if self.deferred.is_hidden(name) {
+                    filtered
+                        .deferred
+                        .hide_copy(name, self.deferred.catalog_spec(name));
+                }
             }
         }
         filtered

@@ -21,7 +21,7 @@ Concise rules for AI-assisted work on this repo. Docs-only project at this phase
 - **Interruptible tool execution:** Long-running tools stream output incrementally; cancellation (SIGINT/timeout) uses SIGTERM→grace→SIGKILL escalation; output is drained after exit; head/tail truncation counts against the context cap; return exit_code/timed_out/cancelled in tool result.
 - **Cost budget:** Opt-in hard session cost cap (USD) + per-turn soft warning; refuse new tool calls exceeding cap; fail closed ($0 + warning) on unknown pricing; cap disabled by default at MVP.
 - **Context warnings:** Per-turn current/total tokens in status bar; warn at ~10–15% remaining; clear error (not crash) at hard cap; no silent truncation.
-- **No tool result caching at MVP:** Every call re-executes; staleness/invalidation complexity deferred post-MVP.
+- **Tool result caching (M23):** Only a TTL cache for read-only tools (`src/tool/cache.rs`); writes invalidate it. All other calls re-execute.
 - **Secrets:** Never store API keys or secrets in config files committed to version control. Use `{env:VAR}` or `{file:path}` substitution. Config load must fail closed if a required secret is missing.
 - **Shutdown:** Signal handlers (SIGINT/SIGTERM) must flush the JSONL session log, teardown the TUI alternate screen, and drain in-flight work before exit. No subsystem may block shutdown indefinitely.
 - **Token counting:** Token counts and cost estimates are estimates, not provider-authoritative. Label them clearly in the UI and logs.

@@ -9,6 +9,7 @@ pub mod compaction;
 pub mod conversation;
 pub mod memory;
 pub mod selective;
+pub mod skills;
 pub mod tier;
 pub mod tokens;
 pub mod warnings;
