@@ -18,7 +18,7 @@ pub use react::{LoopDecision, ReactConfig, ReactError, ReactLoop};
 pub use retry::{RetryDecision, RetryPolicy};
 pub use rules::{Rule, Rules};
 pub use subagent::{
-    SpawnConfig, SpawnConfig as SubAgentSpawnConfig, SubAgentError,
+    ModelResolver, SpawnConfig, SpawnConfig as SubAgentSpawnConfig, SpawnRequest, SubAgentError,
     SubAgentError as SubAgentErrorType, SubAgentHandle, SubAgentHandle as SubAgentHandleType,
     SubAgentResult, SubAgentResult as SubAgentResultType, WorkspaceHandle,
     WorkspaceHandle as WorkspaceHandleType, spawn_subagent,

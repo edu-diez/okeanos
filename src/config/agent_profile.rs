@@ -60,6 +60,71 @@ pub struct AgentProfile {
     /// Workspace isolation mode.
     #[serde(default)]
     pub workspace_mode: WorkspaceMode,
+    /// Extra instructions appended to the sub-agent's system prompt.
+    #[serde(default)]
+    pub instructions: String,
+    /// Hard cap on model iterations (defaults to `token_budget / 1000`, min 10).
+    #[serde(default)]
+    pub max_turns: Option<usize>,
+}
+
+/// Profiles available without any configuration. User or project profiles
+/// with the same name replace them.
+pub fn builtin_profiles() -> Vec<AgentProfile> {
+    let read_only = || vec!["read".to_string(), "grep".to_string(), "glob".to_string()];
+    vec![
+        AgentProfile {
+            name: "explore".to_string(),
+            description: "Fast read-only codebase exploration: find files, trace code, answer \
+                          questions about how something works. Cannot modify anything."
+                .to_string(),
+            model: default_model(),
+            tools: read_only(),
+            disallowed_tools: Vec::new(),
+            max_depth: 1,
+            token_budget: 40_000,
+            workspace_mode: WorkspaceMode::Inherit,
+            instructions: "Search efficiently (issue independent searches together), do not \
+                           modify anything, and finish with a compact report: the answer first, \
+                           then the key file paths and line numbers that support it."
+                .to_string(),
+            max_turns: Some(25),
+        },
+        AgentProfile {
+            name: "plan".to_string(),
+            description: "Read-only planner: investigates the code and returns a concrete, \
+                          step-by-step implementation plan. Cannot modify anything."
+                .to_string(),
+            model: default_model(),
+            tools: read_only(),
+            disallowed_tools: Vec::new(),
+            max_depth: 1,
+            token_budget: 60_000,
+            workspace_mode: WorkspaceMode::Inherit,
+            instructions: "Investigate the relevant code, then return a numbered plan naming the \
+                           exact files and functions to change, the order of changes, risks, and \
+                           how to verify. Do not implement it."
+                .to_string(),
+            max_turns: Some(30),
+        },
+        AgentProfile {
+            name: "general".to_string(),
+            description: "General-purpose worker with the full tool set for self-contained \
+                          multi-step tasks. Use workspace_mode = branch in a custom profile for \
+                          isolated edits."
+                .to_string(),
+            model: default_model(),
+            tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            max_depth: 1,
+            token_budget: 100_000,
+            workspace_mode: WorkspaceMode::Inherit,
+            instructions: "Complete the task fully and finish with a short report of what you \
+                           changed and anything the caller must follow up on."
+                .to_string(),
+            max_turns: None,
+        },
+    ]
 }
 
 fn default_model() -> String {
@@ -203,7 +268,10 @@ impl AgentRegistry {
     /// Project profiles (`.okeanos/agents/*.toml`) override user profiles (`~/.config/okeanos/agents/*.toml`).
     pub fn load(project_dir: Option<&Path>, user_dir: Option<&Path>) -> Result<Self, ConfigError> {
         let mut registry = Self::new();
-        let mut loaded_profiles: HashMap<String, AgentProfile> = HashMap::new();
+        let mut loaded_profiles: HashMap<String, AgentProfile> = builtin_profiles()
+            .into_iter()
+            .map(|p| (p.name.clone(), p))
+            .collect();
 
         // Load user profiles first (lower priority)
         if let Some(user_dir) = user_dir
@@ -311,6 +379,18 @@ impl AgentRegistry {
         self.profiles.contains_key(name)
     }
 
+    /// One `- name: description` line per profile, sorted, for tool descriptions.
+    pub fn describe(&self) -> String {
+        let mut names = self.names();
+        names.sort();
+        names
+            .iter()
+            .filter_map(|n| self.profiles.get(n))
+            .map(|p| format!("- {}: {}", p.name, p.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Add a profile programmatically (for tests).
     pub fn insert(&mut self, profile: AgentProfile) {
         self.profiles.insert(profile.name.clone(), profile);
@@ -320,5 +400,20 @@ impl AgentRegistry {
 impl std::fmt::Display for AgentRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "AgentRegistry({} profiles)", self.profiles.len())
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    #[test]
+    fn registry_seeds_builtin_profiles() {
+        let reg = AgentRegistry::load(None, None).unwrap();
+        for name in ["explore", "plan", "general"] {
+            assert!(reg.get(name).is_some(), "missing builtin {name}");
+        }
+        let desc = reg.describe();
+        assert!(desc.contains("- explore:"));
     }
 }

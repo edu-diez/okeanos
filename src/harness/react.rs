@@ -159,6 +159,16 @@ pub struct ReactLoop<M: Model> {
     spawn_budget: u32,
     /// Current delegation depth.
     delegation_depth: u32,
+    /// Prefix of this loop's approval ids (`"<subagent_id>/"` for sub-agents).
+    approval_prefix: String,
+    /// Builds models for agent profiles that name one explicitly.
+    model_resolver: Option<crate::harness::subagent::ModelResolver>,
+    /// Caps concurrently running sub-agents.
+    agent_slots: Arc<tokio::sync::Semaphore>,
+    /// Where approval decisions for sub-agent requests are delivered.
+    approval_routes: crate::harness::subagent::ApprovalRoutes,
+    /// Whether the approval router task has been installed.
+    approval_router_started: bool,
     /// Signature of the previous tool call and its consecutive repeat count.
     last_call_sig: Option<u64>,
     repeat_count: u32,
@@ -168,6 +178,13 @@ pub struct ReactLoop<M: Model> {
 
 /// Identical consecutive tool calls before the model is told to change course.
 const DOOM_LOOP_WARN: u32 = 3;
+/// Sub-agents allowed to run at the same time.
+const MAX_PARALLEL_AGENTS: usize = 4;
+
+/// Appended to the system prompt while the permission mode is plan.
+const PLAN_MODE_NOTE: &str = "\n\nPLAN MODE ACTIVE: you cannot modify files. Investigate with \
+read-only tools (delegate broad searches to the `explore` agent), then call `exit_plan` with \
+a concrete step-by-step plan. Do not start implementing until it is approved.";
 /// Identical consecutive tool calls before the loop is stopped.
 const DOOM_LOOP_STOP: u32 = 5;
 
@@ -252,6 +269,11 @@ impl<M: Model + 'static> ReactLoop<M> {
             subagent_handles: Vec::new(),
             spawn_budget: 64,
             delegation_depth: 0,
+            approval_prefix: String::new(),
+            model_resolver: None,
+            agent_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_AGENTS)),
+            approval_routes: Arc::default(),
+            approval_router_started: false,
             last_call_sig: None,
             repeat_count: 0,
             last_truncated: false,
@@ -454,9 +476,63 @@ impl<M: Model + 'static> ReactLoop<M> {
         self
     }
 
-    /// Set the agent registry for sub-agent delegation.
+    /// Set the agent registry for sub-agent delegation. Also registers the
+    /// `agent`, `wait_agent` and `exit_plan` tools (the loop handles them).
     pub fn with_agent_registry(mut self, registry: Arc<crate::config::AgentRegistry>) -> Self {
+        use crate::tool::agent::{AgentTool, ExitPlanTool, WaitAgentTool};
+        let mut names = registry.names();
+        names.sort();
+        self.tools
+            .register(AgentTool::new(registry.describe(), names));
+        self.tools.register(WaitAgentTool);
+        self.tools.register(ExitPlanTool);
+        self.refresh_tool_overhead();
         self.agent_registry = Some(registry);
+        self
+    }
+
+    fn refresh_tool_overhead(&mut self) {
+        let specs = self.tools.specs();
+        let overhead = if self.model.capabilities().tool_calling {
+            serde_json::to_string(&specs).map_or(0, |s| s.len() / 4)
+        } else if specs.is_empty() {
+            0
+        } else {
+            TextToolParser::generate_system_prompt_snippet(&specs).len() / 4
+        };
+        self.conversation.set_tool_overhead(overhead);
+    }
+
+    /// Set how to build models for profiles that name one explicitly.
+    pub fn with_model_resolver(
+        mut self,
+        resolver: crate::harness::subagent::ModelResolver,
+    ) -> Self {
+        self.model_resolver = Some(resolver);
+        self
+    }
+
+    /// Model resolver for sub-agent profiles.
+    pub fn model_resolver(&self) -> Option<crate::harness::subagent::ModelResolver> {
+        self.model_resolver
+            .clone()
+            .or_else(crate::harness::subagent::global_model_resolver)
+    }
+
+    /// Concurrency limiter shared by all sub-agents of this loop.
+    pub fn agent_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.agent_slots.clone()
+    }
+
+    /// Set the delegation depth of this loop (children run at parent + 1).
+    pub fn with_delegation_depth(mut self, depth: u32) -> Self {
+        self.delegation_depth = depth;
+        self
+    }
+
+    /// Prefix for this loop's approval ids so decisions can be routed back.
+    pub fn with_approval_prefix(mut self, prefix: String) -> Self {
+        self.approval_prefix = prefix;
         self
     }
 
@@ -810,6 +886,15 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Run the ReAct loop until completion or termination.
     pub async fn run(&mut self, initial_prompt: String) -> Result<String, ReactError> {
+        let result = self.run_inner(initial_prompt).await;
+        if result.is_err() {
+            // Dropping the handles aborts any sub-agent still running.
+            self.subagent_handles.clear();
+        }
+        result
+    }
+
+    async fn run_inner(&mut self, initial_prompt: String) -> Result<String, ReactError> {
         let initial_prompt = match self.begin_prompt(initial_prompt).await {
             Ok(prompt) => prompt,
             Err(reason) => {
@@ -863,8 +948,8 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         let mut stop_rounds = 0u32;
         loop {
-            // Check for completed sub-agents
-            self.check_subagent_completion().await?;
+            // Deliver reports of finished background sub-agents
+            self.drain_subagents().await?;
 
             // Check shutdown signal
             if shutdown_rx.try_recv().is_ok() {
@@ -885,6 +970,10 @@ impl<M: Model + 'static> ReactLoop<M> {
                     continue;
                 }
                 LoopDecision::Complete(result) => {
+                    if self.settle_subagents(&mut shutdown_rx).await? {
+                        self.iteration += 1;
+                        continue;
+                    }
                     if let Some(reason) = self.stop_hook_feedback(&result, &mut stop_rounds).await {
                         self.conversation
                             .add_user_message(reason)
@@ -918,6 +1007,19 @@ impl<M: Model + 'static> ReactLoop<M> {
         prompt: String,
         shutdown_rx: mpsc::Receiver<()>,
     ) -> Result<LoopDecision, ReactError> {
+        let result = self.run_turn_inner(prompt, shutdown_rx).await;
+        if !matches!(result, Ok(LoopDecision::Complete(_))) {
+            // Dropping the handles aborts any sub-agent still running.
+            self.subagent_handles.clear();
+        }
+        result
+    }
+
+    async fn run_turn_inner(
+        &mut self,
+        prompt: String,
+        shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<LoopDecision, ReactError> {
         let prompt = match self.begin_prompt(prompt).await {
             Ok(prompt) => prompt,
             Err(reason) => {
@@ -944,6 +1046,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         let mut shutdown_rx = shutdown_rx;
         let mut stop_rounds = 0u32;
         loop {
+            self.drain_subagents().await?;
             self.prepare_iteration().await?;
 
             match self.iterate(&mut shutdown_rx).await? {
@@ -953,6 +1056,10 @@ impl<M: Model + 'static> ReactLoop<M> {
                     self.maybe_start_background_compaction();
                 }
                 decision @ LoopDecision::Complete(_) => {
+                    if self.settle_subagents(&mut shutdown_rx).await? {
+                        self.iteration += 1;
+                        continue;
+                    }
                     if let LoopDecision::Complete(text) = &decision
                         && let Some(reason) = self.stop_hook_feedback(text, &mut stop_rounds).await
                     {
@@ -1536,6 +1643,12 @@ impl<M: Model + 'static> ReactLoop<M> {
     fn build_model_messages(&self) -> Vec<ModelMessage> {
         let mut messages = self.conversation.to_model_messages();
 
+        if self.policy.mode() == crate::harness::policy::PermissionMode::Plan
+            && let Some(system_msg) = messages.first_mut()
+        {
+            system_msg.content.push_str(PLAN_MODE_NOTE);
+        }
+
         // For models without native tool calling, inject a text-based schema
         // description into the system prompt so the model knows how to invoke
         // tools via text.
@@ -1585,6 +1698,18 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
 
         // Handle sub-agent delegation via todo tool with "delegate" action.
+        if tool_call.name == crate::tool::agent::WAIT_AGENT_TOOL {
+            return self.handle_wait_agent(tool_call, shutdown_rx).await;
+        }
+        if tool_call.name == crate::tool::agent::EXIT_PLAN_TOOL {
+            return self.handle_exit_plan(tool_call).await;
+        }
+        if tool_call.name == crate::tool::agent::AGENT_TOOL {
+            let mut results = Vec::new();
+            self.execute_agent_batch(vec![tool_call], shutdown_rx, &mut results)
+                .await?;
+            return Ok(results.remove(0));
+        }
         if tool_call.name == "todo"
             && let Ok(crate::tool::todo::TodoArgs::Delegate {
                 todo_id,
@@ -1693,7 +1818,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             }
             GateVerdict::Ask => {
                 // Emit approval request and pause the loop until a decision arrives.
-                let approval_id = format!("approval-{}", self.iteration);
+                let approval_id = format!("{}approval-{}", self.approval_prefix, self.iteration);
                 self.emit_approval_request(ApprovalRequest {
                     id: approval_id.clone(),
                     tool: tool_call.name.clone(),
@@ -1874,7 +1999,7 @@ impl<M: Model + 'static> ReactLoop<M> {
     /// Whether a call is a policy-allowed, read-only tool that can run
     /// concurrently with its neighbours.
     fn is_parallel_safe(&self, tool_call: &ToolCall) -> bool {
-        if tool_call.name == "todo" {
+        if tool_call.name == "todo" || crate::tool::agent::is_orchestration_tool(&tool_call.name) {
             return false;
         }
         let Some(tool) = self.tools.get(&tool_call.name) else {
@@ -1898,6 +2023,21 @@ impl<M: Model + 'static> ReactLoop<M> {
     ) -> Result<(), ReactError> {
         let mut i = 0;
         while i < tool_calls.len() {
+            if tool_calls[i].name == crate::tool::agent::AGENT_TOOL {
+                // Contiguous `agent` calls run as concurrent sub-agents.
+                let mut j = i;
+                while j < tool_calls.len() && tool_calls[j].name == crate::tool::agent::AGENT_TOOL {
+                    j += 1;
+                }
+                let mut results = Vec::new();
+                self.execute_agent_batch(tool_calls[i..j].to_vec(), shutdown_rx, &mut results)
+                    .await?;
+                for result in results {
+                    self.record_tool_result(result).await?;
+                }
+                i = j;
+                continue;
+            }
             let mut j = i;
             while j < tool_calls.len() && self.is_parallel_safe(&tool_calls[j]) {
                 j += 1;
@@ -2019,7 +2159,326 @@ impl<M: Model + 'static> ReactLoop<M> {
         Ok(())
     }
 
-    /// Handle sub-agent delegation via todo tool.
+    /// Validate and spawn a sub-agent, returning its handle (not yet stored).
+    async fn spawn_agent(
+        &mut self,
+        todo_id: String,
+        agent_name: String,
+        prompt: String,
+        description: String,
+    ) -> Result<crate::harness::SubAgentHandle, String> {
+        let Some(agent_registry) = self.agent_registry.clone() else {
+            return Err("agent registry not configured; cannot delegate".to_string());
+        };
+        if self.delegation_depth >= 1 {
+            return Err("sub-agents cannot spawn further sub-agents".to_string());
+        }
+        if self.spawn_budget == 0 {
+            return Err("spawn budget exhausted; cannot delegate".to_string());
+        }
+        let Some(profile) = agent_registry.get(&agent_name) else {
+            return Err(format!(
+                "unknown agent '{agent_name}'. Available: {}",
+                agent_registry.names().join(", ")
+            ));
+        };
+        if self.delegation_depth >= profile.max_depth {
+            return Err(format!(
+                "maximum delegation depth for agent '{agent_name}' exceeded: current={}, max={}",
+                self.delegation_depth, profile.max_depth
+            ));
+        }
+
+        let approvals_routable = self.ensure_approval_router();
+        let request = crate::harness::subagent::SpawnRequest {
+            todo_id,
+            agent_name,
+            prompt,
+            description,
+            depth: self.delegation_depth,
+            spawn_budget_remaining: self.spawn_budget,
+        };
+        let handle = crate::harness::spawn_subagent(
+            self,
+            agent_registry,
+            request,
+            self.approval_routes.clone(),
+            approvals_routable,
+        )
+        .await
+        .map_err(|e| format!("failed to spawn sub-agent: {e}"))?;
+        self.spawn_budget -= 1;
+        Ok(handle)
+    }
+
+    /// Route approval decisions for sub-agent requests (ids `<subagent>/…`) to
+    /// that sub-agent; everything else still reaches this loop.
+    /// Returns whether decisions can reach sub-agents (false when this loop
+    /// has no approval receiver, e.g. headless runs).
+    fn ensure_approval_router(&mut self) -> bool {
+        if self.approval_router_started {
+            return self.approval_rx.is_some();
+        }
+        self.approval_router_started = true;
+        let Some(mut upstream) = self.approval_rx.take() else {
+            return false;
+        };
+        let (tx, rx) = mpsc::channel(32);
+        self.approval_rx = Some(rx);
+        let routes = self.approval_routes.clone();
+        tokio::spawn(async move {
+            while let Some(approval) = upstream.recv().await {
+                let child = approval
+                    .id
+                    .split_once('/')
+                    .and_then(|(id, _)| routes.lock().unwrap().get(id).cloned());
+                match child {
+                    Some(child) => {
+                        let _ = child.send(approval).await;
+                    }
+                    None => {
+                        if tx.send(approval).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        true
+    }
+
+    /// Spawn the `agent` calls of one assistant turn and wait for the
+    /// foreground ones concurrently. Pushes one result per call, in order.
+    async fn execute_agent_batch(
+        &mut self,
+        calls: Vec<ToolCall>,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+        results: &mut Vec<ToolResult>,
+    ) -> Result<(), ReactError> {
+        enum Slot {
+            Done(ToolResult),
+            Foreground(ToolCall, usize),
+        }
+
+        let Some(spec) = self
+            .tools
+            .get(crate::tool::agent::AGENT_TOOL)
+            .map(|t| t.spec())
+        else {
+            return Err(ReactError::Tool("agent tool not available".to_string()));
+        };
+        let mut slots = Vec::with_capacity(calls.len());
+        let mut foreground: Vec<crate::harness::SubAgentHandle> = Vec::new();
+        for mut call in calls {
+            if let Some(result) = self.check_doom_loop(&call).await? {
+                slots.push(Slot::Done(result));
+                continue;
+            }
+            match self.authorize(&mut call, &spec).await {
+                Ok(()) => {}
+                Err(ReactError::Tool(msg)) => {
+                    let result = self.error_tool_result(&call, msg).await;
+                    slots.push(Slot::Done(result));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            let args: crate::tool::agent::AgentArgs =
+                match serde_json::from_value(call.args.clone()) {
+                    Ok(args) => args,
+                    Err(e) => {
+                        let result = self
+                            .error_tool_result(&call, format!("invalid agent arguments: {e}"))
+                            .await;
+                        slots.push(Slot::Done(result));
+                        continue;
+                    }
+                };
+            self.emit_tool_call(ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                args: call.args.clone(),
+                status: ToolCallStatus::Pending,
+            })
+            .await;
+            let todo_id: String = call
+                .id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .take(16)
+                .collect();
+            let description = args
+                .description
+                .clone()
+                .unwrap_or_else(|| args.prompt.chars().take(40).collect());
+            match self
+                .spawn_agent(
+                    format!("agent-{todo_id}"),
+                    args.agent.clone(),
+                    args.prompt.clone(),
+                    description,
+                )
+                .await
+            {
+                Ok(handle) if args.background => {
+                    let output = serde_json::json!({
+                        "subagent_id": handle.subagent_id,
+                        "status": "running",
+                        "note": "its report will arrive automatically, or call wait_agent"
+                    })
+                    .to_string();
+                    self.subagent_handles.push(handle);
+                    slots.push(Slot::Done(self.ok_tool_result(&call, output).await));
+                }
+                Ok(handle) => {
+                    foreground.push(handle);
+                    slots.push(Slot::Foreground(call, foreground.len() - 1));
+                }
+                Err(msg) => {
+                    let result = self.error_tool_result(&call, msg).await;
+                    slots.push(Slot::Done(result));
+                }
+            }
+        }
+
+        let joined = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => {
+                // Dropping the handles aborts the sub-agents.
+                drop(foreground);
+                self.emit_interrupted(false).await;
+                return Err(ReactError::Interrupted);
+            }
+            joined = futures::future::join_all(
+                foreground.iter_mut().map(|h| &mut h.join_handle)
+            ) => joined,
+        };
+        let mut joined: Vec<_> = joined.into_iter().map(Some).collect();
+
+        for slot in slots {
+            match slot {
+                Slot::Done(result) => results.push(result),
+                Slot::Foreground(call, index) => {
+                    let outcome = joined[index].take().expect("each handle joined once");
+                    let (ok, text) = self.finish_subagent(&foreground[index], outcome).await;
+                    let result = if ok {
+                        self.ok_tool_result(&call, text).await
+                    } else {
+                        self.error_tool_result(&call, text).await
+                    };
+                    results.push(result);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a successful tool result and emit the Ok status event.
+    async fn ok_tool_result(&mut self, tool_call: &ToolCall, output: String) -> ToolResult {
+        self.emit_tool_call(ToolCall {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            args: tool_call.args.clone(),
+            status: ToolCallStatus::Ok,
+        })
+        .await;
+        ToolResult {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            args: tool_call.args.clone(),
+            output,
+            ok: true,
+            duration_ms: 0,
+            truncated: false,
+            exit_code: Some(0),
+            timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    /// `wait_agent`: block until background sub-agents report.
+    async fn handle_wait_agent(
+        &mut self,
+        tool_call: ToolCall,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<ToolResult, ReactError> {
+        let args: crate::tool::agent::WaitAgentArgs =
+            serde_json::from_value(tool_call.args.clone())
+                .map_err(|e| ReactError::Tool(format!("invalid wait_agent arguments: {e}")))?;
+        if self.subagent_handles.is_empty() {
+            return Ok(self
+                .ok_tool_result(&tool_call, "No background sub-agents are running.".into())
+                .await);
+        }
+        let timeout = Duration::from_secs(args.timeout_sec.unwrap_or(300));
+        let reports = self
+            .wait_for_subagents(&args.ids, timeout, shutdown_rx)
+            .await?;
+        let output = if reports.is_empty() {
+            "None of the given ids are running background sub-agents.".to_string()
+        } else {
+            reports.join("\n\n")
+        };
+        Ok(self.ok_tool_result(&tool_call, output).await)
+    }
+
+    /// `exit_plan`: save the plan, ask the user to approve it and, if they do,
+    /// leave plan mode so implementation can start.
+    async fn handle_exit_plan(&mut self, tool_call: ToolCall) -> Result<ToolResult, ReactError> {
+        use crate::harness::policy::PermissionMode;
+
+        let args: crate::tool::agent::ExitPlanArgs = serde_json::from_value(tool_call.args.clone())
+            .map_err(|e| ReactError::Tool(format!("invalid exit_plan arguments: {e}")))?;
+        let mode = self.policy.mode_handle();
+        if mode.get() != PermissionMode::Plan {
+            return Err(ReactError::Tool(
+                "exit_plan is only available in plan mode".to_string(),
+            ));
+        }
+
+        let dir = self
+            .project_root
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".okeanos")
+            .join("plans");
+        let path = dir.join(format!("plan-{}.md", current_timestamp()));
+        let saved = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, &args.plan))
+            .is_ok();
+        let location = if saved {
+            path.display().to_string()
+        } else {
+            "(could not be saved)".to_string()
+        };
+
+        let approval_id = format!("{}approval-plan-{}", self.approval_prefix, self.iteration);
+        self.emit_approval_request(ApprovalRequest {
+            id: approval_id.clone(),
+            tool: crate::tool::agent::EXIT_PLAN_TOOL.to_string(),
+            args: serde_json::json!({ "plan": args.plan, "path": location }),
+        })
+        .await;
+
+        let output = match self.wait_for_approval(&approval_id).await? {
+            ApprovalDecision::Deny => {
+                "The plan was rejected. Ask what to change or revise the plan, then call exit_plan \
+                 again."
+                    .to_string()
+            }
+            ApprovalDecision::Allow | ApprovalDecision::AllowAlways => {
+                mode.set(PermissionMode::AcceptEdits);
+                format!(
+                    "Plan approved; plan mode is off and edits are enabled. The plan is saved at \
+                     {location}; re-read it if your context gets compacted. Implement it now."
+                )
+            }
+        };
+        Ok(self.ok_tool_result(&tool_call, output).await)
+    }
+
+    /// Handle sub-agent delegation via the todo tool's `delegate` action
+    /// (kept for compatibility; it runs the agent in the background).
     async fn handle_delegate(
         &mut self,
         tool_call_id: String,
@@ -2027,69 +2486,24 @@ impl<M: Model + 'static> ReactLoop<M> {
         agent_name: String,
         prompt: String,
     ) -> Result<ToolResult, ReactError> {
-        let Some(agent_registry) = self.agent_registry.clone() else {
-            return Err(ReactError::Tool(
-                "agent registry not configured; cannot delegate".to_string(),
-            ));
-        };
+        let handle = self
+            .spawn_agent(
+                todo_id.clone(),
+                agent_name.clone(),
+                prompt.clone(),
+                format!("todo {todo_id}"),
+            )
+            .await
+            .map_err(ReactError::Tool)?;
 
-        // Check delegation depth
-        if self.delegation_depth >= 1 {
-            return Err(ReactError::Tool(format!(
-                "maximum delegation depth ({}) exceeded",
-                1
-            )));
-        }
-
-        // Check spawn budget
-        if self.spawn_budget == 0 {
-            return Err(ReactError::Tool(
-                "spawn budget exhausted; cannot delegate".to_string(),
-            ));
-        }
-
-        // Validate agent profile exists
-        let Some(profile) = agent_registry.get(&agent_name) else {
-            return Err(ReactError::Tool(format!(
-                "agent profile not found: {}",
-                agent_name
-            )));
-        };
-
-        // Check profile max_depth
-        if self.delegation_depth >= profile.max_depth {
-            return Err(ReactError::Tool(format!(
-                "maximum delegation depth for agent '{}' exceeded: current={}, max={}",
-                agent_name, self.delegation_depth, profile.max_depth
-            )));
-        }
-
-        // Spawn the sub-agent
-        let handle = crate::harness::spawn_subagent(
-            self,
-            agent_registry,
-            todo_id.clone(),
-            agent_name.clone(),
-            prompt.clone(),
-            self.delegation_depth,
-            self.spawn_budget,
-        )
-        .await
-        .map_err(|e| ReactError::Tool(format!("failed to spawn sub-agent: {}", e)))?;
-
-        // Decrement spawn budget
-        self.spawn_budget -= 1;
-
-        // Store handle for monitoring
         let subagent_id = handle.subagent_id.clone();
         self.subagent_handles.push(handle);
 
-        // Return the sub-agent handle as the tool result
         let output = serde_json::to_string(&serde_json::json!({
             "subagent_id": subagent_id,
             "todo_id": todo_id,
             "agent": agent_name,
-            "status": "spawned"
+            "status": "running"
         }))
         .unwrap();
 
@@ -2172,7 +2586,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
 
         // Emit approval request and pause the loop until a decision arrives.
-        let approval_id = format!("approval-expensive-{}", self.iteration);
+        let approval_id = format!(
+            "{}approval-expensive-{}",
+            self.approval_prefix, self.iteration
+        );
         self.emit_approval_request(ApprovalRequest {
             id: approval_id.clone(),
             tool: tool_call.name.clone(),
@@ -2233,106 +2650,149 @@ impl<M: Model + 'static> ReactLoop<M> {
         })
     }
 
-    /// Check for completed sub-agents and handle their completion.
-    async fn check_subagent_completion(&mut self) -> Result<(), ReactError> {
-        let mut completed_indices = Vec::new();
-
-        // Check each sub-agent handle for completion
-        for (index, handle) in self.subagent_handles.iter().enumerate() {
-            if handle.join_handle.is_finished() {
-                completed_indices.push(index);
+    /// Format a finished sub-agent's outcome for the model and settle its
+    /// bookkeeping: stop hook, todo completion and charging its spend to this
+    /// loop's budget.
+    async fn finish_subagent(
+        &mut self,
+        handle: &crate::harness::SubAgentHandle,
+        joined: Result<Result<crate::harness::SubAgentResult, ReactError>, tokio::task::JoinError>,
+    ) -> (bool, String) {
+        let (status, body) = match joined {
+            Ok(Ok(result)) => {
+                if let Some(tracker) = &mut self.cost_tracker {
+                    tracker.add_spent_usd(result.cost_usd);
+                }
+                self.hooks
+                    .subagent_stop(&handle.subagent_id, &result.summary)
+                    .await;
+                self.log_subagent_complete(SubAgentComplete {
+                    subagent_id: handle.subagent_id.clone(),
+                    todo_id: handle.todo_id.clone(),
+                    summary: result.summary.clone(),
+                    tokens_used: result.tokens_used,
+                    result: result.result.clone(),
+                    ts: current_timestamp(),
+                });
+                if result.result.ok
+                    && let Some(todos) = self.get_todo_list()
+                {
+                    let _ = todos.complete(&handle.todo_id);
+                }
+                (
+                    if result.result.ok { "ok" } else { "stopped" },
+                    result.result.output,
+                )
             }
-        }
-
-        // Process completed sub-agents in reverse order to maintain indices
-        for index in completed_indices.into_iter().rev() {
-            let handle = self.subagent_handles.remove(index);
-            let subagent_id = handle.subagent_id.clone();
-            let todo_id = handle.todo_id.clone();
-
-            // Wait for the sub-agent result
-            match handle.join_handle.await {
-                Ok(Ok(result)) => {
-                    // Sub-agent completed successfully
-                    let _summary =
-                        format!("Sub-agent '{}' completed: {}", subagent_id, result.summary);
-
-                    // Emit SubAgentComplete event
-                    let complete_event = SubAgentComplete {
-                        subagent_id: subagent_id.clone(),
-                        todo_id: todo_id.clone(),
-                        summary: result.summary.clone(),
-                        tokens_used: result.tokens_used,
-                        result: result.result.clone(),
-                        ts: current_timestamp(),
-                    };
-                    self.emit_subagent_complete(complete_event).await;
-                    self.hooks
-                        .subagent_stop(&subagent_id, &result.summary)
-                        .await;
-
-                    // Complete the todo item
-                    if let Some(todo_list) = self.get_todo_list() {
-                        let _ = todo_list.complete(&todo_id);
-                    }
-
-                    // Inject the sub-agent result into the parent conversation
-                    self.add_tool_result_message(
-                        result.result.output.clone(),
-                        result.result.id.clone(),
-                    )
-                    .await?;
-
-                    // Emit tool result event for the sub-agent
-                    self.emit_tool_result(result.result).await;
-
-                    // Log completion
-                    self.emit_log(
-                        LogLevel::Info,
-                        format!(
-                            "Sub-agent '{}' completed (todo: {}) in ~{} tokens",
-                            subagent_id, todo_id, result.tokens_used
-                        ),
-                    )
-                    .await;
-                }
-                Ok(Err(e)) => {
-                    // Sub-agent returned an error result
-                    self.emit_log(
-                        LogLevel::Error,
-                        format!("Sub-agent '{}' failed: {}", subagent_id, e),
-                    )
-                    .await;
-
-                    // Emit error event
-                    let error_event = SubAgentError {
-                        subagent_id: subagent_id.clone(),
-                        code: "execution_failed".to_string(),
-                        message: e.to_string(),
-                        ts: current_timestamp(),
-                    };
-                    self.emit_subagent_error(error_event).await;
-                }
-                Err(e) => {
-                    // Join error (task panicked)
-                    self.emit_log(
-                        LogLevel::Error,
-                        format!("Sub-agent '{}' panicked: {}", subagent_id, e),
-                    )
-                    .await;
-
-                    let error_event = SubAgentError {
-                        subagent_id: subagent_id.clone(),
-                        code: "panicked".to_string(),
-                        message: e.to_string(),
-                        ts: current_timestamp(),
-                    };
-                    self.emit_subagent_error(error_event).await;
-                }
+            Ok(Err(ReactError::Interrupted)) => ("aborted", "Sub-agent was aborted.".to_string()),
+            Ok(Err(e)) => ("failed", format!("Sub-agent failed: {e}")),
+            Err(e) => {
+                self.emit_subagent_error(SubAgentError {
+                    subagent_id: handle.subagent_id.clone(),
+                    code: "panicked".to_string(),
+                    message: e.to_string(),
+                    ts: current_timestamp(),
+                })
+                .await;
+                ("failed", format!("Sub-agent crashed: {e}"))
             }
-        }
+        };
+        (
+            status == "ok",
+            format!(
+                "<subagent-result id=\"{}\" agent=\"{}\" status=\"{status}\">\n{}\n</subagent-result>",
+                handle.subagent_id,
+                handle.agent,
+                body.trim_end()
+            ),
+        )
+    }
 
+    /// Deliver the reports of background sub-agents that already finished.
+    async fn drain_subagents(&mut self) -> Result<(), ReactError> {
+        let mut reports = Vec::new();
+        let mut index = 0;
+        while index < self.subagent_handles.len() {
+            if !self.subagent_handles[index].join_handle.is_finished() {
+                index += 1;
+                continue;
+            }
+            let mut handle = self.subagent_handles.remove(index);
+            let joined = (&mut handle.join_handle).await;
+            reports.push(self.finish_subagent(&handle, joined).await.1);
+        }
+        if !reports.is_empty() {
+            self.conversation
+                .add_user_message(reports.join("\n\n"))
+                .context("failed to add sub-agent results")?;
+        }
         Ok(())
+    }
+
+    /// Wait for the given sub-agents (all when `ids` is empty) up to `timeout`,
+    /// returning their formatted reports. Interrupted by `shutdown_rx`.
+    async fn wait_for_subagents(
+        &mut self,
+        ids: &[String],
+        timeout: Duration,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<Vec<String>, ReactError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut reports = Vec::new();
+        loop {
+            let Some(index) = self
+                .subagent_handles
+                .iter()
+                .position(|h| ids.is_empty() || ids.contains(&h.subagent_id))
+            else {
+                return Ok(reports);
+            };
+            let mut handle = self.subagent_handles.remove(index);
+            let joined = tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => {
+                    self.subagent_handles.clear();
+                    self.emit_interrupted(false).await;
+                    return Err(ReactError::Interrupted);
+                }
+                joined = tokio::time::timeout_at(deadline, &mut handle.join_handle) => joined,
+            };
+            match joined {
+                Ok(joined) => reports.push(self.finish_subagent(&handle, joined).await.1),
+                Err(_) => {
+                    // Still running: keep it and report what's pending.
+                    let pending = format!(
+                        "<subagent-result id=\"{}\" agent=\"{}\" status=\"running\">\nStill running after the wait timeout; call wait_agent again.\n</subagent-result>",
+                        handle.subagent_id, handle.agent
+                    );
+                    self.subagent_handles.push(handle);
+                    reports.push(pending);
+                    return Ok(reports);
+                }
+            }
+        }
+    }
+
+    /// Before the turn completes, wait for outstanding background sub-agents
+    /// and hand their reports to the model. Returns true if the loop should
+    /// continue so the model can react to them.
+    async fn settle_subagents(
+        &mut self,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+    ) -> Result<bool, ReactError> {
+        if self.subagent_handles.is_empty() {
+            return Ok(false);
+        }
+        let reports = self
+            .wait_for_subagents(&[], Duration::from_secs(3600), shutdown_rx)
+            .await?;
+        if reports.is_empty() {
+            return Ok(false);
+        }
+        self.conversation
+            .add_user_message(reports.join("\n\n"))
+            .context("failed to add sub-agent results")?;
+        Ok(true)
     }
 
     /// Take a git snapshot with the given description.
@@ -2459,12 +2919,14 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
     }
 
-    /// Emit a sub-agent completion event.
-    async fn emit_subagent_complete(&mut self, event: SubAgentComplete) {
-        let event = Event::SubAgentComplete(event);
-        let _ = self.event_tx.send(event.clone());
+    /// Record a sub-agent completion in the session log. The event itself was
+    /// already sent to the UI by the sub-agent's task.
+    fn log_subagent_complete(&self, event: SubAgentComplete) {
         if let Some(session) = &self.session {
-            let _ = session.lock().unwrap().log_event(event);
+            let _ = session
+                .lock()
+                .unwrap()
+                .log_event(Event::SubAgentComplete(event));
         }
     }
 

@@ -183,6 +183,12 @@ fn build_summarizer(config: &Config) -> Option<Arc<dyn Model>> {
     if name.is_empty() || config.model.as_ref().and_then(|m| m.name.as_deref()) == Some(&name) {
         return None;
     }
+    build_named_model(config, &name)
+}
+
+/// Build a model by name on the configured provider (used for sub-agent
+/// profiles that pick their own model).
+fn build_named_model(config: &Config, name: &str) -> Option<Arc<dyn Model>> {
     let provider = config.provider.as_ref()?;
     let api_key = provider.api_key.as_deref().filter(|k| !k.is_empty())?;
     let kind = provider.kind.as_deref().unwrap_or("openai-compatible");
@@ -196,16 +202,16 @@ fn build_summarizer(config: &Config) -> Option<Arc<dyn Model>> {
     let caps = config.to_model_capabilities(None);
     let model = match kind {
         "anthropic" => ActiveModel::Anthropic(AnthropicModel::new(
-            client, base_url, api_key, &name, caps, None,
+            client, base_url, api_key, name, caps, None,
         )),
         "openai" => ActiveModel::OpenAI(OpenAIModel::new(
-            client, base_url, api_key, &name, caps, None,
+            client, base_url, api_key, name, caps, None,
         )),
         "google" => ActiveModel::Google(GoogleModel::new(
-            client, base_url, api_key, &name, caps, None,
+            client, base_url, api_key, name, caps, None,
         )),
         _ => ActiveModel::OpenRouter(OpenRouterModel::new(
-            client, base_url, api_key, &name, caps, None,
+            client, base_url, api_key, name, caps, None,
         )),
     };
     Some(Arc::new(model))
@@ -253,6 +259,12 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
         roots: write_roots.clone(),
     });
     okeanos::tool::workspace::set_roots(write_roots);
+    {
+        let model_config = config.clone();
+        okeanos::harness::subagent::set_model_resolver(Arc::new(move |name| {
+            build_named_model(&model_config, name)
+        }));
+    }
 
     match cli.mode() {
         Mode::Interactive => run_interactive(cli, &config, prompt).await,

@@ -80,6 +80,8 @@ impl<T: ?Sized + PricingProvider> PricingProviderExt for T {}
 pub struct CostTracker {
     /// Total spent so far in USD.
     spent_usd: f64,
+    /// Total tokens reported by model responses.
+    tokens_used: u64,
     /// Configuration for the budget.
     config: CostBudgetConfig,
     /// Model ID for pricing lookups.
@@ -106,6 +108,7 @@ impl Clone for CostTracker {
     fn clone(&self) -> Self {
         Self {
             spent_usd: self.spent_usd,
+            tokens_used: self.tokens_used,
             config: self.config,
             model_id: self.model_id.clone(),
             pricing: Arc::clone(&self.pricing),
@@ -124,6 +127,7 @@ impl CostTracker {
     ) -> Self {
         Self {
             spent_usd: 0.0,
+            tokens_used: 0,
             config,
             model_id,
             pricing,
@@ -249,8 +253,19 @@ impl CostTracker {
         self.spent_usd
     }
 
+    /// Total prompt + completion tokens reported by model responses.
+    pub fn tokens_used(&self) -> u64 {
+        self.tokens_used
+    }
+
+    /// Charge spend incurred elsewhere (e.g. by a sub-agent) to this tracker.
+    pub fn add_spent_usd(&mut self, usd: f64) {
+        self.spent_usd += usd;
+    }
+
     /// Record cost from a model response usage.
     pub fn record_usage(&mut self, usage: &crate::model::Usage) -> f64 {
+        self.tokens_used += (usage.prompt_tokens + usage.completion_tokens) as u64;
         let cost = self
             .estimate_tool_call_cost(usage.prompt_tokens, usage.completion_tokens)
             .unwrap_or_else(|_| CostEstimate::default());

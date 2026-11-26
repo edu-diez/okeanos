@@ -31,19 +31,35 @@ use tokio::sync::{mpsc, oneshot};
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Inputs of one spawn request.
+pub struct SpawnRequest {
+    pub todo_id: String,
+    pub agent_name: String,
+    pub prompt: String,
+    /// Short label for the fleet view.
+    pub description: String,
+    pub depth: u32,
+    pub spawn_budget_remaining: u32,
+}
+
 /// Async function to do the actual spawn work (separate to satisfy Send bounds)
 #[allow(clippy::result_large_err)]
 async fn spawn_subagent_inner(
     config: SpawnConfig,
     agent_registry: Arc<AgentRegistry>,
-    todo_id: String,
-    agent_name: String,
-    prompt: String,
-    depth: u32,
-    spawn_budget_remaining: u32,
+    request: SpawnRequest,
 ) -> Result<SubAgentHandle, SubAgentError> {
+    let SpawnRequest {
+        todo_id,
+        agent_name,
+        prompt,
+        description,
+        depth,
+        spawn_budget_remaining,
+    } = request;
+
     // 1. Resolve profile from registry
-    let profile = agent_registry
+    let mut profile = agent_registry
         .get(&agent_name)
         .ok_or_else(|| SubAgentError::ProfileNotFound {
             name: agent_name.clone(),
@@ -69,73 +85,121 @@ async fn spawn_subagent_inner(
         });
     }
 
-    // Validate profile against tool registry
+    // Built-in profiles name tools some tiers lack (e.g. `glob`); drop those
+    // instead of failing, but never let an allowlist collapse into "all tools".
+    if !profile.tools.is_empty() {
+        profile.tools.retain(|t| config.parent_tools.has(t));
+        if profile.tools.is_empty() {
+            return Err(SubAgentError::ValidationFailed {
+                message: format!("none of the tools of agent '{agent_name}' are available"),
+            });
+        }
+    }
+    profile
+        .disallowed_tools
+        .retain(|t| config.parent_tools.has(t));
     profile
         .validate(&config.parent_tools)
         .map_err(|e| SubAgentError::ValidationFailed {
             message: e.to_string(),
         })?;
 
-    // 3. Create isolated Conversation with profile-specific system prompt
-    let conversation = create_subagent_conversation(&config, &profile, depth).await?;
+    // 3. Resolve the model (explicit profile models go through the resolver)
+    let model = resolve_model(&config, &profile)?;
 
-    // 4. Filter ToolRegistry: tier_tools ∩ allowlist - denylist
+    // 4. Create isolated Conversation with profile-specific system prompt
+    let conversation = create_subagent_conversation(&profile, depth, &model, &config)?;
+
+    // 5. Filter ToolRegistry: parent tools ∩ allowlist - denylist
     let tools = create_subagent_tools(&config, &profile)?;
 
-    // 5. Create child CostTracker with token_budget limit
-    let cost_tracker = create_subagent_cost_tracker(&config, &profile)?;
+    // 6. Create child CostTracker with token_budget limit
+    let cost_tracker = create_subagent_cost_tracker(&config, &profile, &model)?;
 
-    // 6. Create WorkspaceHandle per profile.workspace_mode
+    // 7. Create WorkspaceHandle per profile.workspace_mode
     let workspace = create_workspace(&config, &profile).await?;
 
-    // 7. Build ReactLoop with sub-agent's config
-    let subagent_loop = build_subagent_loop(
+    // 8. Build ReactLoop with sub-agent's config
+    let subagent_id = format!("subagent-{}-{}", todo_id, uuid::Uuid::new_v4().simple());
+    let subagent_loop = match build_subagent_loop(
         &config,
         &profile,
+        model,
         conversation,
         tools,
         cost_tracker,
         workspace.cwd().to_path_buf(),
         depth,
-    )?;
+        &subagent_id,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = workspace.cleanup().await;
+            return Err(e);
+        }
+    };
 
-    // 8. Create approval channel (mpsc) for parent→sub-agent
+    // 9. Create approval channel (mpsc) for parent→sub-agent and register it
+    // so the parent's router can deliver decisions for this sub-agent's requests.
     let (approval_tx, approval_rx) = mpsc::channel(32);
-    let approval_tx_for_handle = approval_tx.clone(); // Clone for the handle
+    let subagent_loop = if config.approvals_routable {
+        config
+            .approval_routes
+            .lock()
+            .unwrap()
+            .insert(subagent_id.clone(), approval_tx.clone());
+        subagent_loop.with_approval_receiver(approval_rx)
+    } else {
+        subagent_loop
+    };
 
-    // Configure the loop with the approval receiver
-    let subagent_loop = subagent_loop.with_approval_receiver(approval_rx);
-
-    // 9. Spawn background task running loop_.run(prompt)
-    let subagent_id = format!("subagent-{}-{}", todo_id, uuid::Uuid::new_v4().simple());
-    let parent_tx = config.parent_tx.clone();
-    let subagent_id_clone = subagent_id.clone();
-    let todo_id_for_handle = todo_id.clone(); // Clone for the handle
-    let todo_id_for_task = todo_id; // Move for the task
-
+    // 10. Spawn background task running loop_.run(prompt)
     let (abort_tx, abort_rx) = oneshot::channel();
-    let join_handle = tokio::spawn(async move {
-        run_subagent_task(RunSubagentTaskArgs {
-            subagent_id: subagent_id_clone,
-            todo_id: todo_id_for_task,
-            loop_: subagent_loop,
-            initial_prompt: prompt,
-            parent_tx,
-            _approval_tx: approval_tx,
-            abort_rx,
-            depth,
-        })
-        .await
-    });
+    let join_handle = tokio::spawn(run_subagent_task(RunSubagentTaskArgs {
+        subagent_id: subagent_id.clone(),
+        todo_id: todo_id.clone(),
+        loop_: subagent_loop,
+        initial_prompt: prompt,
+        parent_tx: config.parent_tx.clone(),
+        abort_rx,
+        depth,
+        workspace,
+        slots: config.slots.clone(),
+        approval_routes: config.approval_routes.clone(),
+    }));
 
-    // 10. Return SubAgentHandle
+    // 11. Return SubAgentHandle
     Ok(SubAgentHandle {
         subagent_id,
-        todo_id: todo_id_for_handle,
+        todo_id,
+        agent: agent_name,
+        description,
         join_handle,
         abort_tx,
-        approval_tx: approval_tx_for_handle,
+        approval_tx,
     })
+}
+
+/// Pick the sub-agent's model: the parent's for `inherit`, otherwise whatever
+/// the configured resolver builds for the profile's model name.
+#[allow(clippy::result_large_err)]
+fn resolve_model(
+    config: &SpawnConfig,
+    profile: &AgentProfile,
+) -> Result<Arc<dyn Model>, SubAgentError> {
+    if profile.model == "inherit" || profile.model == config.parent_model.model_id() {
+        return Ok(config.parent_model.clone());
+    }
+    config
+        .model_resolver
+        .as_ref()
+        .and_then(|resolve| resolve(&profile.model))
+        .ok_or_else(|| SubAgentError::ModelResolutionFailed {
+            message: format!(
+                "agent '{}' wants model '{}', which is not configured",
+                profile.name, profile.model
+            ),
+        })
 }
 
 /// Wrapper around `Arc<dyn Model>` that implements `Model` by delegating.
@@ -243,6 +307,8 @@ pub struct SubAgentResult {
     pub summary: String,
     /// Total tokens used by the sub-agent.
     pub tokens_used: u64,
+    /// Spend to charge to the parent's budget.
+    pub cost_usd: f64,
 }
 
 /// Handle to a spawned sub-agent for monitoring and control.
@@ -252,9 +318,13 @@ pub struct SubAgentHandle {
     pub subagent_id: String,
     /// The todo ID that was delegated to this sub-agent.
     pub todo_id: String,
+    /// Name of the agent profile.
+    pub agent: String,
+    /// Short label of the delegated task.
+    pub description: String,
     /// Join handle for the background task.
     pub join_handle: tokio::task::JoinHandle<Result<SubAgentResult, ReactError>>,
-    /// Abort sender to cancel the sub-agent.
+    /// Abort sender to cancel the sub-agent (dropping it aborts too).
     pub abort_tx: oneshot::Sender<()>,
     /// Channel to send approval decisions to the sub-agent.
     pub approval_tx: mpsc::Sender<Approval>,
@@ -289,6 +359,56 @@ impl WorkspaceHandle {
             WorkspaceHandle::Branch { worktree_path, .. } => worktree_path,
             WorkspaceHandle::Share { shared_dir } => shared_dir,
         }
+    }
+
+    /// Finish with the workspace. A `branch` worktree with changes is committed
+    /// to a new `okeanos/<name>` branch (kept for the caller to merge) and
+    /// removed; an unchanged one is simply removed. Returns a note describing
+    /// where the changes went, if there were any.
+    pub async fn finalize(self) -> Result<Option<String>, std::io::Error> {
+        let WorkspaceHandle::Branch { worktree_path, .. } = &self else {
+            return Ok(None);
+        };
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(worktree_path)
+                .output()
+        };
+        let dirty = git(&["status", "--porcelain"])?;
+        let mut note = None;
+        if dirty.status.success() && !dirty.stdout.is_empty() {
+            let name = worktree_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("subagent")
+                .replacen("okeanos-subagent-", "okeanos/", 1);
+            let committed = git(&["switch", "-c", &name])?.status.success()
+                && git(&["add", "-A"])?.status.success()
+                && git(&[
+                    "-c",
+                    "user.name=okeanos",
+                    "-c",
+                    "user.email=okeanos@localhost",
+                    "commit",
+                    "-m",
+                    "okeanos sub-agent changes",
+                ])?
+                .status
+                .success();
+            note = Some(if committed {
+                format!(
+                    "Changes were committed on branch `{name}`; review with `git diff HEAD...{name}` and merge them if wanted."
+                )
+            } else {
+                format!(
+                    "Changes could not be committed automatically and were discarded with {}.",
+                    worktree_path.display()
+                )
+            });
+        }
+        self.cleanup().await?;
+        Ok(note)
     }
 
     /// Clean up workspace resources (removes worktree for Branch mode).
@@ -368,30 +488,54 @@ pub struct SpawnConfig {
     pub parent_hooks: Arc<crate::harness::hooks::Hooks>,
     /// Maximum sub-agent delegation depth allowed globally.
     pub global_max_depth: u32,
+    /// Builds a model by name for profiles that don't `inherit`.
+    pub model_resolver: Option<ModelResolver>,
+    /// Limits how many sub-agents run at once; the rest queue for a slot.
+    pub slots: Arc<tokio::sync::Semaphore>,
+    /// Sub-agent id → channel its approval decisions are routed to.
+    pub approval_routes: ApprovalRoutes,
+    /// False when the parent can't receive decisions (headless): the
+    /// sub-agent then gets no approval receiver, so approval-requiring tool
+    /// calls fail fast instead of waiting forever.
+    pub approvals_routable: bool,
+}
+
+/// Builds a model for a model name (see `AgentProfile::model`).
+pub type ModelResolver = Arc<dyn Fn(&str) -> Option<Arc<dyn Model>> + Send + Sync>;
+
+static MODEL_RESOLVER: std::sync::OnceLock<ModelResolver> = std::sync::OnceLock::new();
+
+/// Install the process-wide resolver used when a loop has none of its own.
+pub fn set_model_resolver(resolver: ModelResolver) {
+    let _ = MODEL_RESOLVER.set(resolver);
+}
+
+/// The process-wide model resolver, if installed.
+pub fn global_model_resolver() -> Option<ModelResolver> {
+    MODEL_RESOLVER.get().cloned()
+}
+
+/// Shared table the parent's approval router uses to reach sub-agents.
+pub type ApprovalRoutes = Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<Approval>>>>;
+
+/// Tool names that only the top-level agent may use.
+fn is_parent_only_tool(name: &str) -> bool {
+    crate::tool::agent::is_orchestration_tool(name)
 }
 
 impl SpawnConfig {
-    /// Get the tier tool subset for the parent's model tier.
+    /// Tools a sub-agent may draw from: everything the parent has except the
+    /// orchestration tools (so sub-agents cannot spawn or exit plan mode).
     fn tier_tools(&self) -> Vec<String> {
-        use crate::context::tier::tool_subsets;
-        match self.parent_capabilities.tier {
-            ModelTier::Small => tool_subsets::small().into_iter().collect(),
-            ModelTier::Mid => tool_subsets::mid().into_iter().collect(),
-            ModelTier::Frontier => tool_subsets::frontier().into_iter().collect(),
-        }
+        self.parent_tools
+            .names()
+            .into_iter()
+            .filter(|n| !is_parent_only_tool(n))
+            .collect()
     }
 }
 
 /// Spawn a new sub-agent as a background task.
-///
-/// # Arguments
-/// * `parent` - The parent ReactLoop (provides model, tools, config, event stream)
-/// * `agent_registry` - Registry of agent profiles
-/// * `todo_id` - ID of the todo item delegating to this sub-agent
-/// * `agent_name` - Name of the agent profile to use
-/// * `prompt` - Initial prompt for the sub-agent
-/// * `depth` - Current delegation depth (0 = first level)
-/// * `spawn_budget_remaining` - Remaining spawn budget for this delegation chain
 ///
 /// # Returns
 /// A `SubAgentHandle` for monitoring and controlling the sub-agent.
@@ -399,11 +543,9 @@ impl SpawnConfig {
 pub async fn spawn_subagent<M: Model + 'static>(
     parent: &ReactLoop<M>,
     agent_registry: Arc<AgentRegistry>,
-    todo_id: String,
-    agent_name: String,
-    prompt: String,
-    depth: u32,
-    spawn_budget_remaining: u32,
+    request: SpawnRequest,
+    approval_routes: ApprovalRoutes,
+    approvals_routable: bool,
 ) -> Result<SubAgentHandle, SubAgentError> {
     // Build SpawnConfig from parent using accessor methods
     let spawn_config = SpawnConfig {
@@ -421,39 +563,22 @@ pub async fn spawn_subagent<M: Model + 'static>(
         parent_policy: parent.policy().clone(),
         parent_hooks: parent.hooks(),
         global_max_depth: 10, // Hard limit per architecture
+        model_resolver: parent.model_resolver(),
+        slots: parent.agent_slots(),
+        approval_routes,
+        approvals_routable,
     };
 
-    spawn_subagent_with_config(
-        spawn_config,
-        agent_registry,
-        todo_id,
-        agent_name,
-        prompt,
-        depth,
-        spawn_budget_remaining,
-    )
-    .await
+    spawn_subagent_with_config(spawn_config, agent_registry, request).await
 }
 
 /// Internal spawn function with explicit config (for testing and flexibility).
 fn spawn_subagent_with_config(
     config: SpawnConfig,
     agent_registry: Arc<AgentRegistry>,
-    todo_id: String,
-    agent_name: String,
-    prompt: String,
-    depth: u32,
-    spawn_budget_remaining: u32,
+    request: SpawnRequest,
 ) -> BoxFuture<'static, Result<SubAgentHandle, SubAgentError>> {
-    Box::pin(spawn_subagent_inner(
-        config,
-        agent_registry,
-        todo_id,
-        agent_name,
-        prompt,
-        depth,
-        spawn_budget_remaining,
-    ))
+    Box::pin(spawn_subagent_inner(config, agent_registry, request))
 }
 
 /// Build the system prompt for a sub-agent.
@@ -477,6 +602,9 @@ fn build_subagent_system_prompt(
         Allowed tools: {}\n\
         Disallowed tools: {}\n\
         Workspace mode: {:?}\n\
+        You cannot ask the user questions and cannot see the caller's conversation. \
+        Your final message is the only thing the caller receives: make it a complete, \
+        self-contained report.\n\
         =========================\n",
         depth,
         profile.name,
@@ -495,46 +623,39 @@ fn build_subagent_system_prompt(
         },
         profile.workspace_mode
     ));
+    if !profile.instructions.is_empty() {
+        prompt.push_str(&format!("\n{}\n", profile.instructions));
+    }
 
     prompt
 }
 
 /// Create a conversation for the sub-agent with profile-specific system prompt.
 #[allow(clippy::result_large_err)]
-async fn create_subagent_conversation(
-    config: &SpawnConfig,
+fn create_subagent_conversation(
     profile: &AgentProfile,
     depth: u32,
+    model: &Arc<dyn Model>,
+    config: &SpawnConfig,
 ) -> Result<Conversation, SubAgentError> {
-    // Determine model ID: "inherit" means use parent's model
-    let model_id = if profile.model == "inherit" {
-        config.parent_model.model_id().to_string()
-    } else {
-        profile.model.clone()
-    };
+    let capabilities = model.capabilities().clone();
+    let tier = capabilities.tier;
+    let system_prompt = build_subagent_system_prompt(profile, depth, model.model_id(), tier);
 
-    // Determine model tier from parent capabilities or profile
-    let tier = if profile.model == "inherit" {
-        config.parent_capabilities.tier
-    } else {
-        // For explicit model, we'd need to look up its tier; default to parent's tier
-        config.parent_capabilities.tier
-    };
-
-    // Build system prompt with sub-agent context
-    let system_prompt = build_subagent_system_prompt(profile, depth, &model_id, tier);
-
-    // Create conversation with parent's context cap (or a reasonable default)
-    let max_context = config.parent_capabilities.max_context;
+    // Never exceed what the sub-agent's own model can hold.
+    let max_context = capabilities
+        .max_context
+        .min(config.parent_capabilities.max_context.max(1));
     let capabilities = ModelCapabilities {
-        tier,
         max_context,
-        ..config.parent_capabilities.clone()
+        ..capabilities
     };
 
-    let conversation = Conversation::with_system_prompt(system_prompt, max_context, capabilities);
-
-    Ok(conversation)
+    Ok(Conversation::with_system_prompt(
+        system_prompt,
+        max_context,
+        capabilities,
+    ))
 }
 
 /// Create a filtered tool registry for the sub-agent.
@@ -550,57 +671,37 @@ fn create_subagent_tools(
     Ok(config.parent_tools.filter(&effective_tool_names))
 }
 
-/// Create a child CostTracker with the profile's token budget.
+/// Create the sub-agent's cost tracker. It has no USD cap of its own (the
+/// profile's token budget is enforced by the loop); it exists so real usage
+/// can be charged to the parent's budget. Absent when the parent doesn't track
+/// cost or the model has no known pricing.
 #[allow(clippy::result_large_err)]
 fn create_subagent_cost_tracker(
     config: &SpawnConfig,
-    profile: &AgentProfile,
-) -> Result<CostTracker, SubAgentError> {
-    let parent_tracker =
-        config
-            .parent_cost_tracker
-            .as_ref()
-            .ok_or_else(|| SubAgentError::ValidationFailed {
-                message: "parent has no cost tracker; cannot create child budget".to_string(),
-            })?;
-
-    // Create child budget config with the profile's token budget as session cap
-    // Convert token budget to USD estimate using parent's pricing
-    let child_config = CostBudgetConfig {
-        session_cap_usd: Some(estimate_usd_from_tokens(
-            profile.token_budget,
-            parent_tracker.model_id(),
-            parent_tracker.pricing(),
-        )),
-        per_turn_warning_usd: parent_tracker.per_turn_warning_usd(),
-        expensive_call_confirmation_usd: parent_tracker.expensive_call_confirmation_usd(),
+    _profile: &AgentProfile,
+    model: &Arc<dyn Model>,
+) -> Result<Option<CostTracker>, SubAgentError> {
+    let Some(parent_tracker) = config.parent_cost_tracker.as_ref() else {
+        return Ok(None);
     };
-
-    Ok(CostTracker::new(
-        child_config,
-        parent_tracker.model_id().to_string(),
-        parent_tracker.pricing().clone(),
-        parent_tracker.capabilities().clone(),
-    ))
-}
-
-/// Estimate USD cost from token count using model pricing.
-fn estimate_usd_from_tokens(
-    tokens: usize,
-    model_id: &str,
-    pricing: &Arc<dyn crate::context::tokens::PricingProvider + Send + Sync>,
-) -> f64 {
-    if let Some(p) = pricing.try_pricing(model_id) {
-        // Rough estimate: assume 50/50 input/output split
-        let input_tokens = tokens / 2;
-        let output_tokens = tokens - input_tokens;
-        let input_cost = (input_tokens as f64 / 1_000_000.0) * p.input_per_million;
-        let output_cost = (output_tokens as f64 / 1_000_000.0) * p.output_per_million;
-        input_cost + output_cost
-    } else {
-        // Fail closed: if pricing unknown, set a conservative cap
-        10.0
+    if parent_tracker
+        .pricing()
+        .try_pricing(model.model_id())
+        .is_none()
+    {
+        return Ok(None);
     }
+    let child_config = CostBudgetConfig {
+        session_cap_usd: None,
+        per_turn_warning_usd: None,
+        expensive_call_confirmation_usd: None,
+    };
+    Ok(Some(CostTracker::new(
+        child_config,
+        model.model_id().to_string(),
+        parent_tracker.pricing().clone(),
+        model.capabilities().clone(),
+    )))
 }
 
 /// Create a workspace handle based on the profile's workspace mode.
@@ -665,32 +766,26 @@ async fn create_workspace(
 }
 
 /// Build the ReactLoop for the sub-agent.
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn build_subagent_loop(
     config: &SpawnConfig,
     profile: &AgentProfile,
+    model: Arc<dyn Model>,
     conversation: Conversation,
     tools: ToolRegistry,
-    cost_tracker: CostTracker,
+    cost_tracker: Option<CostTracker>,
     cwd: PathBuf,
-    _depth: u32,
+    depth: u32,
+    subagent_id: &str,
 ) -> Result<ReactLoop<DynModel>, SubAgentError>
 where
     SpawnConfig: Send,
 {
-    // Determine model for sub-agent
-    let model: Arc<dyn Model> = if profile.model == "inherit" {
-        config.parent_model.clone()
-    } else {
-        // Would need to resolve explicit model from provider registry
-        // For now, fall back to parent model
-        config.parent_model.clone()
-    };
-
     // Create ReactConfig with sub-agent specific settings
     let mut subagent_config = config.parent_config.clone();
-    // Could adjust max_iterations based on token budget, etc.
-    subagent_config.max_iterations = (profile.token_budget / 1000).max(10); // Rough heuristic
+    subagent_config.max_iterations = profile
+        .max_turns
+        .unwrap_or_else(|| (profile.token_budget / 1000).max(10));
 
     // Wrap model in DynModel to satisfy Model trait bound
     let dyn_model = Arc::new(DynModel(model));
@@ -704,7 +799,12 @@ where
         config.parent_tx.clone(),
     )
     .with_project_root(cwd)
-    .with_cost_tracker(cost_tracker);
+    .with_delegation_depth(depth + 1)
+    .with_approval_prefix(format!("{subagent_id}/"));
+    let loop_ = match cost_tracker {
+        Some(tracker) => loop_.with_cost_tracker(tracker),
+        None => loop_,
+    };
 
     // Add optional components from parent
     let loop_ = if let Some(session) = &config.session {
@@ -750,9 +850,25 @@ struct RunSubagentTaskArgs {
     loop_: ReactLoop<DynModel>,
     initial_prompt: String,
     parent_tx: EventSender,
-    _approval_tx: mpsc::Sender<Approval>,
     abort_rx: oneshot::Receiver<()>,
     depth: u32,
+    workspace: WorkspaceHandle,
+    slots: Arc<tokio::sync::Semaphore>,
+    approval_routes: ApprovalRoutes,
+}
+
+/// Text of the last assistant message, used as a partial result.
+fn last_assistant_text(loop_: &ReactLoop<DynModel>) -> String {
+    loop_
+        .conversation()
+        .messages()
+        .iter()
+        .rev()
+        .find(|m| {
+            matches!(m.role, crate::events::MessageRole::Assistant) && !m.content.trim().is_empty()
+        })
+        .map(|m| m.content.clone())
+        .unwrap_or_default()
 }
 
 /// Run the sub-agent task in the background.
@@ -764,89 +880,138 @@ async fn run_subagent_task(args: RunSubagentTaskArgs) -> Result<SubAgentResult, 
         mut loop_,
         initial_prompt,
         parent_tx,
-        _approval_tx,
-        abort_rx,
+        mut abort_rx,
         depth,
+        workspace,
+        slots,
+        approval_routes,
     } = args;
-    // Track progress for periodic updates
-    let start_time = Instant::now();
-    let initial_prompt_clone = initial_prompt.clone(); // Keep a copy for the result
 
-    // Emit initial progress
-    emit_progress(&parent_tx, &subagent_id, 0, "Sub-agent started".to_string()).await;
+    let outcome = run_subagent_inner(
+        &subagent_id,
+        &mut loop_,
+        initial_prompt,
+        &parent_tx,
+        &mut abort_rx,
+        depth,
+        slots,
+    )
+    .await;
 
-    // Run the loop with the initial prompt
-    let result = tokio::select! {
-        biased;
-        result = loop_.run(initial_prompt) => result,
-        _ = abort_rx => {
-            // Aborted by parent
-            emit_error(
-                &parent_tx,
-                &subagent_id,
-                "aborted",
-                "Sub-agent aborted by parent".to_string(),
-            ).await;
-            return Err(ReactError::Interrupted);
-        }
+    approval_routes.lock().unwrap().remove(&subagent_id);
+    let workspace_note = match workspace.finalize().await {
+        Ok(note) => note,
+        Err(e) => Some(format!("Workspace cleanup failed: {e}")),
     };
 
-    match result {
-        Ok(final_output) => {
-            // Approximate tokens from output length (rough heuristic: ~4 chars per token)
-            let total_tokens = (final_output.len() / 4).max(100) as u64;
-
-            // Create summary
-            let tool_result = ToolResult {
-                id: format!("subagent-result-{}", subagent_id),
-                name: "subagent".to_string(),
-                args: serde_json::json!({ "prompt": initial_prompt_clone }),
-                output: final_output.clone(),
-                ok: true,
-                duration_ms: start_time.elapsed().as_millis() as u64,
-                truncated: false,
-                exit_code: Some(0),
-                timed_out: false,
-                cancelled: false,
-            };
-
-            let summary = format!(
-                "Sub-agent '{}' completed at depth {} in {:.1}s (~{} tokens)",
-                subagent_id,
-                depth,
-                start_time.elapsed().as_secs_f32(),
-                total_tokens
-            );
-
-            // Emit completion event
+    match outcome {
+        Ok(mut result) => {
+            if let Some(note) = workspace_note {
+                result.result.output.push_str("\n\n");
+                result.result.output.push_str(&note);
+            }
             emit_complete(
                 &parent_tx,
                 &subagent_id,
                 &todo_id,
-                &summary,
-                total_tokens,
-                &tool_result,
+                &result.summary,
+                result.tokens_used,
+                &result.result,
             )
             .await;
-
-            Ok(SubAgentResult {
-                result: tool_result.clone(),
-                summary,
-                tokens_used: total_tokens,
-            })
+            Ok(result)
         }
         Err(e) => {
-            let error_msg = e.to_string();
-            emit_error(
-                &parent_tx,
-                &subagent_id,
-                "execution_failed",
-                error_msg.clone(),
-            )
-            .await;
+            let code = if matches!(e, ReactError::Interrupted) {
+                "aborted"
+            } else {
+                "execution_failed"
+            };
+            emit_error(&parent_tx, &subagent_id, code, e.to_string()).await;
             Err(e)
         }
     }
+}
+
+#[allow(clippy::result_large_err)]
+async fn run_subagent_inner(
+    subagent_id: &str,
+    loop_: &mut ReactLoop<DynModel>,
+    initial_prompt: String,
+    parent_tx: &EventSender,
+    abort_rx: &mut oneshot::Receiver<()>,
+    depth: u32,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<SubAgentResult, ReactError> {
+    let start_time = Instant::now();
+    let prompt_for_result = initial_prompt.clone();
+
+    // Queue for a concurrency slot (abortable).
+    let _permit = tokio::select! {
+        biased;
+        _ = &mut *abort_rx => return Err(ReactError::Interrupted),
+        permit = slots.acquire_owned() => permit.ok(),
+    };
+
+    emit_progress(parent_tx, subagent_id, 0, "Sub-agent started".to_string()).await;
+
+    let result = tokio::select! {
+        biased;
+        _ = &mut *abort_rx => return Err(ReactError::Interrupted),
+        result = loop_.run(initial_prompt) => result,
+    };
+
+    let (tokens_used, cost_usd) = loop_
+        .cost_tracker()
+        .map(|t| (t.tokens_used(), t.spent_usd()))
+        .unwrap_or((0, 0.0));
+
+    let (output, ok, stopped) = match result {
+        Ok(out) => (out, true, None),
+        Err(
+            e @ (ReactError::MaxIterations { .. }
+            | ReactError::MaxElapsed { .. }
+            | ReactError::CostBudget(_)
+            | ReactError::Stopped { .. }),
+        ) => {
+            let partial = last_assistant_text(loop_);
+            let out = format!(
+                "Stopped early: {e}.\nPartial output:\n{}",
+                if partial.is_empty() {
+                    "(none)"
+                } else {
+                    partial.as_str()
+                }
+            );
+            (out, false, Some(e.to_string()))
+        }
+        Err(e) => return Err(e),
+    };
+
+    let tool_result = ToolResult {
+        id: format!("subagent-result-{subagent_id}"),
+        name: "subagent".to_string(),
+        args: serde_json::json!({ "prompt": prompt_for_result }),
+        output,
+        ok,
+        duration_ms: start_time.elapsed().as_millis() as u64,
+        truncated: false,
+        exit_code: Some(if ok { 0 } else { 1 }),
+        timed_out: false,
+        cancelled: false,
+    };
+    let summary = format!(
+        "Sub-agent '{subagent_id}' {} at depth {depth} in {:.1}s ({tokens_used} tokens){}",
+        if ok { "completed" } else { "stopped early" },
+        start_time.elapsed().as_secs_f32(),
+        stopped.map(|s| format!(": {s}")).unwrap_or_default()
+    );
+    Ok(SubAgentResult {
+        result: tool_result,
+        summary,
+        tokens_used,
+        cost_usd,
+    })
 }
 
 /// Emit a progress event to the parent.

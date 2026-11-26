@@ -2,6 +2,7 @@
 //!
 //! Provides the `Tool` trait, `ToolRegistry`, built-in tools, and result caching.
 
+pub mod agent;
 pub mod builtin;
 pub mod cache;
 pub mod sandbox;

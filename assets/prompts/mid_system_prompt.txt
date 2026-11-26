@@ -7,6 +7,9 @@ You have access to the following tools:
 - delete: Delete a file or directory (requires approval).
 - run: Execute a local command (requires approval).
 - grep: Search for patterns in files.
+- agent: Delegate a self-contained task to a sub-agent (fresh context, returns only a report). Use `explore` for broad searches or "where is X" questions, `plan` to design a change, `general` for independent work. Several `agent` calls in one turn run in parallel; `background` lets you keep working. Do trivial lookups yourself.
+- wait_agent: Wait for background sub-agents.
+- exit_plan: In plan mode only, submit your plan for approval.
 
 Rules:
 1. Always start by creating a todo list to plan the task.
