@@ -29,6 +29,10 @@ CI additionally runs clippy with `--all-targets --all-features` on several opera
 - Add an entry to [CHANGELOG.md](CHANGELOG.md) for user-visible changes.
 - Instructions for AI agents working on this repo are in [AGENTS.md](AGENTS.md).
 
+## Licensing
+
+okeanos is licensed under [AGPL-3.0-or-later](LICENSE). By contributing you agree that your contribution is released under the same license.
+
 ## Reporting security issues
 
 Please don't open a public issue for vulnerabilities. Contact the maintainer privately through GitHub.

@@ -105,4 +105,4 @@ Without `just`: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
 
 ## License
 
-[MIT](LICENSE)
+[AGPL-3.0-or-later](LICENSE). If you run a modified version as a network service, you must offer its source to the users of that service.
