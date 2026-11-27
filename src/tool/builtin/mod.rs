@@ -1,4 +1,4 @@
-//! Built-in tools: read, write, delete, run, grep, glob.
+//! Built-in tools: read, write, delete, run, job_output, job_kill, grep, glob.
 //!
 //! All built-in tools execute under the permission layer.
 //! Tool output is truncated to a maximum byte limit with head/tail
@@ -9,6 +9,7 @@ pub mod edit;
 pub mod fsio;
 pub mod glob;
 pub mod grep;
+pub mod jobs;
 pub mod read;
 pub mod remember;
 pub mod run;
@@ -20,6 +21,7 @@ pub use delete::DeleteTool;
 pub use edit::{EditFormat, EditTool};
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use jobs::{JobKillTool, JobOutputTool};
 pub use read::ReadTool;
 pub use remember::RememberTool;
 pub use run::RunTool;

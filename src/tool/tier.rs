@@ -5,7 +5,8 @@
 
 use crate::model::ModelTier;
 use crate::tool::builtin::{
-    DeleteTool, EditFormat, EditTool, GlobTool, GrepTool, ReadTool, RunTool, WriteTool,
+    DeleteTool, EditFormat, EditTool, GlobTool, GrepTool, JobKillTool, JobOutputTool, ReadTool,
+    RunTool, WriteTool,
 };
 use crate::tool::todo::{TodoList, TodoTool};
 use crate::tool::tool_trait::ToolRegistry;
@@ -13,7 +14,7 @@ use crate::tool::tool_trait::ToolRegistry;
 /// Build the built-in registry for `tier`.
 ///
 /// - Small: `read`, `edit`, `run` (minimal schema surface).
-/// - Mid/Frontier: adds `todo`, `write`, `delete`, `grep`, `glob`; `edit`
+/// - Mid/Frontier: adds `todo`, `write`, `delete`, `grep`, `glob`, `job_output`, `job_kill`; `edit`
 ///   is available everywhere so targeted changes never need a full rewrite.
 pub fn builtin_registry(
     tier: ModelTier,
@@ -30,6 +31,8 @@ pub fn builtin_registry(
         tools.register(DeleteTool::new());
         tools.register(GrepTool::new());
         tools.register(GlobTool::new());
+        tools.register(JobOutputTool::new());
+        tools.register(JobKillTool::new());
     }
     tools
 }
@@ -55,7 +58,15 @@ mod tests {
     fn larger_tiers_get_edit_and_search() {
         for tier in [ModelTier::Mid, ModelTier::Frontier] {
             let n = names(tier);
-            for t in ["edit", "write", "grep", "glob", "todo"] {
+            for t in [
+                "edit",
+                "write",
+                "grep",
+                "glob",
+                "todo",
+                "job_output",
+                "job_kill",
+            ] {
                 assert!(n.iter().any(|x| x == t), "{tier:?} missing {t}");
             }
         }

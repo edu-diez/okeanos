@@ -32,10 +32,10 @@ use tokio::time::{Instant, timeout_at};
 
 #[cfg(unix)]
 const GRACE_PERIOD_MS: u64 = 500; // Between SIGTERM and SIGKILL
-const DRAIN_GRACE_MS: u64 = 250; // Max extra read time after the process exits
+pub(super) const DRAIN_GRACE_MS: u64 = 250; // Max extra read time after the process exits
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 3600;
-const CAPTURE_PART: usize = 256 * 1024;
+pub(super) const CAPTURE_PART: usize = 256 * 1024;
 const LIVE_CAP: usize = 256 * 1024; // Max bytes streamed per call
 
 /// Built-in tool for executing local commands.
@@ -70,7 +70,11 @@ impl Tool for RunTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 3600,
-                        "description": "Maximum seconds to wait before killing the process tree (default 120)."
+                        "description": "Maximum seconds to wait before killing the process tree (default 120; for background jobs, no limit unless set)."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Start the command as a background job (dev server, watcher) and return its job id immediately. Use job_output to read new output and job_kill to stop it."
                     }
                 },
                 "required": ["command"]
@@ -110,46 +114,25 @@ impl Tool for RunTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        crate::tool::workspace::guard_run(command, &args_vec)?;
-        let wrapped = crate::tool::sandbox::apply(command, &args_vec)?;
-        let mut cmd = Command::new(&wrapped.program);
-        cmd.args(&wrapped.args);
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        scrub_env(&mut cmd);
-
-        // Backstop in case the guard below cannot run.
-        cmd.kill_on_drop(true);
-
-        #[cfg(unix)]
+        if args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
         {
-            // Own process group so the whole tree can be signalled.
-            cmd.process_group(0);
+            // Background jobs only time out when the caller asks for it.
+            let timeout = args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .map(|s| Duration::from_secs(s.clamp(1, MAX_TIMEOUT_SECS)));
+            let id = crate::tool::builtin::jobs::JobManager::global()
+                .start(command, &args_vec, timeout)
+                .await?;
+            return Ok(ToolExecutionResult::output(format!(
+                "Started background job {id} ({command}). Check it with job_output {{\"id\": {id}}}; stop it with job_kill {{\"id\": {id}}}."
+            )));
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn '{command}': {e}")))?;
-
-        // Kills the whole tree if this future is dropped (cancellation).
-        let mut guard = TreeGuard::new(&child);
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ToolError::ExecutionFailed("failed to capture stdout".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ToolError::ExecutionFailed("failed to capture stderr".into()))?;
-
-        // Both streams feed one channel so output keeps its arrival order.
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-        let readers = [
-            tokio::spawn(pump(stdout, tx.clone())),
-            tokio::spawn(pump(stderr, tx)),
-        ];
+        let (mut child, mut guard, mut rx, readers) = spawn_piped(command, &args_vec)?;
 
         let mut capture = Capture::default();
         let mut live = LiveOutput::new(sink);
@@ -218,6 +201,59 @@ impl Tool for RunTool {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Child, tree guard (kills the tree when dropped while armed), chunk receiver and reader tasks.
+pub(super) type Spawned = (
+    Child,
+    TreeGuard,
+    mpsc::Receiver<Vec<u8>>,
+    [tokio::task::JoinHandle<()>; 2],
+);
+
+/// Spawn `command` with piped, merged-order output.
+pub(super) fn spawn_piped(command: &str, args: &[String]) -> Result<Spawned, ToolError> {
+    crate::tool::workspace::guard_run(command, args)?;
+    let wrapped = crate::tool::sandbox::apply(command, args)?;
+    let mut cmd = Command::new(&wrapped.program);
+    cmd.args(&wrapped.args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    scrub_env(&mut cmd);
+
+    // Backstop in case the guard below cannot run.
+    cmd.kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        // Own process group so the whole tree can be signalled.
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::ExecutionFailed(format!("failed to spawn '{command}': {e}")))?;
+
+    // Kills the whole tree if the owning future is dropped (cancellation).
+    let guard = TreeGuard::new(&child);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ToolError::ExecutionFailed("failed to capture stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ToolError::ExecutionFailed("failed to capture stderr".into()))?;
+
+    // Both streams feed one channel so output keeps its arrival order.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    let readers = [
+        tokio::spawn(pump(stdout, tx.clone())),
+        tokio::spawn(pump(stderr, tx)),
+    ];
+    Ok((child, guard, rx, readers))
 }
 
 /// Forward raw chunks from a stream until EOF or the receiver goes away.
@@ -357,7 +393,7 @@ impl Capture {
 
 /// Owns the child's process tree (Unix process group / Windows Job Object).
 /// Dropping it while armed — e.g. on cancellation — kills the whole tree.
-struct TreeGuard {
+pub(super) struct TreeGuard {
     armed: bool,
     #[cfg(unix)]
     pgid: Option<u32>,
@@ -376,7 +412,7 @@ impl TreeGuard {
         }
     }
 
-    fn kill(&self) {
+    pub(super) fn kill(&self) {
         #[cfg(unix)]
         if let Some(pgid) = self.pgid {
             use nix::sys::signal::{Signal, killpg};
@@ -390,7 +426,7 @@ impl TreeGuard {
     }
 
     /// Normal completion: leave any background processes the command started running.
-    fn disarm(&mut self) {
+    pub(super) fn disarm(&mut self) {
         self.armed = false;
         #[cfg(windows)]
         if let Some(job) = &self.job {
@@ -481,7 +517,7 @@ mod job {
 }
 
 /// Stop the process tree after a timeout and reap the leader.
-async fn terminate(child: &mut Child, guard: &TreeGuard) {
+pub(super) async fn terminate(child: &mut Child, guard: &TreeGuard) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         use nix::sys::signal::{Signal, killpg};
