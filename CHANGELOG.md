@@ -4,6 +4,12 @@ All notable changes to okeanos are documented here. The format follows [Keep a C
 
 Milestone-level detail (scope, acceptance criteria) lives in [docs/roadmap.md](docs/roadmap.md).
 
+## [0.27.1]
+### Changed
+- Relicensed under AGPL-3.0-or-later (previously MIT).
+- Release binaries now include the `rpc`, `mcp`, `otel` and `markdown` features, and are published as `.tar.gz` (Linux, macOS) or `.zip` (Windows) archives with a `SHA256SUMS.txt`.
+- Documentation reorganized: new README, CONTRIBUTING and CHANGELOG, docs moved under `docs/design/`, roadmap and `AGENTS.md` rewritten.
+
 ## [0.27.0]
 ### Added
 - Weak-model support, part 2 (M39): `[verify] on_fail/candidates`, per-model overrides under `[models."<id>"]`, `okeanos eval --suite weak-model`, behaviour-based tier adjustment.

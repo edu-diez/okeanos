@@ -21,19 +21,42 @@
 
 ## Install
 
+### Prebuilt binaries
+
+Download the archive for your platform from the [latest release](https://github.com/edu-diez/okeanos/releases/latest):
+
+| Platform | Asset |
+|---|---|
+| Linux x86_64 (glibc) | `okeanos-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (static) | `okeanos-x86_64-unknown-linux-musl.tar.gz` |
+| macOS Apple Silicon | `okeanos-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `okeanos-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `okeanos-x86_64-pc-windows-msvc.zip` |
+
+Each archive contains the `okeanos` binary, `LICENSE` and `README.md`. The release also includes `SHA256SUMS.txt`. On Linux and macOS:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS.txt   # use `shasum -a 256 -c` on macOS
+tar -xzf okeanos-<target>.tar.gz
+mv okeanos-<target>/okeanos ~/.local/bin/
+okeanos --version
+```
+
+On Windows, unzip the archive and put `okeanos.exe` somewhere on your `PATH`.
+
+Prebuilt binaries include the optional `rpc`, `mcp`, `otel` and `markdown` features.
+
+### From source
+
 Requires the Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 
 ```sh
 git clone https://github.com/edu-diez/okeanos
 cd okeanos
-cargo install --path .
+cargo install --path . --features "rpc mcp otel markdown"
 ```
 
-Optional features: `rpc`, `mcp`, `otel`, `markdown` (default: `tui`, `config-file`).
-
-```sh
-cargo install --path . --features "mcp rpc markdown"
-```
+Without `--features`, only the defaults (`tui`, `config-file`) are built.
 
 ## Quick start
 

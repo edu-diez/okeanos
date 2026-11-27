@@ -101,21 +101,25 @@ jobs:
           key: cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features "rpc mcp otel markdown"
 
-      - name: Prepare artifact
+      - name: Package (tar.gz)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          BINARY="okeanos"
-          EXT=""
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            EXT=".exe"
-          fi
-          ARTIFACT_DIR="target/${{ matrix.target }}/release"
-          mkdir -p artifacts
-          # Include the target triple before the extension so Windows binaries
-          # end up as 'okeanos-x86_64-pc-windows-msvc.exe' not 'okeanos.exe-x86_64-pc-windows-msvc'.
-          cp "${ARTIFACT_DIR}/${BINARY}${EXT}" "artifacts/${BINARY}-${{ matrix.target }}${EXT}"
+          NAME="okeanos-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}" artifacts
+          cp "target/${{ matrix.target }}/release/okeanos" LICENSE README.md "dist/${NAME}/"
+          tar -czf "artifacts/${NAME}.tar.gz" -C dist "${NAME}"
+
+      - name: Package (zip)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $name = "okeanos-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name", artifacts | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/okeanos.exe", LICENSE, README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "artifacts/$name.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -137,31 +141,20 @@ jobs:
         with:
           path: release-assets
           pattern: okeanos-*
-          merge-multiple: false
-
-      - name: Verify artifacts
-        run: |
-          ls -la release-assets/
-          for dir in release-assets/okeanos-*/; do
-            echo "Checking $dir"
-            ls -la "$dir"
-            file "$dir"/okeanos* 2>/dev/null || true
-          done
+          merge-multiple: true
 
       - name: Create checksums
         run: |
           cd release-assets
-          for dir in okeanos-*/; do
-            # Extract target triple from directory name (e.g., "okeanos-x86_64-unknown-linux-gnu")
-            target=$(basename "$dir" | sed 's/^okeanos-//')
-            (cd "$dir" && sha256sum okeanos* > "SHA256SUMS-${target}.txt" 2>/dev/null || shasum -a 256 okeanos* > "SHA256SUMS-${target}.txt")
-          done
+          ls -la
+          sha256sum okeanos-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-assets/okeanos-*/*
+            release-assets/*
           generate_release_notes: true
           draft: false
           prerelease: false
