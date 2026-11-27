@@ -116,6 +116,27 @@ pub(crate) async fn cmd_doctor(cli: &Cli) -> anyhow::Result<()> {
     }
     println!();
 
+    // Verify recovery needs snapshots to roll back to
+    if let Ok(config) = &config_result
+        && let Some(v) = &config.verify
+        && v.command.is_some()
+        && (v.on_fail.as_deref() == Some("retry") || v.candidates.unwrap_or(1) > 1)
+    {
+        let snapshots_on = config
+            .snapshots
+            .as_ref()
+            .and_then(|s| s.enabled)
+            .unwrap_or(false);
+        if snapshots_on {
+            println!("✓ Verify recovery: rollback enabled (snapshots on)");
+        } else {
+            println!(
+                "⚠ Verify recovery: on_fail/candidates need snapshots, which are off; failures will only be reported. Set snapshots.enabled = true"
+            );
+        }
+        println!();
+    }
+
     // Check session directory
     if let Ok(cwd) = std::env::current_dir() {
         let session_dir = cwd.join(".okeanos").join("sessions");

@@ -359,13 +359,21 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 - **Goal pin:** `harness/react/mod.rs` appends a transient reminder message to the request (not persisted) for the small tier.
 - **Compaction scaling:** `CompactionConfig::scaled_for_window(window)` clamps token budgets to window fractions.
 
+## Weak-model support, part 2 (M39)
+
+- **Verified retry (M39a):** `[verify] on_fail = "retry"`, `retry_after`, `max_rollbacks`. `harness/react/recovery.rs` records the files `write`/`edit` changed since the last good point (paths only), counts consecutive verify failures and, at `retry_after`, calls `SnapshotStore::restore_files(snapshot, paths)` (path-scoped restore: files absent from the snapshot are deleted; nothing else is touched, never a `reset --hard`). The good point is the last snapshot taken after a passing verify. The model gets one message (reverted paths, bounded last failure output, "choose a different approach"); each rollback is a `Log` event prefixed `[rollback]`. Without snapshots it behaves as `report` and `doctor` warns.
+- **Candidates (M39b):** `[verify] candidates = k` (1–5). After a rollback-eligible failure, `recovery.rs` asks the model (higher temperature, tool-less, same context + failure output) for up to `k` alternative edit calls, applies each from the restored state and keeps the first whose `verify` passes; otherwise restores and reports. Each attempt is a `[candidate]` `Log` event.
+- **Per-model overrides (M39c):** `[models."<id>"]` → `config::ModelOverride` (`deny_unknown_fields`), resolved by `Config::model_override(id)` (exact id, then the most specific glob). Applied in `build_capabilities` (tier, edit_format, native_tools), `wiring::apply_cli_overrides` (temperature) and `ReactLoop::with_model_overrides` (tool_output_cap, max_parallel_tools, verify_tiers). `models` is dropped from untrusted project config except `max_parallel_tools = 1`. `okeanos models show <model>` prints effective values with their source.
+- **Eval suite (M39d):** `eval::weak_model_suite()` builds the fixed task set from embedded fixtures (written to a temp dir; no network). `okeanos eval --suite weak-model [--model M] [--compare]` writes/compares `.okeanos/evals/<model>.json` (`EvalReport` + pass rate, tool-call validity, iterations, tokens, stalls). Session stats count validity/stalls from `[stall]`/`[invalid-call]` `Log` events and tool results.
+- **Behaviour-based tier (M39e):** `harness/react/recovery.rs` counts calls vs. invalid ones (schema failures, unknown tools, text-parse failures, stalls). Below `MIN_VALIDITY` after `MIN_CALLS` the loop lowers the tier once per step (`tool::tier::downgrade_registry`, `Conversation::lower_tier`: tools, tier prompt, caps, goal pinning), emits a `[tier]` notice and records it via `model::profile::save` (`<cache>/okeanos/model_profiles.json`). `wiring::apply_cli_overrides` reads it back only when no explicit tier is configured. It never raises a tier.
+
 ## Observability, tracing and evals
 
 - **Logs** go to stderr (never stdout); in TUI mode only to `OKEANOS_LOG_FILE`.
 - **Span trace:** `--trace[=PATH]` or `OKEANOS_TRACE` writes JSONL spans (`run`, `iteration`, `model_call`, `tool_call`, `compaction`) to `.okeanos/traces/`.
 - **Session log** records `RunMeta` (version, model, prompt/tool hashes) and a per-attempt `ModelCall` (TTFT, latency, usage, cost, errors). `Token`/`Thinking`/`ToolOutput` deltas are not persisted. Lines are scrubbed of secrets; set `OKEANOS_LOG_REDACT=0` to disable.
 - **OTLP export (optional):** build with `--features otel` and set `OTEL_EXPORTER_OTLP_ENDPOINT`; the same spans are sent over OTLP/HTTP.
-- **Commands:** `okeanos stats|export|replay <session>` and `okeanos eval <suite.json> [--baseline F] [--out F]`. Eval runs tasks on fixture copies, optionally replaying a recorded session via `OKEANOS_REPLAY_SESSION`.
+- **Commands:** `okeanos stats|export|replay <session>` and `okeanos eval <suite.json> [--baseline F] [--out F]` (or `--suite weak-model`, see M39). Eval runs tasks on fixture copies, optionally replaying a recorded session via `OKEANOS_REPLAY_SESSION`.
 
 ## Dependency rules
 

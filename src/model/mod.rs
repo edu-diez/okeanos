@@ -15,6 +15,7 @@ pub mod model_trait;
 pub mod openai;
 pub mod openai_native;
 pub mod openai_responses;
+pub mod profile;
 pub mod registry;
 pub mod text_tool;
 

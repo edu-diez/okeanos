@@ -227,6 +227,26 @@ pub fn sanitize_untrusted(value: toml::Value) -> (toml::Value, Vec<String>) {
                 }
                 out.insert(key, Value::Table(kept));
             }
+            ("models", Value::Table(t)) => {
+                // Only the stricter value `max_parallel_tools = 1` may come from a project.
+                let mut kept = toml::map::Map::new();
+                for (id, entry) in t {
+                    let mut safe = toml::map::Map::new();
+                    if let Value::Table(fields) = entry {
+                        for (k, v) in fields {
+                            if k == "max_parallel_tools" && v.as_integer() == Some(1) {
+                                safe.insert(k, v);
+                            } else {
+                                dropped.push(format!("models.{id}.{k}"));
+                            }
+                        }
+                    }
+                    if !safe.is_empty() {
+                        kept.insert(id, Value::Table(safe));
+                    }
+                }
+                out.insert(key, Value::Table(kept));
+            }
             ("permissions", Value::Table(t)) => {
                 let mut kept = toml::map::Map::new();
                 for (k, v) in t {

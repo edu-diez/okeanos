@@ -39,6 +39,17 @@ pub enum SnapshotError {
     Git(#[from] std::io::Error),
 }
 
+/// What [`SnapshotStore::restore_files`] did to one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRestore {
+    /// Content rewritten from the snapshot.
+    Restored(PathBuf),
+    /// Created after the snapshot, so deleted.
+    Removed(PathBuf),
+    /// Left alone, with the reason.
+    Skipped(PathBuf, &'static str),
+}
+
 /// A snapshot entry in the store.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotEntry {
@@ -285,6 +296,64 @@ impl SnapshotStore {
         self.cursor = index;
 
         Ok(())
+    }
+
+    /// Restore only `paths` (relative to the project root, or absolute inside
+    /// it) to their content in the snapshot at `index`. Unlike [`restore`],
+    /// nothing else in the work tree, the index or `HEAD` is touched. A path
+    /// that did not exist in the snapshot is deleted unless git ignores it
+    /// (ignored files are not snapshotted, so their prior state is unknown).
+    /// Returns what happened to each path.
+    pub fn restore_files(
+        &self,
+        index: usize,
+        paths: &[PathBuf],
+    ) -> Result<Vec<FileRestore>, SnapshotError> {
+        let snapshot = self
+            .snapshots
+            .get(index)
+            .ok_or_else(|| SnapshotError::OutOfBounds {
+                index,
+                max: self.snapshots.len().saturating_sub(1),
+            })?;
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&self.repo_path)
+                .output()
+        };
+        let mut out = Vec::new();
+        for path in paths {
+            let abs = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.repo_path.join(path)
+            };
+            let Ok(rel) = abs.strip_prefix(&self.repo_path) else {
+                out.push(FileRestore::Skipped(path.clone(), "outside the project"));
+                continue;
+            };
+            let rel_git = rel.to_string_lossy().replace('\\', "/");
+            let spec = format!("{}:{rel_git}", snapshot.id);
+            let shown = git(&["show", &spec]).map_err(SnapshotError::Git)?;
+            if shown.status.success() {
+                std::fs::write(&abs, &shown.stdout)
+                    .map_err(|source| SnapshotError::Io { source })?;
+                out.push(FileRestore::Restored(rel.to_path_buf()));
+                continue;
+            }
+            let ignored = git(&["check-ignore", "-q", &rel_git])
+                .map_err(SnapshotError::Git)?
+                .status
+                .success();
+            if ignored {
+                out.push(FileRestore::Skipped(rel.to_path_buf(), "ignored by git"));
+            } else if abs.is_file() {
+                std::fs::remove_file(&abs).map_err(|source| SnapshotError::Io { source })?;
+                out.push(FileRestore::Removed(rel.to_path_buf()));
+            }
+        }
+        Ok(out)
     }
 
     /// Get the current cursor position.
@@ -652,5 +721,32 @@ mod tests {
 
         let content = std::fs::read_to_string(dir.path().join("file.txt")).unwrap();
         assert_eq!(content, "v2");
+    }
+
+    #[test]
+    fn restore_files_is_path_scoped() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(root.join("a.txt"), "a1").unwrap();
+        std::fs::write(root.join("b.txt"), "b1").unwrap();
+        let mut store = SnapshotStore::new(root).unwrap();
+        store.snapshot("good", 0).unwrap();
+
+        std::fs::write(root.join("a.txt"), "a2").unwrap();
+        std::fs::write(root.join("b.txt"), "user edit").unwrap();
+        std::fs::write(root.join("new.txt"), "n").unwrap();
+        std::fs::write(root.join("ignored.txt"), "i").unwrap();
+
+        let paths = ["a.txt", "new.txt", "ignored.txt"].map(PathBuf::from);
+        let res = store.restore_files(0, &paths).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a1");
+        assert!(!root.join("new.txt").exists());
+        assert!(root.join("ignored.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "user edit"
+        );
+        assert!(matches!(res[2], FileRestore::Skipped(..)));
     }
 }

@@ -47,6 +47,19 @@ pub struct SessionStats {
     /// `read` calls repeating an earlier call's exact arguments.
     pub redundant_reads: usize,
     pub errors: usize,
+    /// Calls to unknown tools, schema-invalid arguments or unparseable text calls.
+    #[serde(default)]
+    pub invalid_calls: usize,
+    /// Fraction of tool calls that were valid (1.0 when there were none).
+    #[serde(default)]
+    pub tool_call_validity: f64,
+    /// Stall-detector nudges and stops.
+    #[serde(default)]
+    pub stalls: usize,
+    #[serde(default)]
+    pub rollbacks: usize,
+    #[serde(default)]
+    pub tier_downgrades: usize,
 }
 
 impl SessionStats {
@@ -111,10 +124,27 @@ impl SessionStats {
                 }
                 Event::Compaction(_) => s.compactions += 1,
                 Event::Error(_) => s.errors += 1,
+                Event::Log(l) => {
+                    let m = l.message.as_str();
+                    if m.starts_with("[invalid-call]") {
+                        s.invalid_calls += 1;
+                    } else if m.starts_with("[stall]") {
+                        s.stalls += 1;
+                    } else if m.starts_with("[rollback]") {
+                        s.rollbacks += 1;
+                    } else if m.starts_with("[tier]") {
+                        s.tier_downgrades += 1;
+                    }
+                }
                 _ => {}
             }
         }
 
+        s.tool_call_validity = if s.tool_calls.max(s.invalid_calls) == 0 {
+            1.0
+        } else {
+            1.0 - s.invalid_calls as f64 / s.tool_calls.max(s.invalid_calls) as f64
+        };
         s.cache_hit_rate = ratio(usage_cache_read, usage_prompt);
         s.tool_error_rate = ratio(s.tool_errors as u64, s.tool_calls as u64);
         ttfts.sort_unstable();
@@ -183,6 +213,14 @@ impl SessionStats {
                 t.calls, t.errors, t.total_ms
             );
         }
+        let _ = writeln!(
+            o,
+            "validity:     {:.0}% valid calls, {} stalls, {} rollbacks, {} tier downgrades",
+            self.tool_call_validity * 100.0,
+            self.stalls,
+            self.rollbacks,
+            self.tier_downgrades
+        );
         let _ = writeln!(
             o,
             "compactions:  {}   errors: {}",
@@ -278,5 +316,32 @@ mod tests {
         assert_eq!(s.tool_errors, 1);
         assert_eq!(s.redundant_reads, 1);
         assert_eq!(s.wall_ms, 1000);
+    }
+
+    #[test]
+    fn counts_validity_and_recovery_logs() {
+        let log = |m: &str| SessionEntry {
+            ts: 1,
+            event: Event::Log(crate::events::Log {
+                level: crate::events::LogLevel::Debug,
+                message: m.into(),
+            }),
+        };
+        let entries = vec![
+            read(serde_json::json!({"path": "a"}), true),
+            read(serde_json::json!({"path": "b"}), true),
+            read(serde_json::json!({"path": "c"}), true),
+            read(serde_json::json!({"path": "d"}), true),
+            log("[invalid-call] nope: unknown tool"),
+            log("[stall] repeating"),
+            log("[rollback] restored a.rs"),
+            log("[tier] lowering"),
+        ];
+        let s = SessionStats::from_entries(&entries);
+        assert_eq!(
+            (s.invalid_calls, s.stalls, s.rollbacks, s.tier_downgrades),
+            (1, 1, 1, 1)
+        );
+        assert!((s.tool_call_validity - 0.75).abs() < 1e-9);
     }
 }

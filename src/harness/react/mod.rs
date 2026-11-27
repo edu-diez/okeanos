@@ -34,6 +34,7 @@ mod budget;
 mod compaction_glue;
 mod dispatch;
 mod parallel;
+mod recovery;
 mod stall;
 mod verify;
 use stall::{StallDetector, Verdict};
@@ -182,6 +183,7 @@ pub struct ReactLoop<M: Model> {
     /// Signature of the previous tool call and its consecutive repeat count.
     stall: StallDetector,
     verify: Option<verify::VerifyConfig>,
+    recovery: recovery::Recovery,
     /// Whether the last model response was cut off by the output token limit.
     last_truncated: bool,
     /// Provider-reported prompt/completion tokens summed over the loop's calls.
@@ -316,6 +318,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             approval_router_started: false,
             stall: StallDetector::default(),
             verify: None,
+            recovery: recovery::Recovery::default(),
             last_truncated: false,
             tokens_in_total: 0,
             tokens_out_total: 0,
@@ -817,6 +820,7 @@ impl<M: Model + 'static> ReactLoop<M> {
 
         // Take initial snapshot
         self.take_snapshot("Session start").await?;
+        self.begin_recovery_turn().await;
 
         // Set up cross-platform signal handling for Ctrl-C / SIGINT
         let (shutdown_tx, mut shutdown_rx) = self
@@ -868,6 +872,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             match self.iterate(&mut shutdown_rx).instrument(iter_span).await? {
                 LoopDecision::Continue => {
                     self.iteration += 1;
+                    self.after_iteration(&mut shutdown_rx).await?;
                     // Take snapshot at loop boundary
                     self.take_boundary_snapshot().await?;
                     self.maybe_start_background_compaction();
@@ -961,6 +966,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         self.iteration = 0;
         self.start_time = Instant::now();
         self.stall.reset();
+        self.begin_recovery_turn().await;
 
         let mut shutdown_rx = shutdown_rx;
         let mut stop_rounds = 0u32;
@@ -972,6 +978,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             match self.iterate(&mut shutdown_rx).instrument(iter_span).await? {
                 LoopDecision::Continue => {
                     self.iteration += 1;
+                    self.after_iteration(&mut shutdown_rx).await?;
                     self.take_boundary_snapshot().await?;
                     self.maybe_start_background_compaction();
                 }
@@ -1289,6 +1296,21 @@ impl<M: Model + 'static> ReactLoop<M> {
     /// When `tool_filter` is `Some`, only the named tools are advertised to
     /// the model and validated against (reduced tool set for fallback).
     async fn execute_text_tool_calls_once(
+        &mut self,
+        content: &str,
+        shutdown_rx: &mut mpsc::Receiver<()>,
+        tool_filter: Option<&[String]>,
+    ) -> Result<LoopDecision, ReactError> {
+        let result = self
+            .parse_and_run_text_tool_calls(content, shutdown_rx, tool_filter)
+            .await;
+        if let Err(ReactError::Tool(msg)) = &result {
+            self.note_invalid_call("text-tool-call", msg).await;
+        }
+        result
+    }
+
+    async fn parse_and_run_text_tool_calls(
         &mut self,
         content: &str,
         shutdown_rx: &mut mpsc::Receiver<()>,
@@ -2253,5 +2275,221 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         let decision = run_one(&mut loop_, "second").await.unwrap();
         assert_eq!(decision, LoopDecision::Complete("two".into()));
+    }
+
+    /// Writes `content` to `path` (named `write` so the loop tracks the change).
+    struct FileWriteTool;
+
+    #[async_trait]
+    impl Tool for FileWriteTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new("write", "write a file", json!({"type": "object"}))
+        }
+
+        async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {
+            let path = args["path"].as_str().unwrap_or_default();
+            std::fs::write(path, args["content"].as_str().unwrap_or_default())
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            Ok(ToolExecutionResult::output("written"))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn write_call(id: &str, dir: &std::path::Path, content: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "write".into(),
+            args: json!({"path": dir.join("a.txt").to_string_lossy(), "content": content}),
+            status: ToolCallStatus::Pending,
+        }
+    }
+
+    /// A loop over a temp project whose `a.txt` ("good") passes verification
+    /// only while it contains "good".
+    fn verify_loop(
+        model: MockModel,
+        dir: &std::path::Path,
+        verify: crate::config::VerifySection,
+    ) -> ReactLoop<MockModel> {
+        std::fs::write(dir.join("a.txt"), "good").unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(FileWriteTool);
+        let section = crate::config::VerifySection {
+            command: Some(if cfg!(windows) {
+                "findstr /C:good a.txt".into()
+            } else {
+                "grep -q good a.txt".into()
+            }),
+            tiers: Some(vec!["frontier".into()]),
+            ..verify
+        };
+        make_loop(model, tools)
+            .with_project_root(dir.to_path_buf())
+            .with_snapshot_store(crate::snapshot::SnapshotStore::new(dir).unwrap())
+            .with_verify(Some(&section))
+    }
+
+    #[tokio::test]
+    async fn repeated_verify_failures_roll_back_then_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![write_call("1", dir.path(), "bad1")]),
+            MockModel::tool_call_response("", vec![write_call("2", dir.path(), "bad2")]),
+            MockModel::tool_call_response("", vec![write_call("3", dir.path(), "bad3")]),
+            MockModel::tool_call_response("", vec![write_call("4", dir.path(), "bad4")]),
+        ]);
+        let mut loop_ = verify_loop(
+            model,
+            dir.path(),
+            crate::config::VerifySection {
+                on_fail: Some("retry".into()),
+                retry_after: Some(2),
+                max_rollbacks: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let err = run_one(&mut loop_, "go").await.unwrap_err();
+        assert!(matches!(err, ReactError::Stopped { .. }), "{err:?}");
+        let msgs = tool_messages(&loop_);
+        assert!(!msgs[0].contains("[rollback]"));
+        assert!(msgs[1].contains("[rollback]"), "{}", msgs[1]);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "bad4"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_last_good_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![write_call("1", dir.path(), "bad1")]),
+            MockModel::tool_call_response("", vec![write_call("2", dir.path(), "bad2")]),
+            MockModel::text_response("done"),
+        ]);
+        let mut loop_ = verify_loop(
+            model,
+            dir.path(),
+            crate::config::VerifySection {
+                on_fail: Some("retry".into()),
+                retry_after: Some(2),
+                ..Default::default()
+            },
+        );
+
+        run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "good"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidates_keep_the_first_passing_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![write_call("1", dir.path(), "bad")]),
+            // candidate 1 fails, candidate 2 passes
+            MockModel::tool_call_response("", vec![write_call("c1", dir.path(), "worse")]),
+            MockModel::tool_call_response("", vec![write_call("c2", dir.path(), "good v2")]),
+            MockModel::text_response("done"),
+        ]);
+        let mut loop_ = verify_loop(
+            model,
+            dir.path(),
+            crate::config::VerifySection {
+                retry_after: Some(1),
+                candidates: Some(3),
+                ..Default::default()
+            },
+        );
+
+        run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "good v2"
+        );
+        let last_user = loop_
+            .conversation()
+            .messages()
+            .iter()
+            .rfind(|m| m.role == MessageRole::User)
+            .unwrap();
+        assert!(
+            last_user.content.starts_with("[candidate]"),
+            "{}",
+            last_user.content
+        );
+    }
+
+    #[tokio::test]
+    async fn mostly_invalid_calls_lower_the_tier_and_remember_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = MockModel::frontier("m");
+        for i in 0..recovery::MIN_CALLS {
+            model.push_response(MockModel::tool_call_response(
+                "",
+                vec![call(&i.to_string(), &format!("nope{i}"))],
+            ));
+        }
+        model.push_response(MockModel::text_response("done"));
+        let mut loop_ = make_loop(model, ToolRegistry::new());
+        let profile = dir.path().join("profiles.json");
+        loop_.recovery.adaptive_tier = true;
+        loop_.recovery.model_id = "m".into();
+        loop_.recovery.profile_path = Some(profile.clone());
+
+        run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(loop_.conversation().tier(), ModelTier::Mid);
+        assert_eq!(
+            crate::model::profile::load_from(&profile, "m"),
+            Some(ModelTier::Mid)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_tier_is_never_adjusted() {
+        let model = MockModel::frontier("m");
+        for i in 0..recovery::MIN_CALLS {
+            model.push_response(MockModel::tool_call_response(
+                "",
+                vec![call(&i.to_string(), &format!("nope{i}"))],
+            ));
+        }
+        model.push_response(MockModel::text_response("done"));
+        let mut loop_ = make_loop(model, ToolRegistry::new());
+
+        run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(loop_.conversation().tier(), ModelTier::Frontier);
+    }
+
+    #[tokio::test]
+    async fn max_parallel_tools_caps_concurrency() {
+        let model = MockModel::frontier("m");
+        model.push_responses(vec![
+            MockModel::tool_call_response("", vec![call("1", "a"), call("2", "b"), call("3", "c")]),
+            MockModel::text_response("done"),
+        ]);
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        for name in ["a", "b", "c"] {
+            let mut t = TestTool::new(name);
+            t.delay_ms = 30;
+            t.max_active = max_active.clone();
+            t.active = Arc::new(AtomicUsize::new(0));
+            tools.register(t);
+        }
+        let mut loop_ = make_loop(model, tools);
+        loop_.recovery.max_parallel = Some(1);
+
+        run_one(&mut loop_, "go").await.unwrap();
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 }

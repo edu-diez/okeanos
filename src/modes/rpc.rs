@@ -301,6 +301,7 @@ pub(crate) async fn run_rpc(
             config.compaction.as_ref(),
         ))
         .with_verify(config.verify.as_ref())
+        .with_model_overrides(config, &model_name)
         .with_agent_registry(agent_registry.clone());
 
     if let Some(summarizer) = build_summarizer(config) {

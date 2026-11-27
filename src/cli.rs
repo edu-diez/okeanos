@@ -105,8 +105,16 @@ pub enum Command {
     },
     /// Run an eval suite (TOML) against fixtures and report pass/fail and metrics.
     Eval {
-        #[arg(value_name = "SUITE")]
-        suite: std::path::PathBuf,
+        /// Suite file (JSON); omit when using `--suite`.
+        #[arg(value_name = "SUITE", required_unless_present = "builtin")]
+        suite: Option<std::path::PathBuf>,
+        /// Run a built-in suite instead of a file: `weak-model`.
+        #[arg(long = "suite", value_name = "NAME", id = "builtin", value_parser = ["weak-model"])]
+        builtin: Option<String>,
+        /// Compare a built-in suite against the stored `.okeanos/evals/<model>.json`
+        /// (the model comes from the global `--model`).
+        #[arg(long)]
+        compare: bool,
         /// Compare against a previous results file; exit non-zero on regressions.
         #[arg(long, value_name = "FILE")]
         baseline: Option<std::path::PathBuf>,

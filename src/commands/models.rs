@@ -1,7 +1,10 @@
 use crate::prelude::*;
 
-/// `okeanos trust [--revoke]`.
-pub(crate) async fn cmd_models(action: &okeanos::cli::ModelsAction) -> anyhow::Result<()> {
+/// `okeanos models update|show`.
+pub(crate) async fn cmd_models(
+    cli: &okeanos::cli::Cli,
+    action: &okeanos::cli::ModelsAction,
+) -> anyhow::Result<()> {
     use okeanos::cli::ModelsAction;
     use okeanos::model::catalog;
     match action {
@@ -36,7 +39,72 @@ pub(crate) async fn cmd_models(action: &okeanos::cli::ModelsAction) -> anyhow::R
                 ),
                 None => println!("catalog: not found (using name heuristics)"),
             }
+            print_effective(cli, name, &c);
         }
     }
     Ok(())
+}
+
+/// Print the values the harness would use for `name`, and where each came from.
+fn print_effective(
+    cli: &okeanos::cli::Cli,
+    name: &str,
+    classification: &okeanos::model::ModelClassification,
+) {
+    use okeanos::model::ModelTier;
+    use okeanos::tool::builtin::EditFormat;
+    let config = Config::load_raw(cli.root.as_deref()).unwrap_or_default();
+    let over = config.model_override(name);
+    let src = |key: &str| format!("[models.\"{key}\"]");
+    let pinned = config.model.as_ref().and_then(|m| m.tier.as_deref());
+
+    let learned = okeanos::model::profile::load(name);
+    let (tier, tier_src) = match (
+        over.and_then(|(k, o)| o.tier.as_deref().map(|t| (k, t))),
+        pinned,
+    ) {
+        (Some((k, t)), _) => (t.parse().unwrap_or(classification.tier), src(k)),
+        (None, Some(t)) => (
+            t.parse().unwrap_or(classification.tier),
+            "config model.tier".into(),
+        ),
+        (None, None) => match learned {
+            Some(l) if l.rank() < classification.tier.rank() => {
+                (l, "learned profile (lowered at runtime)".to_string())
+            }
+            _ => (classification.tier, "classifier".to_string()),
+        },
+    };
+    let tier: ModelTier = tier;
+
+    println!("effective:");
+    println!("  tier:             {tier} ({tier_src})");
+    let (fmt, fmt_src) = match over.and_then(|(k, o)| o.edit_format.as_deref().map(|f| (k, f))) {
+        Some((k, f)) => (f.to_string(), src(k)),
+        None => (
+            format!("{:?}", EditFormat::default_for_tier(tier)).to_lowercase(),
+            "tier default".to_string(),
+        ),
+    };
+    println!("  edit_format:      {fmt} ({fmt_src})");
+    match over.and_then(|(k, o)| o.temperature.map(|t| (k, t))) {
+        Some((k, t)) => println!("  temperature:      {t} ({})", src(k)),
+        None => println!("  temperature:      tier default"),
+    }
+    match over.and_then(|(k, o)| o.tool_output_cap.map(|t| (k, t))) {
+        Some((k, t)) => println!("  tool_output_cap:  {t} ({})", src(k)),
+        None => println!("  tool_output_cap:  tier default"),
+    }
+    match over.and_then(|(k, o)| o.native_tools.map(|t| (k, t))) {
+        Some((k, t)) => println!("  native_tools:     {t} ({})", src(k)),
+        None => println!("  native_tools:     catalog/default"),
+    }
+    match over.and_then(|(k, o)| o.max_parallel_tools.map(|t| (k, t))) {
+        Some((k, t)) => println!("  max_parallel:     {t} ({})", src(k)),
+        None => println!("  max_parallel:     unlimited"),
+    }
+    match over.and_then(|(k, o)| o.verify_tiers.as_ref().map(|t| (k, t))) {
+        Some((k, t)) => println!("  verify_tiers:     {} ({})", t.join(","), src(k)),
+        None => println!("  verify_tiers:     [verify] section / small"),
+    }
 }

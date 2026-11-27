@@ -254,6 +254,9 @@ pub struct Config {
     /// Post-edit verification command (user-trusted; ignored in untrusted project config).
     #[serde(default)]
     pub verify: Option<VerifySection>,
+    /// Per-model overrides keyed by model id or glob (user-level config only).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub models: std::collections::BTreeMap<String, ModelOverride>,
     #[serde(default)]
     pub mcp: Option<McpSection>,
     #[serde(default)]
@@ -299,6 +302,7 @@ impl std::fmt::Debug for Config {
             .field("snapshots", &self.snapshots)
             .field("compaction", &self.compaction)
             .field("verify", &self.verify)
+            .field("models", &self.models)
             .field("mcp", &self.mcp)
             .field("rotation", &self.rotation)
             .field("tool_cache", &self.tool_cache)
@@ -447,6 +451,30 @@ pub struct VerifySection {
     pub timeout_secs: Option<u64>,
     /// Model tiers it applies to: "small", "mid", "frontier" (default: ["small"])
     pub tiers: Option<Vec<String>>,
+    /// What to do when verification keeps failing: "report" (default) or "retry"
+    /// (restore the files changed this turn and ask for a different approach).
+    pub on_fail: Option<String>,
+    /// Consecutive failures before a retry rollback (default: 2).
+    pub retry_after: Option<u32>,
+    /// Rollbacks allowed per user turn (default: 2).
+    pub max_rollbacks: Option<u32>,
+    /// Alternative edits tried after a failed verification (1 = off, max 5).
+    pub candidates: Option<u32>,
+}
+
+/// Per-model overrides (`[models."<id>"]`). Keys are an exact model id or a
+/// `*`/`?` glob. Unknown keys are rejected.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOverride {
+    pub tier: Option<String>,
+    pub edit_format: Option<String>,
+    pub temperature: Option<f64>,
+    pub tool_output_cap: Option<usize>,
+    /// `false` forces text-tool mode even if the model supports native calls.
+    pub native_tools: Option<bool>,
+    pub max_parallel_tools: Option<usize>,
+    pub verify_tiers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -938,6 +966,57 @@ impl Config {
                     });
                 }
             }
+            if let Some(mode) = &verify.on_fail
+                && !matches!(mode.as_str(), "report" | "retry")
+            {
+                return Err(ConfigError::Validation {
+                    message: format!("verify.on_fail must be 'report' or 'retry', got '{mode}'"),
+                });
+            }
+            if verify.retry_after == Some(0) {
+                return Err(ConfigError::Validation {
+                    message: "verify.retry_after must be > 0".to_string(),
+                });
+            }
+            if let Some(k) = verify.candidates
+                && !(1..=5).contains(&k)
+            {
+                return Err(ConfigError::Validation {
+                    message: format!("verify.candidates must be between 1 and 5, got {k}"),
+                });
+            }
+        }
+
+        for (id, o) in &self.models {
+            let bad = |what: String| ConfigError::Validation {
+                message: format!("models.\"{id}\": {what}"),
+            };
+            if let Some(t) = &o.tier
+                && t.parse::<ModelTier>().is_err()
+            {
+                return Err(bad(format!("unknown tier '{t}'")));
+            }
+            if let Some(f) = &o.edit_format
+                && f.parse::<EditFormat>().is_err()
+            {
+                return Err(bad(format!("unknown edit_format '{f}'")));
+            }
+            if let Some(t) = o.temperature
+                && !(0.0..=2.0).contains(&t)
+            {
+                return Err(bad(format!("temperature must be in [0, 2], got {t}")));
+            }
+            if o.tool_output_cap == Some(0) {
+                return Err(bad("tool_output_cap must be > 0".to_string()));
+            }
+            if o.max_parallel_tools == Some(0) {
+                return Err(bad("max_parallel_tools must be > 0".to_string()));
+            }
+            for t in o.verify_tiers.iter().flatten() {
+                if !matches!(t.as_str(), "small" | "mid" | "frontier") {
+                    return Err(bad(format!("verify_tiers: unknown tier '{t}'")));
+                }
+            }
         }
 
         // Validate compaction section
@@ -1122,9 +1201,68 @@ impl Config {
         self.build_capabilities(classification)
     }
 
+    /// Layering: tier defaults < bundled catalog < explicit config overrides
+    /// < `[models."<id>"]` overrides. CLI flags are applied by the caller.
+    fn build_capabilities(
+        &self,
+        classification: Option<crate::model::ModelClassification>,
+    ) -> ModelCapabilities {
+        let mut caps = self.build_capabilities_base(classification);
+        if let Some(name) = self.model.as_ref().and_then(|m| m.name.as_deref())
+            && let Some((_, o)) = self.model_override(name)
+        {
+            if let Some(t) = o.tier.as_deref().and_then(|t| t.parse::<ModelTier>().ok()) {
+                caps.tier = t;
+                if o.edit_format.is_none() {
+                    caps.edit_format = EditFormat::default_for_tier(t);
+                }
+            }
+            if let Some(ef) = o.edit_format.as_deref().and_then(|e| e.parse().ok()) {
+                caps.edit_format = ef;
+            }
+            if o.native_tools == Some(false) {
+                caps.tool_calling = false;
+            }
+        }
+        caps
+    }
+
+    /// Whether the user pinned a tier (`model.tier`, `model.capabilities.tier` or
+    /// `[models."<id>"].tier`), which disables learned tier adjustment.
+    pub fn has_explicit_tier(&self, model_name: &str) -> bool {
+        let m = self.model.as_ref();
+        m.is_some_and(|m| {
+            m.tier.is_some() || m.capabilities.as_ref().is_some_and(|c| c.tier.is_some())
+        }) || self
+            .model_override(model_name)
+            .is_some_and(|(_, o)| o.tier.is_some())
+    }
+
+    /// The `[models."<id>"]` entry for `name`: exact id first, then the most
+    /// specific matching glob. Also tries the id without a `provider/` prefix.
+    pub fn model_override(&self, name: &str) -> Option<(&str, &ModelOverride)> {
+        let bare = name.rsplit_once('/').map(|(_, m)| m);
+        let candidates = [Some(name), bare];
+        for c in candidates.into_iter().flatten() {
+            if let Some((k, v)) = self.models.get_key_value(c) {
+                return Some((k.as_str(), v));
+            }
+        }
+        self.models
+            .iter()
+            .filter(|(pat, _)| {
+                candidates
+                    .iter()
+                    .flatten()
+                    .any(|c| crate::harness::rules::wildcard_match(pat, c, true))
+            })
+            .max_by_key(|(pat, _)| pat.chars().filter(|c| *c != '*' && *c != '?').count())
+            .map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Layering: tier defaults < bundled catalog < explicit config overrides.
     /// Explicit `max_context`/`max_output`/`edit_format` always win.
-    fn build_capabilities(
+    fn build_capabilities_base(
         &self,
         classification: Option<crate::model::ModelClassification>,
     ) -> ModelCapabilities {

@@ -96,6 +96,8 @@ pub struct Conversation {
     estimated_tokens: usize,
     /// Current cost estimate.
     cost_estimate: CostEstimate,
+    /// Configured tool-output cap that wins over the tier default.
+    output_cap_override: Option<usize>,
 }
 
 impl Conversation {
@@ -120,6 +122,7 @@ impl Conversation {
             generation: 0,
             estimated_tokens: system_tokens,
             cost_estimate: CostEstimate::default(),
+            output_cap_override: None,
         }
     }
 
@@ -550,6 +553,37 @@ impl Conversation {
     /// Model tier of this conversation.
     pub fn tier(&self) -> ModelTier {
         self.tier_config.tier
+    }
+
+    /// Override the tool-output cap (`[models."<id>"] tool_output_cap`). The
+    /// override survives [`lower_tier`](Self::lower_tier).
+    pub fn set_tool_output_cap(&mut self, bytes: usize) {
+        self.output_cap_override = Some(bytes);
+        self.tier_config.tool_output_cap = bytes;
+    }
+
+    /// Switch to a lower tier mid-session (never raises): swap the tier's
+    /// system-prompt template, capabilities and tier-derived limits.
+    /// Returns whether anything changed.
+    pub fn lower_tier(&mut self, tier: ModelTier) -> bool {
+        let old = self.capabilities.tier;
+        if tier.rank() >= old.rank() {
+            return false;
+        }
+        let old_template = system_prompt_for_tier(old);
+        if let Some(rest) = self.system_prompt.strip_prefix(old_template) {
+            self.system_prompt = format!("{}{rest}", system_prompt_for_tier(tier));
+        }
+        self.capabilities.lower_tier(tier);
+        self.tier_config = TierConfig::from_capabilities(&self.capabilities);
+        if let Some(cap) = self.output_cap_override {
+            self.tier_config.tool_output_cap = cap;
+        }
+        self.selective_config = self.tier_config.selective_context.clone();
+        self.generation += 1;
+        self.anchor = None;
+        self.recalculate_tokens();
+        true
     }
 
     /// Get generation parameters for this tier.

@@ -49,7 +49,7 @@ async fn real_main() -> anyhow::Result<()> {
             return cmd_sessions(&cli).await;
         }
         Some(Command::Models { action }) => {
-            return cmd_models(action).await;
+            return cmd_models(&cli, action).await;
         }
         Some(Command::Stats { session, json }) => {
             return cmd_stats(&cli, session, *json);
@@ -62,10 +62,24 @@ async fn real_main() -> anyhow::Result<()> {
         }
         Some(Command::Eval {
             suite,
+            builtin,
+            compare,
             baseline,
             out,
         }) => {
-            let ok = okeanos::eval::run_suite(suite, baseline.as_deref(), out.as_deref())?;
+            let ok = if builtin.is_some() {
+                let root = std::env::current_dir()?;
+                okeanos::eval::run_weak_model(
+                    cli.model.as_deref(),
+                    *compare,
+                    &root,
+                    out.as_deref(),
+                )?
+            } else if let Some(suite) = suite {
+                okeanos::eval::run_suite(suite, baseline.as_deref(), out.as_deref())?
+            } else {
+                anyhow::bail!("provide a suite file or --suite weak-model");
+            };
             std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Command::Run { prompt }) => run_with_prompt(&cli, prompt.clone()).await,

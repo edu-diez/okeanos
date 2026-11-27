@@ -43,9 +43,33 @@ pub fn builtin_registry(
     tools
 }
 
+/// Shrink `tools` in place after a mid-session downgrade to `tier`, so the
+/// registry matches what [`builtin_registry`] would have produced. Never adds
+/// tools a larger tier would have.
+pub fn downgrade_registry(tools: &mut ToolRegistry, tier: ModelTier, edit_format: EditFormat) {
+    if tier != ModelTier::Small {
+        return;
+    }
+    for name in ["todo", "write", "delete", "job_output", "job_kill"] {
+        tools.remove(name);
+    }
+    tools.register(EditTool::with_format(edit_format).simplified());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downgrade_matches_small_registry() {
+        let mut reg = builtin_registry(ModelTier::Mid, EditFormat::Diff, &TodoList::new());
+        downgrade_registry(&mut reg, ModelTier::Small, EditFormat::StrReplace);
+        let mut got: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
+        got.sort();
+        assert_eq!(got, ["edit", "glob", "grep", "read", "run"]);
+        let edit = reg.specs().into_iter().find(|s| s.name == "edit").unwrap();
+        assert!(edit.input_schema.get("oneOf").is_none());
+    }
 
     fn names(tier: ModelTier) -> Vec<String> {
         builtin_registry(tier, EditFormat::StrReplace, &TodoList::new())

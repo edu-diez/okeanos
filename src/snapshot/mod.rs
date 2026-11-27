@@ -6,5 +6,5 @@
 pub mod store;
 pub mod undo_redo;
 
-pub use store::{SnapshotError, SnapshotStore};
+pub use store::{FileRestore, SnapshotError, SnapshotStore};
 pub use undo_redo::{UndoRedo, UndoRedoError};

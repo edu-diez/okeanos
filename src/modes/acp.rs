@@ -185,6 +185,7 @@ pub(crate) async fn acp_new_session(
             config.compaction.as_ref(),
         ))
         .with_verify(config.verify.as_ref())
+        .with_model_overrides(config, &model_name)
         .with_agent_registry(agent_registry);
     if let Some(summarizer) = build_summarizer(config) {
         loop_ = loop_.with_summarizer_model(summarizer);

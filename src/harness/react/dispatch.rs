@@ -253,6 +253,16 @@ impl<M: Model + 'static> ReactLoop<M> {
         if let Some(result) = self.check_doom_loop(&tool_call).await? {
             return Ok(result);
         }
+        if self.call_is_valid(&tool_call) {
+            self.recovery.note_call(true);
+        } else {
+            let msg = match self.tools.get(&tool_call.name) {
+                None => "unknown tool",
+                Some(_) => "arguments failed schema check",
+            };
+            self.note_invalid_call(&tool_call.name.clone(), msg).await;
+        }
+        self.note_change(&tool_call);
         let span = tracing::info_span!(
             "tool_call",
             tool = %tool_call.name,
@@ -276,20 +286,15 @@ impl<M: Model + 'static> ReactLoop<M> {
             .observe_result(&result.name, result.ok, &result.output)
         {
             Verdict::Stop(reason) => return Err(ReactError::Stopped { reason }),
-            Verdict::Nudge(hint) => result.output.push_str(&format!("\n\n[hint] {hint}")),
+            Verdict::Nudge(hint) => {
+                self.emit_log(LogLevel::Debug, format!("[stall] {hint}"))
+                    .await;
+                result.output.push_str(&format!("\n\n[hint] {hint}"));
+            }
             Verdict::Continue => {}
         }
-        if result.ok
-            && matches!(result.name.as_str(), "write" | "edit")
-            && let Some(cfg) = &self.verify
-            && cfg.applies_to(self.conversation.tier())
-        {
-            let cwd = self
-                .project_root
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let note = verify::run(cfg, &cwd).await;
-            result.output.push_str(&format!("\n\n{note}"));
+        if result.ok && matches!(result.name.as_str(), "write" | "edit") {
+            self.verify_after_edit(&mut result).await?;
         }
         Ok(result)
     }
@@ -329,8 +334,17 @@ impl<M: Model + 'static> ReactLoop<M> {
         tool_call: &ToolCall,
     ) -> Result<Option<ToolResult>, ReactError> {
         match self.stall.observe_call(&tool_call.name, &tool_call.args) {
-            Verdict::Stop(reason) => Err(ReactError::Stopped { reason }),
-            Verdict::Nudge(msg) => Ok(Some(self.error_tool_result(tool_call, msg).await)),
+            Verdict::Stop(reason) => {
+                self.emit_log(LogLevel::Debug, format!("[stall] stop: {reason}"))
+                    .await;
+                Err(ReactError::Stopped { reason })
+            }
+            Verdict::Nudge(msg) => {
+                self.emit_log(LogLevel::Debug, format!("[stall] {msg}"))
+                    .await;
+                self.recovery.note_call(false);
+                Ok(Some(self.error_tool_result(tool_call, msg).await))
+            }
             Verdict::Continue => Ok(None),
         }
     }
@@ -361,7 +375,8 @@ impl<M: Model + 'static> ReactLoop<M> {
                 continue;
             }
             let mut j = i;
-            while j < tool_calls.len() && self.is_parallel_safe(&tool_calls[j]) {
+            let cap = self.recovery.max_parallel.unwrap_or(usize::MAX).max(1);
+            while j < tool_calls.len() && j - i < cap && self.is_parallel_safe(&tool_calls[j]) {
                 j += 1;
             }
             if j - i >= 2 {

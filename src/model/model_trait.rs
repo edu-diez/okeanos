@@ -48,6 +48,40 @@ pub enum ModelTier {
     Frontier,
 }
 
+impl ModelTier {
+    /// Ordering used for downgrades: small < mid < frontier.
+    pub fn rank(self) -> u8 {
+        match self {
+            ModelTier::Small => 0,
+            ModelTier::Mid => 1,
+            ModelTier::Frontier => 2,
+        }
+    }
+
+    /// The next tier down, if any.
+    pub fn lower(self) -> Option<ModelTier> {
+        match self {
+            ModelTier::Frontier => Some(ModelTier::Mid),
+            ModelTier::Mid => Some(ModelTier::Small),
+            ModelTier::Small => None,
+        }
+    }
+}
+
+impl ModelCapabilities {
+    /// Lower the declared tier to `tier` (never raises). The edit format follows
+    /// the tier only if it was still the old tier's default.
+    pub fn lower_tier(&mut self, tier: ModelTier) {
+        if tier.rank() >= self.tier.rank() {
+            return;
+        }
+        if self.edit_format == EditFormat::default_for_tier(self.tier) {
+            self.edit_format = EditFormat::default_for_tier(tier);
+        }
+        self.tier = tier;
+    }
+}
+
 impl std::fmt::Display for ModelTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

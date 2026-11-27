@@ -88,6 +88,17 @@ pub(crate) fn build_named_model(config: &Config, name: &str) -> Option<Arc<dyn M
     Some(Arc::new(ActiveModel::Provider(model)))
 }
 
+/// Start at the tier a previous session lowered this model to (M39e), unless
+/// the user pinned a tier in config.
+fn apply_learned_tier(config: &Config, model_name: &str, caps: &mut ModelCapabilities) {
+    if config.has_explicit_tier(model_name) {
+        return;
+    }
+    if let Some(tier) = okeanos::model::profile::load(model_name) {
+        caps.lower_tier(tier);
+    }
+}
+
 /// Apply CLI overrides to configuration, returning the effective model name,
 /// capabilities, and generation parameters.
 pub(crate) fn apply_cli_overrides(
@@ -109,6 +120,7 @@ pub(crate) fn apply_cli_overrides(
         .to_string();
 
     let mut model_capabilities = config.to_model_capabilities(None);
+    apply_learned_tier(config, &model_name, &mut model_capabilities);
     let mut generation_params = default_generation_params(model_capabilities.tier);
 
     // Apply CLI overrides
@@ -118,7 +130,16 @@ pub(crate) fn apply_cli_overrides(
         let mut overridden = config.clone();
         overridden.model.get_or_insert_with(Default::default).name = Some(m.clone());
         model_capabilities = overridden.to_model_capabilities(None);
+        apply_learned_tier(&overridden, &model_name, &mut model_capabilities);
         generation_params = default_generation_params(model_capabilities.tier);
+    }
+
+    // `[models."<id>"]` temperature beats the tier default; the CLI flag below beats it.
+    if let Some((_, o)) = config.model_override(&model_name)
+        && let Some(t) = o.temperature
+        && model_capabilities.temperature_supported
+    {
+        generation_params.temperature = Some(t);
     }
 
     if let Some(level) = config
