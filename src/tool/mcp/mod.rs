@@ -9,6 +9,9 @@
 pub mod client;
 
 #[cfg(feature = "mcp")]
+pub mod oauth;
+
+#[cfg(feature = "mcp")]
 pub mod presets;
 
 #[cfg(feature = "mcp")]

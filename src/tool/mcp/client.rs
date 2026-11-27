@@ -18,7 +18,7 @@ use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ClientConfig, ResourceContents, Tool},
     service::{NotificationContext, RoleClient, RunningService, ServiceError},
     transport::{
-        StreamableHttpClientTransport, TokioChildProcess,
+        StreamableHttpClientTransport, TokioChildProcess, auth::AuthClient,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
@@ -58,6 +58,8 @@ pub enum McpError {
     ServerAlreadyExists(String),
     #[error("not connected to server: {0}")]
     NotConnected(String),
+    #[error("MCP authentication failed: {0}")]
+    AuthFailed(String),
     #[error("protocol error: {0}")]
     ProtocolError(String),
     #[error("IO error: {0}")]
@@ -417,7 +419,16 @@ impl McpClient {
                     warn!("MCP server '{server_name}' connection lost; reconnecting");
                     self.servers.write().await.remove(server_name);
                 }
-                Err(e) => return Err(McpError::ToolCallFailed(e.to_string())),
+                Err(e) => {
+                    let mut msg = e.to_string();
+                    if let Some(cfg) = self.config.servers.iter().find(|s| s.name == server_name)
+                        && cfg.url.is_some()
+                        && let Some(hint) = super::oauth::auth_hint(server_name, &msg)
+                    {
+                        msg = format!("{msg} ({hint})");
+                    }
+                    return Err(McpError::ToolCallFailed(msg));
+                }
             }
         }
     }
@@ -462,10 +473,31 @@ async fn establish(
         if let Some(token) = &cfg.bearer_token {
             http = http.auth_header(token.clone());
         }
-        handler
-            .serve(StreamableHttpClientTransport::from_config(http))
-            .await
-            .map_err(|e| McpError::InitializationFailed(e.to_string()))?
+        // A static bearer token wins; otherwise use stored OAuth credentials (M35).
+        let oauth = if cfg.bearer_token.is_none() {
+            super::oauth::authorized_manager(cfg).await?
+        } else {
+            None
+        };
+        let served = if let Some(manager) = oauth {
+            let auth = AuthClient::new(reqwest13::Client::default(), manager);
+            handler
+                .serve(StreamableHttpClientTransport::with_client(auth, http))
+                .await
+        } else {
+            handler
+                .serve(StreamableHttpClientTransport::from_config(http))
+                .await
+        };
+        served.map_err(|e| {
+            let mut msg = e.to_string();
+            if cfg.bearer_token.is_none()
+                && let Some(hint) = super::oauth::auth_hint(&cfg.name, &msg)
+            {
+                msg = format!("{msg} ({hint})");
+            }
+            McpError::InitializationFailed(msg)
+        })?
     } else {
         if cfg.command.is_empty() {
             return Err(McpError::SpawnFailed(

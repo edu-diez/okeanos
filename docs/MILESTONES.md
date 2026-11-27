@@ -1078,6 +1078,19 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.24.0`
 - ☐ Tag `v0.24.0`
 
+### Milestone 35 — MCP OAuth for Streamable HTTP servers
+**Status:** complete — v0.25.0 (tag pending)
+
+**Scope:** FR-54. rmcp `auth` feature (pure Rust; `reqwest` 0.13 only to name the client type). `okeanos mcp login <server>` (browser + one-shot loopback redirect, PKCE, dynamic client registration) and `okeanos mcp logout <server>`. File credential store (`CredentialStore` impl) under `<data_dir>/okeanos/mcp-auth/`, `0600` on Unix, atomic writes, keyed by server name + URL hash. Stored credentials are used automatically on connect; rmcp refreshes tokens and the store is re-saved. `bearer_token` wins over OAuth. Missing/expired auth produces a "run `okeanos mcp login <server>`" hint.
+- **Out of scope:** client-credentials/enterprise flows, OS keychain, scope-upgrade prompts mid-session, OAuth for built-in presets, stdio servers.
+
+**Definition of Done:**
+- ✅ ARCHITECTURE.md, PRODUCT_SPEC.md (FR-54) updated first
+- ✅ Unit tests: credential store round-trip/0600/clear, path keying, callback parsing/state handling, auth-hint mapping
+- ✅ `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` (575 passed, Windows)
+- ✅ `Cargo.toml` bumped to `0.25.0`
+- ☐ Tag `v0.25.0`
+
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
 
@@ -1202,7 +1215,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M32 Background processes | `0.22.0` | ✅ Complete |
 | M33 Policy depth | `0.23.0` | ✅ Complete. Minor bump: `run`/`job_kill` category `network` → `process` (visible in tool events), new optional `permissions.env_allowlist` and `exec-policy.toml` files. |
 | M34 Multimodal MCP results | `0.24.0` | ✅ Complete. Minor bump: new `ModelCapabilities.vision` / `[model.capabilities] vision`; MCP images reach vision-capable models. |
-| M35 | `0.25.0` | Planned |
+| M35 MCP OAuth | `0.25.0` | ✅ Complete. Minor bump: `okeanos mcp login/logout`, OAuth for Streamable HTTP MCP servers. |
 | M36 Monolith split | patch bump | Planned, next up. Refactor only; no user-visible change. |
 | M37 Windows sandbox spike | minor bump if shipped | Deferred; spike with explicit abandon criteria if revived. |
 

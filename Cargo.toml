@@ -1,7 +1,7 @@
 [package]
 name = "okeanos"
 description = "Autonomous coding agent harness"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 resolver = "2"
 
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
-tokio = { version = "1.43", features = ["rt", "macros", "time", "signal", "process", "io-std", "io-util", "sync"] }
+tokio = { version = "1.43", features = ["rt", "macros", "time", "signal", "process", "io-std", "io-util", "sync", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "json", "stream"] }
 thiserror = "1.0"
 anyhow = "1.0"
@@ -52,7 +52,8 @@ tempfile = { version = "3.15", optional = true }
 jsonrpsee = { version = "0.24", optional = true, features = ["ws-client", "http-client", "server"] }
 futures-util = { version = "0.3", optional = true }
 http = { version = "1.2", optional = true }
-rmcp = { version = "3.11", optional = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "schemars"] }
+rmcp = { version = "3.11", optional = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "schemars", "auth"] }
+reqwest13 = { package = "reqwest", version = "0.13", optional = true, default-features = false }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 pulldown-cmark = { version = "0.12", optional = true }
 syntect = { version = "5.0", optional = true, default-features = false, features = ["default-fancy"] }
@@ -72,7 +73,7 @@ default = ["tui", "config-file"]
 tui = ["ratatui", "crossterm"]
 config-file = ["toml"]
 rpc = ["jsonrpsee", "http", "futures-util"]
-mcp = ["rmcp", "rustls"]
+mcp = ["rmcp", "rustls", "reqwest13"]
 mock-provider = []
 otel = ["opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing-opentelemetry"]
 simd-json = []

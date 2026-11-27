@@ -67,6 +67,11 @@ pub enum Command {
         #[arg(long)]
         revoke: bool,
     },
+    /// Manage MCP server credentials (OAuth for Streamable HTTP servers).
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// List resumable sessions.
     Sessions,
     /// Download the models.dev catalog into the cache (or to `--out`, e.g. to
@@ -114,6 +119,22 @@ pub enum Command {
     Completions {
         /// Shell to generate completions for.
         shell: Shell,
+    },
+}
+
+/// MCP subcommands.
+#[derive(Debug, Subcommand)]
+pub enum McpAction {
+    /// Log in to a Streamable HTTP MCP server via OAuth (opens a browser).
+    Login {
+        /// Server name from `[[mcp.servers]]` or `.mcp.json`.
+        #[arg(value_name = "SERVER")]
+        server: String,
+    },
+    /// Delete the stored OAuth credentials for a server.
+    Logout {
+        #[arg(value_name = "SERVER")]
+        server: String,
     },
 }
 
