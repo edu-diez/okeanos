@@ -10,9 +10,9 @@
 
 | Subsystem | Responsibility | Key traits/interfaces |
 |-----------|----------------|-----------------------|
-| **CLI entry** (`src/main.rs`) | Argument parsing (clap), mode selection (interactive/headless/RPC), binary startup/shutdown, signal handling (tokio `signal`), graceful shutdown orchestration. | `Cli` (clap derive), `Mode` enum, `ShutdownHandler` |
+| **CLI entry** (`src/main.rs`, `src/commands/`, `src/modes/`, `src/wiring.rs`) | Argument parsing (clap), mode selection (interactive/headless/RPC), binary startup/shutdown, signal handling (tokio `signal`), graceful shutdown orchestration. | `Cli` (clap derive), `Mode` enum, `ShutdownHandler` |
 | **Config** (`src/config/`) | XDG global config + project-local config walk-up, TOML parsing, env var / file secret substitution, defaults, validation. | `Config`, `ConfigLayer`, `SecretRef` |
-| **ReAct loop** (`src/harness/react.rs`) | Core control flow: think → call tool → observe → repeat; context-cap enforcement; bounded retries; error-in-context. | `Harness`, `ReactLoop`, `LoopDecision` |
+| **ReAct loop** (`src/harness/react/`) | Core control flow: think → call tool → observe → repeat; context-cap enforcement; bounded retries; error-in-context. | `Harness`, `ReactLoop`, `LoopDecision` |
 | **Model abstraction** (`src/model/`) | Provider-agnostic chat completions + streaming; capability negotiation; OpenAI-compatible/OpenRouter at launch; mock provider for tests. | `Model` trait, `ModelCapabilities`, `OpenAICompatible` provider, `MockModel` |
 | **Tool system** (`src/tool/`) | JSON-schema function calling; text-based tool calling for models without native FC; tool registry; execution with permission checks; lenient parse + validate-before-execute; edit format (diff/patch + whole-file fallback); interruptible tool execution. | `Tool` trait, `ToolSpec` (JSON schema), `ToolRegistry`, `TextToolParser`, `EditFormat`, `ToolExecutor` |
 | **Permission layer** (`src/perm/`) | Safe-by-default boundary: allow-list, confirm-before-write/delete/network, argument-aware `run` rules and command-scoped session grants (M29). Optional OS sandbox for `run` (M30, see below). | `Policy`, `Permission`, `ApprovalDecision` |
@@ -226,7 +226,7 @@ okeanos/
 │   ├── MILESTONES.md      # Phase 5 roadmap
 │   └── AGENTS.md          # Phase 6 agent instructions
 ├── src/
-│   ├── main.rs            # CLI entry, mode selection, signals, shutdown orchestration
+│   ├── main.rs            # thin entrypoint: parse, init tracing, dispatch\n│   ├── prelude.rs         # shared imports for the binary's modules\n│   ├── wiring.rs          # ActiveModel, build_policy/hooks, MCP/skill/memory registration\n│   ├── commands/          # doctor, sessions, stats_export_replay, models, mcp, trust, init\n│   ├── modes/             # interactive, headless, acp, rpc, rpc_ws
 │   ├── lib.rs             # harness crate root (public API)
 │   ├── cli.rs             # clap derive definitions
 │   ├── config/
@@ -235,7 +235,7 @@ okeanos/
 │   │   └── agent_profile.rs  # AgentProfile, AgentRegistry (M27)
 │   ├── harness/
 │   │   ├── mod.rs
-│   │   ├── react.rs       # ReAct loop, LoopDecision, iteration/elapsed limits
+│   │   ├── react/         # mod.rs loop+config; dispatch, parallel, authorize, budget, compaction_glue
 │   │   ├── policy.rs      # approval policy wiring
 │   │   ├── error.rs       # HarnessError (thiserror)
 │   │   └── subagent.rs    # SubAgent, SubAgentHandle, spawning, bubbling (M27)
