@@ -117,7 +117,7 @@ pub fn availability() -> (bool, String) {
     } else {
         (
             false,
-            "no OS sandbox backend on this platform; `run` is only guarded by permissions and path checks (consider WSL or a container)".into(),
+            "no native OS sandbox on this platform; `run` is only guarded by approvals and path checks. For OS-enforced confinement use WSL2 or a container".into(),
         )
     }
 }
@@ -139,7 +139,8 @@ impl Sandbox for Unsupported {
     fn wrap(&self, _: &str, _: &[String], _: &SandboxPolicy) -> Result<Wrapped, ToolError> {
         Err(ToolError::ExecutionFailed(
             "permissions.sandbox is enabled but no OS sandbox is available on this platform; \
-             set permissions.sandbox = \"none\" to run unsandboxed"
+             use WSL2 or a container for confinement, or set permissions.sandbox = \"none\" \
+             to run guarded only by approvals and path checks"
                 .into(),
         ))
     }
@@ -383,6 +384,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_seatbelt_profile() {
         let p = SandboxPolicy {

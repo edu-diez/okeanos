@@ -238,10 +238,12 @@ impl CompressionWorker {
             path.with_extension("jsonl.zst")
         };
 
-        fs::write(&compressed_path, compressed_data).map_err(|source| SessionError::WriteLog {
-            path: compressed_path.clone(),
-            source,
-        })?;
+        crate::tool::builtin::fsio::atomic_write(&compressed_path, &compressed_data).map_err(
+            |source| SessionError::WriteLog {
+                path: compressed_path.clone(),
+                source,
+            },
+        )?;
 
         // Remove original after successful compression
         fs::remove_file(path).map_err(|source| SessionError::WriteLog {
@@ -721,9 +723,11 @@ impl SessionManager {
 
         // Write back
         let content = lines.join("\n") + "\n";
-        fs::write(path, content).map_err(|source| SessionError::WriteLog {
-            path: path.to_path_buf(),
-            source,
+        crate::tool::builtin::fsio::atomic_write(path, content.as_bytes()).map_err(|source| {
+            SessionError::WriteLog {
+                path: path.to_path_buf(),
+                source,
+            }
         })?;
 
         Ok(())

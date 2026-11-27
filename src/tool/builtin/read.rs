@@ -4,6 +4,7 @@
 //! Output is line-numbered (`cat -n` style) and windowed with `offset`/`limit`
 //! so large files are paged instead of head/tail-truncated.
 
+use crate::tool::builtin::fsio;
 use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -70,18 +71,26 @@ impl Tool for ReadTool {
             });
 
         crate::tool::workspace::guard_read(std::path::Path::new(path))?;
-        let bytes = tokio::fs::read(path)
+        let path_buf = std::path::PathBuf::from(path);
+        let bytes = tokio::task::spawn_blocking(move || fsio::read_existing(&path_buf))
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("failed to read '{path}': {e}")))?;
+            .map_err(|e| ToolError::ExecutionFailed(format!("read task failed: {e}")))??
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed(format!("failed to read '{path}': file not found"))
+            })?;
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return Err(ToolError::ExecutionFailed(format!(
                 "'{path}' looks like a binary file ({} bytes)",
                 bytes.len()
             )));
         }
+        fsio::record(std::path::Path::new(path), &bytes);
         let content = String::from_utf8_lossy(&bytes);
 
-        let (output, truncated) = format_window(&content, offset, limit);
+        let (mut output, truncated) = format_window(&content, offset, limit);
+        if matches!(content, std::borrow::Cow::Owned(_)) {
+            output.push_str("\n[note: file is not valid UTF-8; invalid bytes shown as U+FFFD and edit will refuse to modify it]");
+        }
         Ok(ToolExecutionResult {
             output,
             exit_code: None,

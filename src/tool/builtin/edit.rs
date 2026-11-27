@@ -3,7 +3,7 @@
 //! Category: Write (requires approval).
 //! Output is truncated to MAX_OUTPUT_BYTES.
 
-use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output};
+use crate::tool::builtin::{MAX_OUTPUT_BYTES, fsio, truncate_output};
 use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -186,13 +186,17 @@ impl Tool for EditTool {
         };
 
         // Read existing file content for diff/str_replace
-        let original_content = if path.exists() {
-            std::fs::read_to_string(path).map_err(|e| {
-                ToolError::ExecutionFailed(format!("failed to read '{}': {e}", path.display()))
-            })?
-        } else {
-            String::new()
-        };
+        let read_path = path.to_path_buf();
+        let (original_content, text_format) =
+            tokio::task::spawn_blocking(move || match fsio::read_existing(&read_path)? {
+                Some(bytes) => {
+                    fsio::check_unchanged(&read_path, &bytes)?;
+                    fsio::decode(&read_path, bytes)
+                }
+                None => Ok((String::new(), fsio::TextFormat::plain())),
+            })
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("read task failed: {e}")))??;
 
         // Apply the edit with preflight validation
         let new_content = match &op {
@@ -204,13 +208,16 @@ impl Tool for EditTool {
         };
 
         // Write the new content
-        if let Some(parent) = path.parent() {
-            fs_create_dir_all(parent).map_err(|e| {
-                ToolError::ExecutionFailed(format!("failed to create directories: {e}"))
-            })?;
-        }
-
-        std::fs::write(path, &new_content).map_err(|e| {
+        let bytes = text_format.restore(&new_content);
+        let write_path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            fsio::atomic_write(&write_path, &bytes)?;
+            fsio::record(&write_path, &bytes);
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("write task failed: {e}")))?
+        .map_err(|e| {
             ToolError::ExecutionFailed(format!("failed to write '{}': {e}", path.display()))
         })?;
 
@@ -475,17 +482,41 @@ fn apply_str_replace(original: &str, old_str: &str, new_str: &str) -> Result<Str
     Ok(original.replace(old_str, new_str))
 }
 
-/// Create all directories in `path` if they don't exist.
-fn fs_create_dir_all(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_str_replace_preserves_crlf_and_bom() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("crlf.txt");
+        fs::write(&p, "\u{feff}a\r\nb\r\nc\r\n").unwrap();
+        EditTool::with_format(EditFormat::StrReplace)
+            .execute(json!({"path": p.to_str().unwrap(), "old_str": "a\nb", "new_str": "a\nB"}))
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&p).unwrap(), "\u{feff}a\r\nB\r\nc\r\n".as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_edit_refuses_non_utf8_and_stale_files() {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("latin1.txt");
+        fs::write(&bin, [b'a', 0xE9, b'\n']).unwrap();
+        let tool = EditTool::with_format(EditFormat::StrReplace);
+        let args = |p: &std::path::Path| json!({"path": p.to_str().unwrap(), "old_str": "a", "new_str": "b"});
+        assert!(tool.execute(args(&bin)).await.is_err());
+
+        let p = dir.path().join("stale.txt");
+        fs::write(&p, "a\n").unwrap();
+        fsio::record(&p, b"a\n");
+        fs::write(&p, "a changed\n").unwrap();
+        let err = tool.execute(args(&p)).await.unwrap_err().to_string();
+        assert!(err.contains("changed since you last read"), "{err}");
+    }
 
     #[tokio::test]
     async fn test_edit_tool_diff_basic() {

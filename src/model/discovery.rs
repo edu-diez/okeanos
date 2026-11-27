@@ -175,7 +175,7 @@ pub async fn fetch_openrouter_models(
         return Err(DiscoveryError::NoApiKey);
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::model::http::provider_client();
     let response = client
         .get("https://openrouter.ai/api/v1/models")
         .header("Authorization", format!("Bearer {}", api_key))

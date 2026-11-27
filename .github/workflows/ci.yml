@@ -12,7 +12,7 @@ env:
 
 jobs:
   check:
-    name: Check (fmt, clippy, test)
+    name: Check (fmt, clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +33,30 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}-test-${{ matrix.os }}
+
       - name: Run tests
         run: cargo test --all-features
 
   build-matrix:
     name: Build ${{ matrix.os }} (${{ matrix.target }})
-    needs: check
+    needs: [check, test]
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

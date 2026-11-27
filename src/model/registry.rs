@@ -113,7 +113,7 @@ pub fn build_model(
     caps: ModelCapabilities,
     pricing: Option<ModelPricing>,
 ) -> Arc<dyn Model + Send + Sync> {
-    let client = reqwest::Client::new();
+    let client = crate::model::http::provider_client();
     let (url, key) = (spec.base_url.as_str(), spec.api_key.as_str());
     match (spec.kind, spec.wire_api) {
         (ProviderKind::Anthropic, _) => Arc::new(AnthropicModel::new(

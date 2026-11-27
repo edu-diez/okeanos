@@ -6,6 +6,7 @@
 
 pub mod delete;
 pub mod edit;
+pub mod fsio;
 pub mod glob;
 pub mod grep;
 pub mod read;

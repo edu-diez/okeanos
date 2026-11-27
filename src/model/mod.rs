@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod classifier;
 pub mod discovery;
 pub mod google;
+pub mod http;
 pub mod mock;
 pub mod model_trait;
 pub mod openai;

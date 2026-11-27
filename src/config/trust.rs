@@ -174,7 +174,7 @@ fn write_store(path: &Path, store: &BTreeMap<String, String>) -> Result<(), Stri
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| e.to_string())
+    crate::tool::builtin::fsio::atomic_write(path, text.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Reduce an untrusted project config to settings that cannot run code, reach

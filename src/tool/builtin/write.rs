@@ -3,7 +3,7 @@
 //! Category: Write (requires approval).
 //! Output is truncated to MAX_OUTPUT_BYTES.
 
-use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output};
+use crate::tool::builtin::{MAX_OUTPUT_BYTES, fsio, truncate_output};
 use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -55,15 +55,23 @@ impl Tool for WriteTool {
 
         let path = Path::new(path);
         crate::tool::workspace::guard_write(path)?;
-        if let Some(parent) = path.parent() {
-            fs_create_dir_all(parent).map_err(|e| {
-                ToolError::ExecutionFailed(format!("failed to create directories: {e}"))
+        let write_path = path.to_path_buf();
+        let bytes = content.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || {
+            if let Some(existing) = fsio::read_existing(&write_path)? {
+                fsio::check_unchanged(&write_path, &existing)?;
+            }
+            fsio::atomic_write(&write_path, &bytes).map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to write '{}': {e}",
+                    write_path.display()
+                ))
             })?;
-        }
-
-        std::fs::write(path, content).map_err(|e| {
-            ToolError::ExecutionFailed(format!("failed to write '{}': {e}", path.display()))
-        })?;
+            fsio::record(&write_path, &bytes);
+            Ok::<_, ToolError>(())
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("write task failed: {e}")))??;
 
         let output = format!("Wrote {} bytes to {}", content.len(), path.display());
         let (output, truncated) = truncate_output(&output, MAX_OUTPUT_BYTES);
@@ -80,11 +88,6 @@ impl Tool for WriteTool {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-}
-
-/// Create all directories in `path` if they don't exist.
-fn fs_create_dir_all(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)
 }
 
 #[cfg(test)]

@@ -1040,6 +1040,13 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | M34 | Multimodal MCP results: map MCP image/audio content blocks to model image inputs (instead of flattening to text) for providers that support them; text placeholder otherwise. | Depends on Message content-part support in the Model trait; capability-gated per DESIGN of ModelCapabilities. |
 | M35 | MCP OAuth for Streamable HTTP servers: rmcp auth flow, token store (0600), refresh, okeanos mcp login <server>. | Secrets stay out of config; must stay pure Rust (no C deps). |
 
+### Maintainability milestone (planned, next up)
+
+| Milestone | Deliverable | Notes |
+|-----------|-------------|-------|
+| M36 | Split the two monoliths with **no behaviour change**. `src/main.rs` (~3.8k lines) → thin entrypoint + `src/commands/` modules (`doctor`, `sessions`, `stats_export_replay`, `models`, `trust`, `init`) and run-mode modules (`interactive`, `headless`, `acp`, `rpc`, `rpc_ws`) plus shared wiring (`build_active_model`, `build_policy`, `build_hooks`, MCP/skill/memory registration). `src/harness/react.rs` (~3.2k lines) → `harness/react/` (`mod.rs` loop + config, `dispatch.rs` serial tool execution, `parallel.rs` parallel read batch, `authorize.rs` policy/hooks/approval, `budget.rs` cost and expensive-call checks, `compaction_glue.rs`). | Pure moves: public API (`okeanos::harness::ReactLoop`, etc.) re-exported unchanged; no new deps; `cargo fmt`, `clippy -D warnings` and the full test suite must pass identically before and after, with tests moved beside their code. Do it in small commits (one module per commit) so each is reviewable. Patch bump (`0.x.y`), since nothing user-facing changes. |
+| M37 | **⏸ Deferred (revisit if Windows users ask for it): Windows sandbox spike → opt-in backend.** Rationale: green real-process tests only prove the attacks we thought of, a half-trusted native sandbox can give false confidence, and WSL2/containers already give Windows users the bwrap sandbox. Until then Windows `run` is guarded by approvals and path checks only, and `doctor`/the refusal message say so. Design kept below for later. Phase 1 (time-boxed spike): prototype a `Sandbox` impl for Windows behind the existing trait, using a restricted token (disabled SIDs, low integrity level) + the existing Job Object, and/or AppContainer with explicit ACL grants on the workspace roots. Phase 2 (only if the spike passes): ship it as an opt-in backend for `permissions.sandbox = "read-only" \| "workspace-write"`, with `doctor` reporting availability. | **Exit criteria for the spike** (real child processes on `windows-latest`, no mocks): writes outside the workspace roots fail; writes inside succeed; `.git`/`.env*` stay read-only; network is blocked unless `sandbox_network = true`; the process tree dies with the job. If any fails or ACL grants are flaky/leave residue, abandon: keep today's "refuse to run" behaviour and document WSL/container as the Windows path. Unsafe FFI confined to one module (`src/tool/sandbox/windows.rs`) with `// SAFETY:` comments and RAII handle wrappers. Minor bump if shipped; no bump if abandoned. |
+
 ---
 
 ## Milestone summary table
@@ -1090,6 +1097,8 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 33 | Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
 | 34 | Multimodal MCP results | 1–2 | M32a |
 | 35 | MCP OAuth (Streamable HTTP) | 2 | M32a |
+| 36 | Split `main.rs` / `react.rs` (no behaviour change) | 2–3 | — |
+| 37 | ⏸ Deferred: Windows sandbox spike (opt-in backend if it passes) | 2–3 | M30 |
 
 ---
 
@@ -1141,6 +1150,8 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M30 OS sandbox | `0.14.0` | ✅ Complete. Minor bump: additive, opt-in (`permissions.sandbox`, default `none`). |
 | M31 Incremental tool output | `0.15.0` | ✅ Complete. Minor bump: additive `tool_output` event; consumers matching `Event` exhaustively must handle it. |
 | M32–M35 | `0.16.0`+ | Planned, one minor each |
+| M36 Monolith split | patch bump | Planned, next up. Refactor only; no user-visible change. |
+| M37 Windows sandbox spike | minor bump if shipped | Deferred; spike with explicit abandon criteria if revived. |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 
