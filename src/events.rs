@@ -1,6 +1,6 @@
 //! Shared event types for TUI and headless/RPC parity.
 //!
-//! Per DESIGN.md §7, every visible TUI state has a 1:1 JSON event.
+//! Per tui-design.md §7, every visible TUI state has a 1:1 JSON event.
 //! These structs are serialized for headless/RPC and consumed by the TUI renderer.
 
 use serde::{Deserialize, Serialize};

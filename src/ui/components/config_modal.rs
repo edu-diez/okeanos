@@ -1,6 +1,6 @@
 //! Configuration modal component — stepper form for in-TUI provider setup.
 //!
-//! Per DESIGN.md §5.11: centered overlay (~70% width, max 100 cols). Stepper flow:
+//! Per tui-design.md §5.11: centered overlay (~70% width, max 100 cols). Stepper flow:
 //! Step 1: Provider kind → Step 2: Base URL → Step 3: API key → Step 4: Model →
 //! Step 5: Confirm & write. Writes `okeanos.toml` at git root/CWD on save.
 

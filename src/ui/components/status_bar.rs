@@ -1,4 +1,4 @@
-//! Status bar component — always visible status per DESIGN.md §5.6.
+//! Status bar component — always visible status per tui-design.md §5.6.
 //!
 //! Left-to-right: model name, tokens in/out, cost, elapsed time, retry count, mode dot.
 //! Two rows at comfortable height, one row at minimum height.

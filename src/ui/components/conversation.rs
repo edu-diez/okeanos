@@ -1,6 +1,6 @@
 //! Conversation pane component — vertical message list with streaming token render.
 //!
-//! Per DESIGN.md §5.1, §5.2:
+//! Per tui-design.md §5.1, §5.2:
 //! - User messages left-aligned with `user` chip
 //! - Assistant messages with `assistant` chip and streaming token render
 //! - Tool results indented under assistant turn, collapsed by default

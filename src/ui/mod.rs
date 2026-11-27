@@ -1,7 +1,7 @@
-//! TUI module — terminal rendering per DESIGN.md.
+//! TUI module — terminal rendering per tui-design.md.
 //!
 //! Uses ratatui + crossterm; themes from assets/themes/.
-//! Consumes the same event stream that headless/RPC mode emits (DESIGN.md §7).
+//! Consumes the same event stream that headless/RPC mode emits (tui-design.md §7).
 
 pub mod components;
 pub mod layout;

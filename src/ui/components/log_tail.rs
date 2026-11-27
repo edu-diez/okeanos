@@ -1,4 +1,4 @@
-//! Log tail panel component — newest JSONL line at bottom per DESIGN.md §5.8.
+//! Log tail panel component — newest JSONL line at bottom per tui-design.md §5.8.
 //!
 //! Autoscroll on new lines; level color (system/ok/error); optional filter chips.
 

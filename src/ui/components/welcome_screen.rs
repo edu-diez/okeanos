@@ -1,6 +1,6 @@
 //! Welcome screen component — shown on startup when no config and no prompt.
 //!
-//! Per DESIGN.md §5.10: centered modal overlay (not a full-screen replacement)
+//! Per tui-design.md §5.10: centered modal overlay (not a full-screen replacement)
 //! shown on startup when no config exists and no prompt provided via CLI.
 //! Panel contains: app name/version, provider/model status, key bindings summary,
 //! and two actions: [Enter] Configure provider · [Esc] Dismiss.

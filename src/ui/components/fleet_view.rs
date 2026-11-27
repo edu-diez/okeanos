@@ -1,6 +1,6 @@
 //! FleetView panel — shows active sub-agents with status, tokens, depth, and controls.
 //!
-//! Per DESIGN.md §5: right-rail panel for multi-agent delegation monitoring.
+//! Per tui-design.md §5: right-rail panel for multi-agent delegation monitoring.
 
 use crate::events::{Event, SubAgentComplete, SubAgentError, SubAgentProgress};
 use crate::ui::theme::{SemanticRole, Theme};

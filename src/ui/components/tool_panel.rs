@@ -1,4 +1,4 @@
-//! Tool panel component — tool-call invocation panel per DESIGN.md §5.3.
+//! Tool panel component — tool-call invocation panel per tui-design.md §5.3.
 //!
 //! Shows name chip (tool color), arguments as scrollable mono-data with key/string coloring,
 //! result block (expandable), status badge (pending → ok/error), retry counter.

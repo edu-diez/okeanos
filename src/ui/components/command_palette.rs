@@ -1,4 +1,4 @@
-//! Command palette component — centered overlay per DESIGN.md §5.7.
+//! Command palette component — centered overlay per tui-design.md §5.7.
 //!
 //! Lists `/undo`, `/redo`, `/help`, `/approve`, `/deny`, `/todos`, `/logs`.
 //! Prefix/fuzzy match as you type; Esc closes; Enter runs.

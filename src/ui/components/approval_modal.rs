@@ -1,4 +1,4 @@
-//! Approval/confirm modal — centered, keyboard-first per DESIGN.md §5.4.
+//! Approval/confirm modal — centered, keyboard-first per tui-design.md §5.4.
 //!
 //! Title "Approve tool call?", tool name + args preview.
 //! Three actions: Allow / Deny / Allow always for this session.

@@ -1,4 +1,4 @@
-//! Input composer component — multi-line text area per DESIGN.md §5.9.
+//! Input composer component — multi-line text area per tui-design.md §5.9.
 //!
 //! Multi-line editing, Enter to submit, Shift+Enter for newline,
 //! Ctrl+C to cancel in-flight turn, Ctrl+D to exit.

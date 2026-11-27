@@ -1,4 +1,4 @@
-//! Responsive layout grid per DESIGN.md §4.
+//! Responsive layout grid per tui-design.md §4.
 //!
 //! Grid unit: 1 terminal character cell. Regions stack vertically by default;
 //! columns appear when width allows.

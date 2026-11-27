@@ -1,14 +1,12 @@
-# Phase 1 — Visual Design & Art Direction
+# TUI Design
 
-**Project:** Rust CLI TUI Agent Harness
-**Status:** Phase 1 — design only (no implementation code)
-**Owner:** UI/UX (Design)
-**Validation:** Workflow manager checks this against product requirements
-**Output path:** DESIGN.md
+Visual design and art direction for the okeanos TUI. This is the visual spec: don't deviate from colors, layout regions, tokens or the §7 event map without design review.
+
+Related: [product-spec.md](product-spec.md), [../architecture.md](../architecture.md)
 
 ## Summary
 
-The harness is a single static Rust binary that turns an LLM into an autonomous coding agent (ReAct loop, tool calls, approval policies, todo tool, headless/RPC mode, JSONL session log, git snapshots). The primary interface is a terminal TUI; headless/RPC mode emits the same state as JSON. This document defines the visual design so Phase 2+ can build the TUI without visual rework.
+okeanos is a single static Rust binary that turns an LLM into an autonomous coding agent (ReAct loop, tool calls, approval policies, todo tool, headless/RPC mode, JSONL session log, git snapshots). The primary interface is a terminal TUI; headless/RPC mode emits the same state as JSON. This document defines the visual design so the TUI can be built and extended without visual rework.
 
 ## 1. Art direction principles
 
@@ -164,7 +162,7 @@ Headless mode prints identical JSON to stdout/RPC; screen readers and automation
 
 ## 8. Design tokens
 
-Named constants to be encoded in one theme file (Phase 2). Changing one file re-themes the app; no visual rework.
+Named constants encoded in one theme file per canvas (`assets/themes/`). Changing one file re-themes the app; no visual rework.
 
 **Colors** — `canvas.bg`, `canvas.fg`, `canvas.muted`, `canvas.border`; `semantic.ok`, `semantic.warn`, `semantic.error`, `semantic.pending`, `semantic.tool`, `semantic.system`, `semantic.user`, `semantic.assistant`.
 
@@ -178,19 +176,18 @@ Named constants to be encoded in one theme file (Phase 2). Changing one file re-
 
 **Breakpoints** (cells) — `width.min = 80`, `width.comfortable = 120`, `height.min = 24`, `height.comfortable = 40`.
 
-## 9. Integration contract with Phases 2–6
+## 9. Implementation contract
 
-**Tech stack binding (to confirm in Phase 2):**
+**Tech stack:**
 - TUI rendering: ratatui (Layout, Block, Paragraph, List, Table, BarChart, buffer drawing).
 - Terminal I/O/input: crossterm (raw mode, alternate screen, mouse optional, terminal-size queries).
 - Headless/RPC: same event structs serialized to JSONL/stdout; no TUI dependency in the headless binary path.
-- No custom pixel painting unless Phase 2 proves ratatui cannot meet a required effect.
+- No custom pixel painting unless ratatui cannot meet a required effect.
 
 **Folder structure:**
-- `DESIGN.md` — this brief.
 - `src/ui/` — theme/tokens, layout, components, frames.
-- `assets/themes/` — theme files (TOML/JSON) consumed by the UI theme module; `dark.toml` and `light.toml` ship by default.
-- `src/headless.rs` — JSON event emitter shared with the TUI renderer.
+- `assets/themes/` — theme files (TOML) consumed by the UI theme module; `dark.toml` and `light.toml` ship by default.
+- `src/modes/headless.rs` — JSON event emitter shared with the TUI renderer.
 
 **Testing:**
 - Snapshot tests: capture the rendered terminal buffer at fixed sizes (80×24, 120×40) and compare to golden files on every change.
@@ -199,7 +196,3 @@ Named constants to be encoded in one theme file (Phase 2). Changing one file re-
 - Reduced-motion test: with animations disabled, no time-dependent frame changes occur.
 - Event-parity test: every TUI state transition produces the matching JSON event in headless mode.
 - **Interactive flow test**: simulated keystrokes in composer → `run_turn()` invoked → events rendered → composer re-enabled → next input; verifies single-turn execution and no autonomous loop.
-
----
-
-**Next step:** Phase 2 confirms the TUI crate (ratatui/crossterm) and implements the UI theme module from §8 tokens. This brief is the visual spec; implementers should not deviate from colors, layout regions, or the §7 event map without design review.

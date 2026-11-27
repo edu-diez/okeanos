@@ -1,4 +1,4 @@
-//! Todo panel component — ordered list with checkboxes per DESIGN.md §5.5.
+//! Todo panel component — ordered list with checkboxes per tui-design.md §5.5.
 //!
 //! Each row shows checkbox glyph ([ ] / [x]), short title, status chip.
 //! Add via `/todo`; completing toggles the row.

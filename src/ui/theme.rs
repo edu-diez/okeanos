@@ -1,7 +1,7 @@
 //! TUI Theme module — design tokens from assets/themes/
 //!
 //! Loads dark.toml / light.toml at runtime. Changing one file re-themes the app;
-//! no visual rework. Per DESIGN.md §8.
+//! no visual rework. Per tui-design.md §8.
 //!
 //! Themes are also embedded in the binary for standalone distribution.
 

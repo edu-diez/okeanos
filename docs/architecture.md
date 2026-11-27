@@ -1,10 +1,6 @@
-# ARCHITECTURE.md — Rust CLI TUI Agent Harness
+# Architecture
 
-**Status:** Phase 4 — architecture (docs only, no implementation code)  
-**Owner:** Workflow manager / architecture  
-**Related:** PRODUCT_SPEC.md, DESIGN.md, Phase 2 tech-selection research
-
----
+How okeanos is structured: subsystems, data flow, boundaries and dependency rules. The tree below is a guide to the main modules rather than an exhaustive listing. Requirements live in [design/product-spec.md](design/product-spec.md) and the visual spec in [design/tui-design.md](design/tui-design.md).
 
 ## Major subsystems
 
@@ -30,8 +26,8 @@
 | **Session log** (`src/session/`) | Append-only JSONL log of messages, tool calls, results, approvals, snapshot events; session header with id/cwd/version; resume by session ID; project-scoped storage. | `SessionLog`, `SessionHeader`, `ResumeStore` |
 | **Git snapshots** (`src/snapshot/`) | gix-based git snapshots before destructive actions and on `/undo`/`/redo` boundaries; snapshot store. | `SnapshotStore`, `UndoRedo` |
 | **Sub-agent delegation** (`src/harness/subagent.rs`, `src/tool/agent.rs`) | Dedicated `agent` / `wait_agent` / `exit_plan` tools (schemas in `src/tool/agent.rs`, handled by `ReactLoop`); `todo.delegate` kept as a background-spawn alias. Built-in `explore`/`plan`/`general` profiles (overridable via user/project profiles). Per-sub-agent ReAct loop with isolated context, tool subset, real model resolution, turn/token limits, depth limit; concurrency cap (4); approval routing by `<subagent_id>/` id prefix; worktree cleanup (changed `branch` worktrees are committed to `okeanos/<id>` first); foreground results returned as the tool result, background results delivered as `<subagent-result>` user messages and awaited before a turn completes; child spend charged to the parent's `CostTracker`. | `SubAgent`, `AgentProfile`, `AgentRegistry`, `SubAgentHandle`, `SubAgentProgress`, `SubAgentComplete`, `WorkspaceHandle` |
-| **TUI** (`src/ui/`) | Terminal rendering per DESIGN.md; ratatui + crossterm; themes from `assets/themes/`. | `TerminalApp`, `Theme`, components (conversation, tool panel, modal, status bar, FleetView, …) |
-| **Headless/RPC** (`src/headless.rs`) | JSON event emitter shared with TUI; stdio or JSON-RPC transport; identical event stream to TUI (DESIGN.md §7). | `HeadlessDriver`, `JsonRpcServer` (feature-gated) |
+| **TUI** (`src/ui/`) | Terminal rendering per tui-design.md; ratatui + crossterm; themes from `assets/themes/`. | `TerminalApp`, `Theme`, components (conversation, tool panel, modal, status bar, FleetView, …) |
+| **Headless/RPC** (`src/headless.rs`) | JSON event emitter shared with TUI; stdio or JSON-RPC transport; identical event stream to TUI (tui-design.md §7). | `HeadlessDriver`, `JsonRpcServer` (feature-gated) |
 | **Logging** | `tracing` spans/events; JSON subscriber via tracing-subscriber; `RUST_LOG` filtering. | — |
 
 ## Ownership boundaries
@@ -154,7 +150,7 @@ Headless/RPC (JSON over stdout/stdio/HTTP)            │
 | Approval | Modal blocks composer | JSON event on stdout / RPC call |
 | Exit | Ctrl+D / `/quit` | Task complete / error / SIGINT |
 
-- In both modes, the harness emits the **same event structs** (DESIGN.md §7).
+- In both modes, the harness emits the **same event structs** (tui-design.md §7).
 - The TUI is a **renderer + input driver** in interactive mode; a **passive renderer** in headless mode (not used).
 - Approval requests pause the harness turn; the loop resumes on an `Approval` event (from TUI modal or RPC).
 - Context cap errors propagate as a terminal `error` event; the turn stops cleanly.
@@ -191,7 +187,7 @@ Parent ReAct Loop (Harness)
             ├─► ToolResult injected into parent conversation
             └─► Parent continues (async, non-blocking)
 
-Key events (extend DESIGN.md §7):
+Key events (extend tui-design.md §7):
 - SubAgentProgress { subagent_id, profile, tokens_used, status, depth }
 - SubAgentComplete { subagent_id, todo_id, result: ToolResult, summary }
 - SubAgentError { subagent_id, error }
@@ -219,14 +215,21 @@ okeanos/
 │   └── themes/
 │       ├── dark.toml      # design tokens, dark canvas
 │       └── light.toml     # design tokens, light canvas
+├── AGENTS.md              # agent instructions for working on this repo
+├── CHANGELOG.md
+├── CONTRIBUTING.md
 ├── docs/
-│   ├── DESIGN.md          # Phase 1 visual design (art direction, tokens, parity map)
-│   ├── PRODUCT_SPEC.md    # Phase 3 product definition
-│   ├── ARCHITECTURE.md    # Phase 4 architecture (this file)
-│   ├── MILESTONES.md      # Phase 5 roadmap
-│   └── AGENTS.md          # Phase 6 agent instructions
+│   ├── architecture.md    # this file
+│   ├── roadmap.md         # milestones and roadmap
+│   └── design/
+│       ├── product-spec.md  # product definition and requirements
+│       └── tui-design.md    # visual design (art direction, tokens, parity map)
 ├── src/
-│   ├── main.rs            # thin entrypoint: parse, init tracing, dispatch\n│   ├── prelude.rs         # shared imports for the binary's modules\n│   ├── wiring.rs          # ActiveModel, build_policy/hooks, MCP/skill/memory registration\n│   ├── commands/          # doctor, sessions, stats_export_replay, models, mcp, trust, init\n│   ├── modes/             # interactive, headless, acp, rpc, rpc_ws
+│   ├── main.rs            # thin entrypoint: parse, init tracing, dispatch
+│   ├── prelude.rs         # shared imports for the binary's modules
+│   ├── wiring.rs          # ActiveModel, build_policy/hooks, MCP/skill/memory registration
+│   ├── commands/          # doctor, sessions, stats_export_replay, models, mcp, trust, init
+│   ├── modes/             # interactive, headless, acp, rpc, rpc_ws
 │   ├── lib.rs             # harness crate root (public API)
 │   ├── cli.rs             # clap derive definitions
 │   ├── config/
@@ -282,9 +285,9 @@ okeanos/
 │   │   ├── memory.rs      # instruction-file hierarchy + MEMORY.md index loading (M28)
 │   │   └── warnings.rs    # context window warnings before hard cap
 │   ├── session/
-│   │   ├── log.rs         # append-only JSONL (TODO: not yet split)
-│   │   ├── header.rs      # session id, cwd, version (TODO: not yet split)
-│   │   └── resume.rs      # --resume <id>, project-scoped storage (TODO: not yet split)
+│   │   ├── log.rs         # append-only JSONL
+│   │   ├── header.rs      # session id, cwd, version
+│   │   └── resume.rs      # --resume <id>, project-scoped storage
 │   ├── snapshot/
 │   │   ├── mod.rs
 │   │   ├── store.rs       # gix-based snapshot store
@@ -292,38 +295,14 @@ okeanos/
 │   ├── ui/
 │   │   ├── mod.rs
 │   │   ├── theme.rs       # design tokens from assets/themes/
-│   │   ├── layout.rs      # responsive grid per DESIGN.md §4
+│   │   ├── layout.rs      # responsive grid per tui-design.md §4
 │   │   └── components/    # conversation, tool_panel, modal, status_bar, fleet_view (M27), …
-│   ├── headless.rs        # JSON event emitter, stdio/JSON-RPC transports (TODO: not yet created)
 │   └── events.rs          # shared event structs (Message, ToolCall, Approval, SubAgentProgress, …)
-├── tests/                 # integration tests (mock provider, harness logic)
 ├── Cargo.toml
 ├── rust-toolchain.toml
 ├── .gitignore
 └── LICENSE
 ```
-
-### Current Implementation Gaps (as of M11 complete)
-
-| Spec (this doc) | Reality | Tracking |
-|-----------------|---------|----------|
-| `src/headless.rs` exists | Missing; headless logic inline in `main.rs::run_headless()` | M14 |
-| `src/session/log.rs`, `header.rs`, `resume.rs` | Single `src/session/mod.rs` | M13 |
-| `toml` crate in harness deps | In workspace `[dependencies]` (violates CLI-only rule) | M16 |
-| `--rpc` CLI flag | Not defined in `cli.rs` | M14 |
-| `jsonrpsee` in `rpc` feature | Not in `Cargo.toml` | M14 |
-| `ReactLoop::run_turn()` | Not implemented; only `run()` exists | M12 |
-| TUI input composer | Not implemented | M12 |
-| Welcome screen | Not implemented | M12 |
-| Graceful shutdown flush on SIGINT | Only normal exit cleanup | M17 |
-| `src/config/agent_profile.rs` | Not created | M27 |
-| `src/harness/subagent.rs` | Not created | M27 |
-| `TodoArgs::Delegate` variant | Not in `todo.rs` | M27 |
-| `SubAgentProgress/Complete` events | Not in `events.rs` | M27 |
-| FleetView TUI component | Not created | M27 |
-| `branch` workspace mode (gix worktree) | Not implemented | M27 |
-
-These gaps are tracked in MILESTONES.md Technical Debt section and will be resolved in the indicated milestones.
 
 ## Security model
 
@@ -377,10 +356,10 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 
 ## Dependency rules
 
-- **Primary crates (Phase 2 recommendation):** ratatui + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC).
+- **Primary crates:** ratatui + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC). + crossterm (TUI), tokio `current_thread` (runtime), reqwest with rustls (HTTP), clap derive (CLI), thiserror (lib errors) + anyhow (bin), serde + serde_json (JSON), toml (config), tracing + tracing-subscriber `json` (logging), gix (git), jsonrpsee feature-gated (RPC).
 - **No C dependencies** in the primary tree: avoid git2, openssl, rapidjson. Build with `--target x86_64-unknown-linux-musl` for full static.
 - **Platform process-control crates (M29):** `nix` (`signal`, Unix-only target dependency) for process-group signalling and `windows-sys` (Windows-only target dependency, features `Win32_Foundation`/`Security`/`System_IO`/`System_JobObjects`/`System_Threading`) for Job Objects. Both are raw-binding crates with no C code; neither is compiled on the other platform. tokio additionally enables `io-util` and `sync`.
-- **Feature flags:** `rpc` (jsonrpsee HTTP/WebSocket), `mcp` (lazy MCP client, deferred), `mock-provider` (test-only MockModel), `simd-json` (performance opt, deferred).
+- **Feature flags:** `tui` and `config-file` (default); `rpc` (jsonrpsee HTTP/WebSocket), `mcp` (MCP client), `otel` (OTLP export), `markdown` (pulldown-cmark + syntect rendering), `mock-provider` (test-only MockModel), `simd-json` (performance opt).
 - **Config crate rule:** `toml` is added only for config parsing; it sits in the CLI/config layer, never in the harness `lib`.
 - **Layering rule:** `src/lib` (harness) depends only on model/tool/perm/context/session/snapshot/events — never on `ui`, `headless`, or `cli`. UI and headless depend on the harness, not vice versa. Sub-agent delegation (`src/harness/subagent.rs`) is part of the harness lib; it uses `ReactLoop`, `ToolRegistry`, `Policy`, `CostTracker`, `Conversation`, `SnapshotStore` — all harness-internal.
 - **No circular dependencies** between subsystems.
@@ -390,28 +369,28 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 | Layer | Tooling | Scope |
 |-------|---------|-------|
 | Unit | `cargo test`, mock provider | ReAct loop, approval policy, context cap, tool execution, snapshot undo/redo, config load + secret substitution, token counter, model capability negotiation, text tool parsing, tier selection, edit format validation, tool execution interrupt/cancel, **agent profile parsing, sub-agent spawn validation, tool subset selection, token budget child accounting, depth enforcement, approval bubbling routing** — no network |
-| Integration | `tests/` | CLI modes, headless JSON event parity with TUI events, session log append, snapshot round-trip, `--resume` restore, graceful shutdown flush, small-model text-based tool calling, interruptible tool execution, cost cap enforcement, **sub-agent delegation end-to-end: spawn, progress events, approval bubbling, completion, result aggregation, workspace modes (inherit/branch)** |
+| Integration | in-crate tests with the mock provider | CLI modes, headless JSON event parity with TUI events, session log append, snapshot round-trip, `--resume` restore, graceful shutdown flush, small-model text-based tool calling, interruptible tool execution, cost cap enforcement, **sub-agent delegation end-to-end: spawn, progress events, approval bubbling, completion, result aggregation, workspace modes (inherit/branch)** |
 | TUI snapshot | golden buffer files | Rendered frame at 80×24 and 120×40; resize reflow; modal re-center; **FleetView panel with active sub-agents** |
-| Visual audit | automated contrast check | WCAG AA/AAA ratios per DESIGN.md §2 on both canvases |
+| Visual audit | automated contrast check | WCAG AA/AAA ratios per tui-design.md §2 on both canvases |
 | Reduced motion | config toggle | No time-dependent frame changes when disabled |
-| Event parity | harness test harness | Every TUI state transition has a matching JSON event (DESIGN.md §7), **including SubAgentProgress, SubAgentComplete, bubbled ApprovalRequest** |
+| Event parity | harness test harness | Every TUI state transition has a matching JSON event (tui-design.md §7), **including SubAgentProgress, SubAgentComplete, bubbled ApprovalRequest** |
 | Clippy/fmt | CI | `cargo clippy -- -D warnings`, `cargo fmt --check` |
 
 ## Scalability considerations
 
-- **Context:** Hard cap at MVP (no compaction). Selective file inclusion and history-turn capping are tier-aware (small models get fewer files and turns). If compaction is added later, it lives in `src/context/` behind the `ContextCap` seam; the ReAct loop treats it as a context-source change, not a rewrite.
+- **Context:** Hard cap with a clear error, plus optional compaction (`src/context/`, behind the `ContextCap` seam). Selective file inclusion and history-turn capping are tier-aware (small models get fewer files and turns).
 - **Concurrency:** Single-threaded tokio `current_thread` for the ReAct loop. Parallel tool execution can be added later behind the `ToolRegistry` without changing the loop signature. **Sub-agents run as independent background tasks; each has its own `ReactLoop` on the same runtime. Concurrency bounded by global spawn budget (default 64) and per-session token budget.**
 - **Providers:** New providers implement `Model` + declare `ModelCapabilities`; no changes to harness logic. Provider selection is config-driven (feature flags at build time, env/CLI at runtime). Local/self-hosted models require explicit TOML capability override. **Per-agent model override enables cost-optimized routing (Haiku for exploration, Opus for reasoning).**
 - **Tools:** New tools implement `Tool` and register in the registry. Tool subset is selected by model tier; small models get a minimal subset. No harness changes. **Sub-agent tool subset is a further filter of the tier subset via profile allowlist/denylist.**
 - **Transport:** stdio JSON-RPC first; HTTP/WebSocket via `jsonrpsee` behind the `rpc` feature. Adding a transport means implementing `HeadlessDriver`, not touching the loop.
-- **Session log:** Append-only JSONL is unbounded by design at MVP; rotation/archiving can be added in `src/session/` without affecting the loop. **Sub-agent events are tagged with `subagent_id` in the parent's log for traceability.**
+- **Session log:** Append-only JSONL with optional rotation/compression (`src/session/`), which doesn't affect the loop. **Sub-agent events are tagged with `subagent_id` in the parent's log for traceability.**
 - **Workspace isolation:** `branch` mode creates git worktrees via gix; cleanup on sub-agent completion. Number of concurrent worktrees bounded by spawn budget. No persistent disk growth.
 
-## Tooling, skills and extensibility (update)
+## Tooling, skills and extensibility
 
-- **Tool order** is deterministic (BTreeMap) for prompt-cache stability; per-tier sets come from 	ool::builtin_registry.
+- **Tool order** is deterministic (BTreeMap) for prompt-cache stability; per-tier sets come from `tool::builtin_registry`.
 - **read** is line-numbered with offset/limit; **grep** uses the ignore crate (gitignore, glob filter, context); **glob** finds files; **edit** is available on every tier.
-- **MCP**: parallel connect, per-call 	imeout_secs, one reconnect, stderr drained, spec cache (DeferCached), tool deferral behind 	ool_search when more than defer_tools_over tools exist, project .mcp.json. Unannotated MCP tools require approval (Network). Streamable HTTP runs over rustls/ring (pure Rust).
+- **MCP**: parallel connect, per-call `timeout_secs`, one reconnect, stderr drained, spec cache (DeferCached), tool deferral behind `tool_search` when more than `defer_tools_over` tools exist, project `.mcp.json`. Unannotated MCP tools require approval (Network). Streamable HTTP runs over rustls/ring (pure Rust).
 - **MCP OAuth (M35)**: Streamable HTTP servers without `bearer_token` use rmcp's `auth` flow (`src/tool/mcp/oauth.rs`). `okeanos mcp login <server>` discovers the authorization server (RFC 9728/8414), registers a client (pre-registered, CIMD or dynamic registration; PKCE), opens the browser and receives the redirect on a one-shot `127.0.0.1` listener (5 min timeout). Tokens and the client id live in a per-server JSON file `<data_dir>/okeanos/mcp-auth/<name>-<hash(url)>.json`, written atomically with mode `0600` on Unix, never in config, logs or the session log. On connect the stored credentials are loaded; rmcp refreshes the access token transparently and the refreshed token is re-saved. A rejected/expired grant surfaces as "run `okeanos mcp login <server>`". `okeanos mcp logout <server>` deletes the file. A static `bearer_token` takes precedence. Adds only pure-Rust crates (`oauth2` via rmcp `auth`; `reqwest` 0.13 to name the client type); no C dependencies.
 - **Multimodal MCP results (M34)**: `render_result` keeps text + placeholders and returns accepted image blocks in `ToolExecutionResult.images`; the ReAct loop attaches them to the tool message (`MessageExtras.images`) only if `ModelCapabilities.vision` is true (catalog `vision`, override `[model.capabilities] vision`; default false). Adapters: Anthropic puts image blocks inside `tool_result`; OpenAI Responses uses `input_image` in `function_call_output`; OpenAI Chat and Google append images as a user message/part after the tool results. Pruned tool results drop their images.
 - **Built-in MCP servers**: `context7` (library docs, `https://mcp.context7.com/mcp`) and `gh_grep` (GitHub code search, `https://mcp.grep.app`) are connected by default as read-only Streamable HTTP servers (no login, no approval prompts, 8s connect budget, `DeferCached` startup unless `[mcp] startup_policy` is set; tools are deferred behind `tool_search`). Failures are non-fatal (offline works). Query text is sent to those third-party services: disable all with `[mcp] builtin_servers = false` or one via `[[mcp.servers]] name = "gh_grep" enabled = false`. `read_only = true` on any server downgrades its tools to the Read category.
