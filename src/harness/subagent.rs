@@ -999,6 +999,7 @@ async fn run_subagent_inner(
         exit_code: Some(if ok { 0 } else { 1 }),
         timed_out: false,
         cancelled: false,
+        images: Vec::new(),
     };
     let summary = format!(
         "Sub-agent '{subagent_id}' {} at depth {depth} in {:.1}s ({tokens_used} tokens){}",

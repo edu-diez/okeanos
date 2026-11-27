@@ -475,8 +475,12 @@ impl GoogleModel {
             .flatten()
             .map(|tc| (tc.id.as_str(), tc.name.clone()))
             .collect();
+        let mut pending_images: Vec<(String, &[crate::model::ImagePart])> = Vec::new();
 
         for msg in messages {
+            if msg.role != ModelRole::Tool {
+                Self::flush_tool_images(&mut contents, &mut pending_images);
+            }
             match msg.role {
                 ModelRole::System => {
                     system_instruction = Some(GoogleContent {
@@ -570,11 +574,14 @@ impl GoogleModel {
                     };
                     let part = GooglePart {
                         function_response: Some(GoogleFunctionResponse {
-                            name,
+                            name: name.clone(),
                             response: serde_json::json!({ key: msg.content }),
                         }),
                         ..Default::default()
                     };
+                    if !msg.extras.images.is_empty() {
+                        pending_images.push((name, &msg.extras.images));
+                    }
                     // Parallel results must share a single user turn.
                     match contents.last_mut() {
                         Some(last)
@@ -592,7 +599,34 @@ impl GoogleModel {
             }
         }
 
+        Self::flush_tool_images(&mut contents, &mut pending_images);
         (system_instruction, contents)
+    }
+
+    /// Function responses cannot carry images, so tool-result images follow the
+    /// responses as one user turn of inline data.
+    fn flush_tool_images(
+        contents: &mut Vec<GoogleContent>,
+        pending: &mut Vec<(String, &[crate::model::ImagePart])>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let mut parts = Vec::new();
+        for (name, images) in pending.drain(..) {
+            parts.push(GooglePart::text(format!("Image(s) returned by `{name}`:")));
+            parts.extend(images.iter().map(|img| GooglePart {
+                inline_data: Some(GoogleInlineData {
+                    mime_type: img.media_type.clone(),
+                    data: img.data.clone(),
+                }),
+                ..Default::default()
+            }));
+        }
+        contents.push(GoogleContent {
+            role: "user".to_string(),
+            parts,
+        });
     }
 
     /// Convert [`ToolSpec`] items to Google tool definitions.
@@ -1050,6 +1084,7 @@ mod tests {
             max_context: 1048576, // 1M tokens for Gemini 1.5
             max_output: 8192,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Frontier,
             edit_format: EditFormat::Diff,
         }
@@ -1272,6 +1307,57 @@ mod tests {
             system.unwrap().parts[0].text.as_deref(),
             Some("You are a helpful assistant")
         );
+    }
+
+    #[test]
+    fn test_tool_result_images_follow_function_responses() {
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: serde_json::json!({}),
+            status: crate::events::ToolCallStatus::Ok,
+        };
+        let messages = vec![
+            ModelMessage {
+                role: ModelRole::Assistant,
+                tool_calls: Some(vec![call("c1", "shot"), call("c2", "read")]),
+                ..Default::default()
+            },
+            ModelMessage {
+                role: ModelRole::Tool,
+                content: "[image: image/png, 3 bytes]".into(),
+                tool_call_id: Some("c1".into()),
+                extras: crate::model::MessageExtras {
+                    images: vec![crate::model::ImagePart {
+                        media_type: "image/png".into(),
+                        data: "QUJD".into(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ModelMessage {
+                role: ModelRole::Tool,
+                content: "ok".into(),
+                tool_call_id: Some("c2".into()),
+                ..Default::default()
+            },
+        ];
+        let (_, contents) = GoogleModel::to_google_contents(&messages);
+        assert_eq!(contents.len(), 3);
+        // Both responses stay in one turn; the image turn comes after.
+        assert_eq!(contents[1].parts.len(), 2);
+        assert!(
+            contents[1]
+                .parts
+                .iter()
+                .all(|p| p.function_response.is_some())
+        );
+        assert!(contents[2].parts.iter().any(|p| {
+            p.inline_data
+                .as_ref()
+                .is_some_and(|d| d.mime_type == "image/png" && d.data == "QUJD")
+        }));
     }
 
     #[test]

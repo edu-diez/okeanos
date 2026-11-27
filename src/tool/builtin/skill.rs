@@ -63,6 +63,7 @@ impl Tool for SkillTool {
             timed_out: false,
             cancelled: false,
             truncated: false,
+            images: Vec::new(),
         })
     }
 

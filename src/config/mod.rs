@@ -360,6 +360,8 @@ pub struct ModelCapabilitiesSection {
     pub max_output: Option<usize>,
     /// Model supports temperature parameter.
     pub temperature_supported: Option<bool>,
+    /// Model accepts image inputs (default false when not declared or in the catalog).
+    pub vision: Option<bool>,
     /// Model tier for tiered prompts and tool selection.
     pub tier: Option<String>,
     /// Preferred edit format: "diff", "whole_file", or "str_replace".
@@ -1117,6 +1119,7 @@ impl Config {
                 caps.max_output = entry.max_output;
                 caps.tool_calling = entry.tool_calling;
                 caps.thinking = entry.reasoning;
+                caps.vision = entry.vision;
             } else if explicit_tier.is_none()
                 && classification.as_ref().is_some_and(|c| c.confidence < 0.5)
             {
@@ -1143,6 +1146,9 @@ impl Config {
             }
             if let Some(v) = c.temperature_supported {
                 caps.temperature_supported = v;
+            }
+            if let Some(v) = c.vision {
+                caps.vision = v;
             }
             if let Some(t) = &c.tier
                 && let Ok(parsed_tier) = t.parse::<ModelTier>()

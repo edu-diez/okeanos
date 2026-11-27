@@ -72,6 +72,7 @@ impl Tool for DeleteTool {
             timed_out: false,
             cancelled: false,
             truncated,
+            images: Vec::new(),
         })
     }
 

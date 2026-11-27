@@ -78,6 +78,9 @@ pub struct ToolResult {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// Images from the tool, attached to the model message when the model has vision.
+    #[serde(skip)]
+    pub images: Vec<crate::model::ImagePart>,
 }
 
 /// A live output chunk from a running tool (ephemeral; not session-logged).

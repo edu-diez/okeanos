@@ -195,6 +195,7 @@ impl Tool for RunTool {
             timed_out,
             cancelled: false,
             truncated,
+            images: Vec::new(),
         })
     }
 

@@ -775,6 +775,7 @@ mod tests {
             exit_code: None,
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         };
         pane.handle_event(&crate::events::Event::ToolResult(result));
 

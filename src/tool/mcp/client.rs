@@ -30,6 +30,7 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::model::ImagePart;
 use crate::tool::builtin::{MAX_OUTPUT_BYTES, truncate_output_with_spill};
 use crate::tool::tool_trait::{ToolCategory, ToolError, ToolExecutionResult, ToolSpec};
 
@@ -533,15 +534,57 @@ fn apply_trust(cfg: &McpServerConfig, tools: &mut [DiscoveredTool]) {
     }
 }
 
+/// Largest base64 payload accepted per image.
+const MAX_IMAGE_B64_BYTES: usize = 5 * 1024 * 1024;
+/// Most images forwarded to the model per tool result.
+const MAX_IMAGES_PER_RESULT: usize = 4;
+const IMAGE_MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Text shown to the model for an image block, plus the image itself when it
+/// is acceptable. Rejections are explained in the placeholder, never silent.
+fn image_block(mime: &str, data: &str, accepted_so_far: usize) -> (String, Option<ImagePart>) {
+    let mime = mime.trim().to_ascii_lowercase();
+    let size = data.len() * 3 / 4;
+    let reason = if !IMAGE_MIME_TYPES.contains(&mime.as_str()) {
+        Some("unsupported type")
+    } else if data.len() > MAX_IMAGE_B64_BYTES {
+        Some("too large")
+    } else if accepted_so_far >= MAX_IMAGES_PER_RESULT {
+        Some("too many images")
+    } else {
+        None
+    };
+    match reason {
+        Some(r) => (
+            format!("[image: {mime}, {size} bytes, not attached: {r}]"),
+            None,
+        ),
+        None => (
+            format!("[image: {mime}, {size} bytes]"),
+            Some(ImagePart {
+                media_type: mime,
+                data: data.to_string(),
+            }),
+        ),
+    }
+}
+
 /// Flatten an MCP result to text, truncating (with spill) like built-ins.
+/// Image blocks keep a text placeholder and are also returned as images; the
+/// harness attaches them only for vision-capable models.
 fn render_result(result: CallToolResult) -> ToolExecutionResult {
     let is_error = result.is_error.unwrap_or(false);
+    let mut images = Vec::new();
     let text = result
         .content
         .into_iter()
         .map(|c| match c {
             rmcp::model::ContentBlock::Text(t) => t.text,
-            rmcp::model::ContentBlock::Image(img) => format!("[image: {}]", img.mime_type),
+            rmcp::model::ContentBlock::Image(img) => {
+                let (placeholder, part) = image_block(&img.mime_type, &img.data, images.len());
+                images.extend(part);
+                placeholder
+            }
             rmcp::model::ContentBlock::Audio(audio) => format!("[audio: {}]", audio.mime_type),
             rmcp::model::ContentBlock::Resource(resource) => {
                 let uri = match resource.resource {
@@ -566,6 +609,7 @@ fn render_result(result: CallToolResult) -> ToolExecutionResult {
     let (output, truncated) = truncate_output_with_spill(&text, MAX_OUTPUT_BYTES);
     ToolExecutionResult {
         truncated,
+        images,
         ..ToolExecutionResult::output(output)
     }
 }
@@ -704,6 +748,40 @@ mod tests {
             tool.annotations = Some(annotations);
         }
         tool
+    }
+
+    #[test]
+    fn image_block_accepts_supported_types_only() {
+        let (text, part) = image_block("image/PNG", "QUJD", 0);
+        assert_eq!(text, "[image: image/png, 3 bytes]");
+        assert_eq!(part.unwrap().media_type, "image/png");
+
+        let (text, part) = image_block("image/svg+xml", "QUJD", 0);
+        assert!(part.is_none() && text.contains("unsupported type"));
+
+        let big = "A".repeat(MAX_IMAGE_B64_BYTES + 1);
+        let (text, part) = image_block("image/png", &big, 0);
+        assert!(part.is_none() && text.contains("too large"));
+
+        let (text, part) = image_block("image/png", "QUJD", MAX_IMAGES_PER_RESULT);
+        assert!(part.is_none() && text.contains("too many images"));
+    }
+
+    #[test]
+    fn render_result_returns_images_and_placeholders() {
+        let result: CallToolResult = serde_json::from_value(json!({
+            "content": [
+                {"type": "text", "text": "chart:"},
+                {"type": "image", "data": "QUJD", "mimeType": "image/png"},
+                {"type": "audio", "data": "QUJD", "mimeType": "audio/wav"}
+            ]
+        }))
+        .unwrap();
+        let out = render_result(result);
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(out.images[0].data, "QUJD");
+        assert!(out.output.contains("[image: image/png, 3 bytes]"));
+        assert!(out.output.contains("[audio: audio/wav]"));
     }
 
     #[test]

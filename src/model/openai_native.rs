@@ -385,6 +385,53 @@ impl OpenAIModel {
         ModelError::Provider(err.to_string())
     }
 
+    /// Convert a conversation to OpenAI chat messages. Chat `tool` messages are
+    /// text-only, so images from tool results go in one user message placed after
+    /// the contiguous run of tool messages (keeping tool responses adjacent to
+    /// their assistant `tool_calls`).
+    pub(crate) fn to_openai_messages(messages: &[ModelMessage]) -> Vec<OpenAIMessage> {
+        let mut out = Vec::with_capacity(messages.len());
+        let mut pending: Vec<(&str, &ModelMessage)> = Vec::new();
+        let flush = |out: &mut Vec<OpenAIMessage>, pending: &mut Vec<(&str, &ModelMessage)>| {
+            if pending.is_empty() {
+                return;
+            }
+            let mut parts = vec![serde_json::json!({
+                "type": "text",
+                "text": "Images returned by the preceding tool calls:",
+            })];
+            for (id, msg) in pending.drain(..) {
+                parts.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("Image(s) from tool call {id}:"),
+                }));
+                parts.extend(msg.extras.images.iter().map(|img| {
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {"url": img.data_url()},
+                    })
+                }));
+            }
+            out.push(OpenAIMessage {
+                role: "user".to_string(),
+                content: Value::Array(parts),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        };
+        for msg in messages {
+            if msg.role != ModelRole::Tool {
+                flush(&mut out, &mut pending);
+            } else if !msg.extras.images.is_empty() {
+                pending.push((msg.tool_call_id.as_deref().unwrap_or(""), msg));
+            }
+            out.push(Self::to_openai_message(msg));
+        }
+        flush(&mut out, &mut pending);
+        out
+    }
+
     /// Convert a [`ModelMessage`] to an OpenAI chat message.
     pub(crate) fn to_openai_message(msg: &ModelMessage) -> OpenAIMessage {
         let content = if msg.role == ModelRole::User && !msg.extras.images.is_empty() {
@@ -501,8 +548,7 @@ impl OpenAIModel {
         tools: Option<&[ToolSpec]>,
         stream: bool,
     ) -> OpenAIRequest {
-        let openai_messages: Vec<OpenAIMessage> =
-            messages.iter().map(Self::to_openai_message).collect();
+        let openai_messages: Vec<OpenAIMessage> = Self::to_openai_messages(messages);
 
         let openai_tools = tools.map(Self::to_openai_tools);
 
@@ -858,6 +904,7 @@ mod tests {
             max_context: 128000,
             max_output: 8192,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Frontier,
             edit_format: EditFormat::Diff,
         }
@@ -1212,6 +1259,41 @@ mod tests {
         assert_eq!(
             m.content[0]["image_url"]["url"],
             "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn test_tool_images_follow_contiguous_tool_messages() {
+        let tool = |id: &str, img: bool| ModelMessage {
+            role: ModelRole::Tool,
+            content: "r".into(),
+            tool_call_id: Some(id.into()),
+            extras: crate::model::MessageExtras {
+                images: if img {
+                    vec![crate::model::ImagePart {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let user = ModelMessage {
+            role: ModelRole::User,
+            content: "next".into(),
+            ..Default::default()
+        };
+        let out = OpenAIModel::to_openai_messages(&[tool("a", true), tool("b", false), user]);
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["tool", "tool", "user", "user"]);
+        let images = out[2].content.as_array().unwrap();
+        assert!(
+            images
+                .iter()
+                .any(|p| p["image_url"]["url"] == "data:image/png;base64,AAAA")
         );
     }
 

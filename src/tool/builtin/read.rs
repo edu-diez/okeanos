@@ -97,6 +97,7 @@ impl Tool for ReadTool {
             timed_out: false,
             cancelled: false,
             truncated,
+            images: Vec::new(),
         })
     }
 

@@ -434,6 +434,7 @@ mod tests {
             exit_code: None,
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         };
         panel.handle_event(&crate::events::Event::ToolResult(result));
 
@@ -480,6 +481,7 @@ mod tests {
             exit_code: Some(1),
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         };
         panel.handle_event(&crate::events::Event::ToolResult(result));
 

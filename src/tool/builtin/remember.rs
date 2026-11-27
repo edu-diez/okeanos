@@ -180,6 +180,7 @@ impl Tool for RememberTool {
             timed_out: false,
             cancelled: false,
             truncated: false,
+            images: Vec::new(),
         })
     }
 

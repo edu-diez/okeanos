@@ -134,6 +134,7 @@ impl Tool for GrepTool {
             timed_out: false,
             cancelled: false,
             truncated: truncated || capped,
+            images: Vec::new(),
         })
     }
 

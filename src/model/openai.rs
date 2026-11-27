@@ -248,6 +248,7 @@ impl OpenRouterModel {
             max_context: discovered.context_length,
             max_output: discovered.max_output_tokens,
             temperature_supported: true,
+            vision: false,
             tier: discovered.tier,
             edit_format: EditFormat::default_for_tier(discovered.tier),
         };
@@ -320,9 +321,9 @@ impl OpenRouterModel {
         ModelError::Provider(err.to_string())
     }
 
-    /// Convert a [`ModelMessage`] to an OpenAI chat message.
-    fn to_openai_message(msg: &ModelMessage) -> OpenAIMessage {
-        crate::model::openai_native::OpenAIModel::to_openai_message(msg)
+    /// Convert a conversation to OpenAI chat messages.
+    fn to_openai_messages(messages: &[ModelMessage]) -> Vec<OpenAIMessage> {
+        crate::model::openai_native::OpenAIModel::to_openai_messages(messages)
     }
 
     /// Convert [`ToolSpec`] items to OpenAI tool definitions.
@@ -397,8 +398,7 @@ impl OpenRouterModel {
         tools: Option<&[ToolSpec]>,
         stream: bool,
     ) -> ChatCompletionRequest {
-        let openai_messages: Vec<OpenAIMessage> =
-            messages.iter().map(Self::to_openai_message).collect();
+        let openai_messages: Vec<OpenAIMessage> = Self::to_openai_messages(messages);
 
         let openai_tools = tools.map(Self::to_openai_tools);
 
@@ -760,6 +760,7 @@ mod tests {
             max_context: 128000,
             max_output: 8192,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Frontier,
             edit_format: EditFormat::Diff,
         }

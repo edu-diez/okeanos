@@ -23,6 +23,8 @@ pub const PRUNED_TOOL_OUTPUT_PREFIX: &str = "[tool output cleared";
 
 /// Tool results smaller than this (in estimated tokens) are not worth pruning.
 const MIN_PRUNABLE_TOOL_TOKENS: usize = 60;
+/// Flat token estimate per attached image (images are not text).
+const IMAGE_TOKENS: usize = 1_500;
 
 /// Bounds for the estimate-to-reality correction factor.
 const MIN_CALIBRATION_RATIO: f64 = 0.25;
@@ -214,8 +216,6 @@ impl Conversation {
     }
 
     fn message_tokens(&self, msg: &Message) -> usize {
-        // Images are not text; charge a flat estimate per image.
-        const IMAGE_TOKENS: usize = 1_500;
         self.scaled(self.token_counter.count_event_message(msg))
             + msg.extras.images.len() * IMAGE_TOKENS
     }
@@ -298,6 +298,17 @@ impl Conversation {
         tool_call_id: String,
         is_error: bool,
     ) -> Result<(), ConversationError> {
+        self.add_tool_message_with_images(content, tool_call_id, is_error, Vec::new())
+    }
+
+    /// Add a tool result message that also carries images for vision models.
+    pub fn add_tool_message_with_images(
+        &mut self,
+        content: String,
+        tool_call_id: String,
+        is_error: bool,
+        images: Vec<crate::model::ImagePart>,
+    ) -> Result<(), ConversationError> {
         let msg = Message {
             role: MessageRole::Tool,
             content,
@@ -307,6 +318,7 @@ impl Conversation {
             thinking: None,
             extras: crate::model::MessageExtras {
                 is_error,
+                images,
                 ..Default::default()
             },
         };
@@ -383,7 +395,8 @@ impl Conversation {
                         .iter()
                         .map(|m| self.token_counter.count_event_message(m))
                         .sum::<usize>();
-                self.scaled(raw)
+                let images: usize = self.messages.iter().map(|m| m.extras.images.len()).sum();
+                self.scaled(raw) + images * IMAGE_TOKENS
             }
         };
     }
@@ -437,7 +450,8 @@ impl Conversation {
             if msg.role != MessageRole::Tool || msg.content.starts_with(PRUNED_TOOL_OUTPUT_PREFIX) {
                 continue;
             }
-            let tokens = self.token_counter.count_event_message(msg);
+            let tokens = self.token_counter.count_event_message(msg)
+                + msg.extras.images.len() * IMAGE_TOKENS;
             if protected < protect_tokens {
                 protected += tokens;
                 continue;
@@ -463,6 +477,7 @@ impl Conversation {
         for &(i, _) in &candidates {
             let bytes = self.messages[i].content.len();
             self.messages[i].content = pruned_placeholder(bytes);
+            self.messages[i].extras.images.clear();
         }
         self.anchor = None;
         self.recalculate_tokens();

@@ -82,6 +82,7 @@ impl Tool for WriteTool {
             timed_out: false,
             cancelled: false,
             truncated,
+            images: Vec::new(),
         })
     }
 

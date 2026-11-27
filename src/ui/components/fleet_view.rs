@@ -417,6 +417,7 @@ mod tests {
                 exit_code: Some(0),
                 timed_out: false,
                 cancelled: false,
+                images: Vec::new(),
             },
             ts: 1234567890,
         };

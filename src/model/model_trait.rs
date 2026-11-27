@@ -23,6 +23,9 @@ pub struct ModelCapabilities {
     pub max_output: usize,
     /// Model supports temperature parameter
     pub temperature_supported: bool,
+    /// Model accepts image inputs (fail closed: false unless declared).
+    #[serde(default)]
+    pub vision: bool,
     /// Model tier for tiered prompts and tool selection
     pub tier: ModelTier,
     /// Preferred edit format for this model
@@ -158,7 +161,7 @@ pub struct ReasoningBlock {
 }
 
 /// Base64-encoded image attached to a message.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImagePart {
     pub media_type: String,
     pub data: String,

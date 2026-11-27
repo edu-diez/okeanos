@@ -237,6 +237,7 @@ fn tool_result_from_exec(
         exit_code: exec.exit_code,
         timed_out: exec.timed_out,
         cancelled: exec.cancelled,
+        images: exec.images,
     }
 }
 
@@ -874,24 +875,27 @@ impl<M: Model + 'static> ReactLoop<M> {
     }
 
     /// Add a tool result to the conversation. If it does not fit under the
-    /// hard cap, compact and retry, then truncate as a last resort.
+    /// hard cap, compact and retry, then truncate (dropping images) as a last resort.
     async fn add_tool_result_message(
         &mut self,
         output: String,
         id: String,
         is_error: bool,
+        images: Vec<crate::model::ImagePart>,
     ) -> Result<(), ReactError> {
-        let Err(first) =
-            self.conversation
-                .add_tool_message_with_status(output.clone(), id.clone(), is_error)
-        else {
+        let Err(first) = self.conversation.add_tool_message_with_images(
+            output.clone(),
+            id.clone(),
+            is_error,
+            images.clone(),
+        ) else {
             return Ok(());
         };
         if self.compaction_manager.is_some() {
             let _ = self.compact_with(CompactionTrigger::OverflowRecovery).await;
             if self
                 .conversation
-                .add_tool_message_with_status(output.clone(), id.clone(), is_error)
+                .add_tool_message_with_images(output.clone(), id.clone(), is_error, images)
                 .is_ok()
             {
                 return Ok(());
@@ -2131,6 +2135,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             exit_code: None,
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         }
     }
 
@@ -2235,8 +2240,15 @@ impl<M: Model + 'static> ReactLoop<M> {
     }
 
     /// Add a tool result to the conversation and emit its event.
-    async fn record_tool_result(&mut self, result: ToolResult) -> Result<(), ReactError> {
-        self.add_tool_result_message(result.output.clone(), result.id.clone(), !result.ok)
+    async fn record_tool_result(&mut self, mut result: ToolResult) -> Result<(), ReactError> {
+        // Images only reach models that declared vision; others keep the text placeholder.
+        let images = if self.model.capabilities().vision {
+            std::mem::take(&mut result.images)
+        } else {
+            result.images.clear();
+            Vec::new()
+        };
+        self.add_tool_result_message(result.output.clone(), result.id.clone(), !result.ok, images)
             .await?;
         self.emit_tool_result(result).await;
         Ok(())
@@ -2571,6 +2583,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             exit_code: Some(0),
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         }
     }
 
@@ -2696,6 +2709,7 @@ impl<M: Model + 'static> ReactLoop<M> {
             exit_code: Some(0),
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         })
     }
 
@@ -3253,6 +3267,7 @@ mod tests {
                 timed_out: false,
                 cancelled: false,
                 truncated: false,
+                images: Vec::new(),
             })
         }
 

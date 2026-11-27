@@ -355,6 +355,7 @@ mod tests {
             exit_code: Some(1),
             timed_out: false,
             cancelled: false,
+            images: Vec::new(),
         });
         let u = event_to_update("s1", &res).unwrap();
         assert_eq!(u["params"]["update"]["status"], "failed");

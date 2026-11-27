@@ -22,7 +22,7 @@ use bytes::Bytes;
 use futures::Stream;
 use reqwest::{StatusCode, header};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::pin::Pin;
 
 /// Anthropic Messages API request.
@@ -488,11 +488,28 @@ impl AnthropicModel {
                 ModelRole::Tool => {
                     // Tool result message
                     if let Some(tool_call_id) = &msg.tool_call_id {
+                        let content = if msg.extras.images.is_empty() {
+                            Value::String(msg.content.clone())
+                        } else {
+                            // Images go inside the tool_result so they stay paired with the call.
+                            let mut blocks = vec![json!({"type": "text", "text": msg.content})];
+                            blocks.extend(msg.extras.images.iter().map(|img| {
+                                json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": img.media_type,
+                                        "data": img.data,
+                                    },
+                                })
+                            }));
+                            Value::Array(blocks)
+                        };
                         anthropic_messages.push(AnthropicMessage {
                             role: "user".to_string(),
                             content: vec![AnthropicContentBlock::ToolResult {
                                 tool_use_id: tool_call_id.clone(),
-                                content: Value::String(msg.content.clone()),
+                                content,
                                 is_error: msg.extras.is_error.then_some(true),
                             }],
                         });
@@ -1281,6 +1298,7 @@ mod tests {
             max_context: 200000,
             max_output: 8192,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Frontier,
             edit_format: EditFormat::Diff,
         }
@@ -1530,6 +1548,31 @@ mod tests {
             AnthropicContentBlock::ToolResult { tool_use_id, content, .. }
             if tool_use_id == "toolu_123" && content == "File contents here"
         ));
+    }
+
+    #[test]
+    fn test_to_anthropic_messages_tool_result_with_images() {
+        let messages = vec![ModelMessage {
+            role: ModelRole::Tool,
+            content: "[image: image/png, 3 bytes]".to_string(),
+            tool_call_id: Some("toolu_1".to_string()),
+            extras: crate::model::MessageExtras {
+                images: vec![crate::model::ImagePart {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let (_, msgs) = AnthropicModel::to_anthropic_messages(&messages);
+        let AnthropicContentBlock::ToolResult { content, .. } = &msgs[0].content[0] else {
+            panic!("expected tool_result");
+        };
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "QUJD");
     }
 
     async fn collect(data: &'static str) -> Vec<ModelStreamChunk> {

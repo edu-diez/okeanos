@@ -1059,6 +1059,25 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.23.0`
 - ✅ Tag `v0.23.0`
 
+### Milestone 34 — Multimodal MCP results
+**Status:** complete — v0.24.0 (tag pending)
+
+**Scope:** FR-53. MCP `image` content blocks become model image inputs instead of flattened text.
+- `ModelCapabilities.vision` (default `false`, fail closed): from the models.dev catalog, overridable via `[model.capabilities] vision = true|false`.
+- `ToolExecutionResult.images` / `ToolResult.images` (`#[serde(skip)]`, never sent over events) carry base64 `ImagePart`s; the tool text always keeps a `[image: <mime>, <n> bytes]` placeholder.
+- The ReAct loop attaches images to the tool message only when `vision` is true; otherwise the placeholder is all the model sees.
+- Accepted: `image/png|jpeg|gif|webp`, ≤ 5 MiB base64 each, ≤ 4 per result; others stay placeholders with a reason. Audio has no model input path and stays a placeholder.
+- Provider mapping of tool-message images: Anthropic → image blocks inside `tool_result`; OpenAI Responses → `input_image` items in `function_call_output`; OpenAI Chat and Google → images in a user message/part directly after the tool result(s). OpenAI-compatible/OpenRouter (`openai.rs`) shares the OpenAI Chat mapping and sends images only when `vision` is true (off by default unless the catalog or an override enables it).
+- Pruning a tool result (`prune_tool_results`) also drops its images.
+- **Out of scope:** audio input, MCP resources/blobs as images, image resizing, TUI image rendering.
+
+**Definition of Done:**
+- ✅ ARCHITECTURE.md, PRODUCT_SPEC.md (FR-53), AGENTS.md updated first
+- ✅ Unit tests: MCP block → image/placeholder mapping (mime/size/count limits), vision gating in the loop, per-provider tool-image serialization, pruning drops images, config `vision` override
+- ✅ `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+- ✅ `Cargo.toml` bumped to `0.24.0`
+- ☐ Tag `v0.24.0`
+
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
 
@@ -1126,7 +1145,7 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 31 | ✅ Incremental tool output events | 1–2 | M29, M12 |
 | 32 | ✅ Background processes | 1–2 | M29 |
 | 33 | ✅ Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
-| 34 | Multimodal MCP results | 1–2 | M32a |
+| 34 | ✅ Multimodal MCP results | 1–2 | M32a |
 | 35 | MCP OAuth (Streamable HTTP) | 2 | M32a |
 | 36 | Split `main.rs` / `react.rs` (no behaviour change) | 2–3 | — |
 | 37 | ⏸ Deferred: Windows sandbox spike (opt-in backend if it passes) | 2–3 | M30 |
@@ -1182,7 +1201,8 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M31 Incremental tool output | `0.15.0` | ✅ Complete. Minor bump: additive `tool_output` event; consumers matching `Event` exhaustively must handle it. |
 | M32 Background processes | `0.22.0` | ✅ Complete |
 | M33 Policy depth | `0.23.0` | ✅ Complete. Minor bump: `run`/`job_kill` category `network` → `process` (visible in tool events), new optional `permissions.env_allowlist` and `exec-policy.toml` files. |
-| M34–M35 | `0.24.0`+ | Planned, one minor each |
+| M34 Multimodal MCP results | `0.24.0` | ✅ Complete. Minor bump: new `ModelCapabilities.vision` / `[model.capabilities] vision`; MCP images reach vision-capable models. |
+| M35 | `0.25.0` | Planned |
 | M36 Monolith split | patch bump | Planned, next up. Refactor only; no user-visible change. |
 | M37 Windows sandbox spike | minor bump if shipped | Deferred; spike with explicit abandon criteria if revived. |
 

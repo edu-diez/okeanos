@@ -95,6 +95,8 @@ pub struct ToolExecutionResult {
     pub cancelled: bool,
     /// Whether the output was truncated due to size limits.
     pub truncated: bool,
+    /// Images to show a vision-capable model (base64); never serialized into events.
+    pub images: Vec<crate::model::ImagePart>,
 }
 
 impl ToolExecutionResult {
@@ -106,6 +108,7 @@ impl ToolExecutionResult {
             timed_out: false,
             cancelled: false,
             truncated: false,
+            images: Vec::new(),
         }
     }
 }

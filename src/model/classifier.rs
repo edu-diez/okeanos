@@ -254,6 +254,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             max_context: 32768,
             max_output: 4096,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Small,
             edit_format: EditFormat::WholeFile,
         },
@@ -264,6 +265,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             max_context: 131072,
             max_output: 8192,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Mid,
             edit_format: EditFormat::Diff,
         },
@@ -274,6 +276,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             max_context: 200000,
             max_output: 8192,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Frontier,
             edit_format: EditFormat::Diff,
         },
@@ -305,6 +308,9 @@ pub fn merge_capabilities(
         }
         if let Some(v) = e.temperature_supported {
             merged.temperature_supported = v;
+        }
+        if let Some(v) = e.vision {
+            merged.vision = v;
         }
         if let Some(t) = &e.tier
             && let Ok(parsed) = t.parse::<ModelTier>()

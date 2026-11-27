@@ -176,10 +176,21 @@ impl OpenAIResponsesModel {
                 }
                 ModelRole::Tool => {
                     if let Some(id) = &msg.tool_call_id {
+                        // With images, output is a list of input_text/input_image items.
+                        let output = if msg.extras.images.is_empty() {
+                            json!(msg.content)
+                        } else {
+                            let mut items =
+                                vec![json!({"type": "input_text", "text": msg.content})];
+                            items.extend(msg.extras.images.iter().map(
+                                |img| json!({"type": "input_image", "image_url": img.data_url()}),
+                            ));
+                            Value::Array(items)
+                        };
                         input.push(json!({
                             "type": "function_call_output",
                             "call_id": id,
-                            "output": msg.content,
+                            "output": output,
                         }));
                     }
                 }
@@ -586,6 +597,7 @@ mod tests {
             max_context: 400_000,
             max_output: 128_000,
             temperature_supported: true,
+            vision: false,
             tier: ModelTier::Frontier,
             edit_format: EditFormat::Diff,
         }
@@ -672,6 +684,28 @@ mod tests {
         assert_eq!(input[2]["arguments"], "{\"p\":1}");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input.len(), 4);
+    }
+
+    #[test]
+    fn tool_output_with_images_uses_input_items() {
+        let msg = ModelMessage {
+            role: ModelRole::Tool,
+            content: "shot".into(),
+            tool_call_id: Some("call_1".into()),
+            extras: crate::model::MessageExtras {
+                images: vec![crate::model::ImagePart {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (_, input) = OpenAIResponsesModel::to_input(&[msg]);
+        let output = &input[0]["output"];
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,QUJD");
     }
 
     #[test]

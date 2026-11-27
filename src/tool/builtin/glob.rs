@@ -84,6 +84,7 @@ impl Tool for GlobTool {
             timed_out: false,
             cancelled: false,
             truncated,
+            images: Vec::new(),
         })
     }
 

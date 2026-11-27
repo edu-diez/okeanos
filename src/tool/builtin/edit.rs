@@ -235,6 +235,7 @@ impl Tool for EditTool {
             timed_out: false,
             cancelled: false,
             truncated,
+            images: Vec::new(),
         })
     }
 

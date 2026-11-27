@@ -251,6 +251,7 @@ mod tests {
                 exit_code: None,
                 timed_out: false,
                 cancelled: false,
+                images: Vec::new(),
             }),
         }
     }
