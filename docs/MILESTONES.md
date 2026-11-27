@@ -1029,7 +1029,7 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.16.0`; tag `v0.16.0`
 
 ### Milestone 32 — Background processes
-**Status:** complete — v0.22.0 (tag pending)
+**Status:** complete — v0.22.0
 
 **Scope:** FR-51. un accepts `background: true` and returns a job id immediately (same approval, guard, sandbox and env scrubbing as foreground un; no timeout unless `timeout_secs` is given). New tools `job_output` (`id`, optional `wait_secs` ≤ 60; returns only output since the last poll plus status; no `id` lists jobs; category Read) and `job_kill` (stops the process tree; category Network, approval-gated). Implemented in `src/tool/builtin/jobs.rs` on the existing process-group / Job Object guard; a supervisor task per job keeps a bounded 256 KiB output tail (dropped bytes are reported). Max 8 running jobs, last 16 finished jobs kept; jobs are killed when the session's runtime shuts down. `job_output`/`job_kill` are registered for Mid/Frontier tiers only (Small keeps read/edit/run).
 - **Out of scope:** job persistence across sessions/resume, stdin to jobs, TUI job panel, per-job sandbox/env overrides.
@@ -1038,9 +1038,9 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ ARCHITECTURE.md, PRODUCT_SPEC.md (FR-51) updated first
 - ✅ Unit tests: immediate return + incremental output, kill, explicit timeout, unknown id, running-job cap, dropped-byte notice, argument validation
 - ✅ `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (525 passed, Windows)
-- ⚠️ Unix process-group paths reuse M29 code; verify in CI on Linux/macOS/musl
+- ✅ Unix process-group paths verified in CI (Linux/macOS/musl)
 - ✅ `Cargo.toml` bumped to `0.22.0`
-- ☐ Tag `v0.22.0`
+- ✅ Tag `v0.22.0`
 
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
