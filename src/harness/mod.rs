@@ -1,6 +1,7 @@
 //! Harness core (ReAct loop, context, ...).
 
 pub mod error;
+pub mod exec_policy;
 pub mod gate;
 pub mod hooks;
 pub mod policy;

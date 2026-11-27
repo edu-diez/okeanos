@@ -221,7 +221,9 @@ impl Policy {
             let blocked = match spec.category {
                 ToolCategory::Read => false,
                 ToolCategory::Write | ToolCategory::Delete => true,
-                ToolCategory::Network => !self.rules.allowed_by(tool, &subjects),
+                ToolCategory::Network | ToolCategory::Process => {
+                    !self.covered(tool, args, &subjects, true, false)
+                }
             };
             if blocked {
                 return PolicyDecision::Deny(format!(
@@ -237,12 +239,7 @@ impl Policy {
         if mode == PermissionMode::Yolo {
             return PolicyDecision::Allow;
         }
-        if self.rules.allowed_by(tool, &subjects)
-            || self
-                .session
-                .iter()
-                .any(|r| r.matches(tool, &subjects, true))
-        {
+        if self.covered(tool, args, &subjects, true, true) {
             return PolicyDecision::Allow;
         }
         if mode == PermissionMode::AcceptEdits && spec.category == ToolCategory::Write {
@@ -251,10 +248,42 @@ impl Policy {
 
         match spec.category {
             ToolCategory::Read => PolicyDecision::Allow,
-            ToolCategory::Write | ToolCategory::Delete | ToolCategory::Network => {
-                PolicyDecision::RequireApproval
-            }
+            ToolCategory::Write
+            | ToolCategory::Delete
+            | ToolCategory::Network
+            | ToolCategory::Process => PolicyDecision::RequireApproval,
         }
+    }
+
+    /// Whether `allow` rules (`rules`) and/or session grants (`session`) cover
+    /// the call. A parsed `sh -c "<script>"` is also covered when every one of
+    /// its simple commands is.
+    fn covered(
+        &self,
+        tool: &str,
+        args: &Value,
+        subjects: &Subjects,
+        rules: bool,
+        session: bool,
+    ) -> bool {
+        let one = |s: &Subjects| {
+            (rules && self.rules.allowed_by(tool, s))
+                || (session && self.session.iter().any(|r| r.matches(tool, s, true)))
+        };
+        if one(subjects) {
+            return true;
+        }
+        if tool != RUN_TOOL {
+            return false;
+        }
+        RunCall::parse(args)
+            .and_then(|c| {
+                c.script_leaves()
+                    .map(|l| l.into_iter().cloned().collect::<Vec<_>>())
+            })
+            .is_some_and(|leaves| {
+                !leaves.is_empty() && leaves.iter().all(|l| one(&Subjects::from_run_call(l)))
+            })
     }
 
     /// Grant allow-always for a whole tool in this session.
@@ -298,9 +327,7 @@ impl Policy {
     /// Whether this specific call is covered by a session grant.
     pub fn has_session_allow_call(&self, tool: &str, args: &Value) -> bool {
         let subjects = Subjects::of(tool, args);
-        self.session
-            .iter()
-            .any(|r| r.matches(tool, &subjects, true))
+        self.covered(tool, args, &subjects, false, true)
     }
 
     /// Record an approval decision, persisting allow-always grants.
@@ -410,6 +437,74 @@ mod tests {
             policy.check("fetch", &network_spec),
             PolicyDecision::RequireApproval
         );
+    }
+
+    #[test]
+    fn process_category_is_gated_like_network() {
+        let spec = ToolSpec::new("run", "d", json!({})).with_category(ToolCategory::Process);
+        let call = json!({"command": "ls"});
+        let mut policy = Policy::new(vec![]);
+        assert_eq!(
+            policy.check_call("run", &spec, &call),
+            PolicyDecision::RequireApproval
+        );
+        policy = policy.with_mode(PermissionMode::Plan);
+        assert!(matches!(
+            policy.check_call("run", &spec, &call),
+            PolicyDecision::Deny(_)
+        ));
+        let allowed = Policy::new(vec![])
+            .with_rules(rules(&[], &[], &["run:ls"]))
+            .with_mode(PermissionMode::Plan);
+        assert_eq!(
+            allowed.check_call("run", &spec, &call),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn compound_script_allowed_only_when_every_segment_is() {
+        let spec = run_spec();
+        let sh = |script: &str| json!({"command": "bash", "args": ["-c", script]});
+        let policy = Policy::new(vec![]).with_rules(rules(
+            &["run:git push*"],
+            &["run:cargo publish"],
+            &["run:cargo test*", "run:git status"],
+        ));
+        let check = |s: &str| policy.check_call("run", &spec, &sh(s));
+
+        assert_eq!(
+            check("cd src && cargo test --all | tail"),
+            PolicyDecision::RequireApproval // `tail` is not allowed
+        );
+        assert_eq!(check("cargo test && git status"), PolicyDecision::Allow);
+        assert!(matches!(
+            check("cargo test && git push --force"),
+            PolicyDecision::Deny(_)
+        ));
+        assert_eq!(
+            check("git status; cargo publish"),
+            PolicyDecision::AlwaysAsk
+        );
+        // Opaque scripts are never auto-allowed, even if text looks allowed.
+        for s in ["cargo test $(echo x)", "cargo test > out.txt"] {
+            assert_eq!(check(s), PolicyDecision::RequireApproval, "{s}");
+        }
+    }
+
+    #[test]
+    fn compound_script_honours_session_grants() {
+        let mut policy = Policy::new(vec![]);
+        let spec = run_spec();
+        assert!(policy.allow_always_call("run", &json!({"command": "cargo", "args": ["test"]})));
+        let call = json!({"command": "sh", "args": ["-c", "cargo test --all && cargo test -q"]});
+        assert_eq!(
+            policy.check_call("run", &spec, &call),
+            PolicyDecision::Allow
+        );
+        assert!(policy.has_session_allow_call("run", &call));
+        let mixed = json!({"command": "sh", "args": ["-c", "cargo test && ls"]});
+        assert!(!policy.has_session_allow_call("run", &mixed));
     }
 
     #[test]

@@ -75,6 +75,10 @@ pub fn project_files(dir: &Path) -> Vec<PathBuf> {
                 }
             }
         }
+        let policy = crate::harness::exec_policy::project_file(&root);
+        if policy.is_file() {
+            files.push(policy);
+        }
     }
     files.sort();
     files.dedup();

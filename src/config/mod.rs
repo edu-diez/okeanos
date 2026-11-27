@@ -405,6 +405,9 @@ pub struct PermissionsSection {
     pub mode: Option<String>,
     /// Block reading credential files such as `.env`, `~/.ssh/*` (default: true).
     pub protect_secrets: Option<bool>,
+    /// When set, `run`/background-job children only inherit a small baseline plus
+    /// these variable names (`*`/`?` globs allowed) instead of everything minus secrets.
+    pub env_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1047,6 +1050,13 @@ impl Config {
                     .map_err(|message| ConfigError::Validation {
                         message: format!("permissions.mode: {message}"),
                     })?;
+            }
+            for entry in p.env_allowlist.iter().flatten() {
+                crate::tool::run_env::validate_entry(entry).map_err(|message| {
+                    ConfigError::Validation {
+                        message: format!("permissions.env_allowlist: {message}"),
+                    }
+                })?;
             }
         }
 

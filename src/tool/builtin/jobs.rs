@@ -395,7 +395,7 @@ impl Tool for JobKillTool {
                 "required": ["id"]
             }),
         )
-        .with_category(ToolCategory::Network)
+        .with_category(ToolCategory::Process)
     }
 
     async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {

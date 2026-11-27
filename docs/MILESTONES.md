@@ -1042,6 +1042,23 @@ These are genuinely deferred features from PRODUCT_SPEC.md. Each is a small, ind
 - ✅ `Cargo.toml` bumped to `0.22.0`
 - ✅ Tag `v0.22.0`
 
+### Milestone 33 — Policy depth
+**Status:** complete — v0.23.0
+
+**Scope:** FR-52.
+- **Process category:** new `ToolCategory::Process` (`"process"`) for `run` and `job_kill` (was `Network`). Same gating as `Network` (approval, plan-mode refusal, snapshot, cache invalidation); MCP unannotated tools stay `Network`.
+- **Exec-policy files:** `exec-policy.toml` with `[[rule]] action = "allow"|"ask"|"deny"`, `pattern` (word prefix or `*`/`?` glob), optional `tool` (default `run`). Loaded from `$XDG_CONFIG_HOME/okeanos/exec-policy.toml` (user) then `<project>/.okeanos/exec-policy.toml`; appended to the `permissions.*` rules. The project file is covered by the trust fingerprint; while untrusted only `deny`/`ask` rules are honoured.
+- **Compound commands:** `run` of `sh|bash|zsh|dash|ash|ksh -c "<script>"` is split on `&&`, `||`, `;`, `|`, `&` and newlines (quote-aware). `deny`/`ask` rules match every segment; `allow` rules/grants apply only when **every** segment is allowed. Scripts with command substitution, subshells/groups, redirections (other than `2>&1`), variable-expanded or assigned command words, or shell keywords are opaque: never auto-allowed.
+- **Env allowlist:** `permissions.env_allowlist = ["PATH", "CARGO_*"]` — when set, `run`/jobs children get only a small baseline (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, temp dirs, Windows system vars) plus the listed names (`*`/`?` globs). Unset keeps M29 secret scrubbing. Ignored from untrusted project config.
+- **Out of scope:** persistent shell session (optional item; deferred), `cmd`/PowerShell script parsing (never auto-allowed).
+
+**Definition of Done:**
+- ✅ ARCHITECTURE.md, PRODUCT_SPEC.md (FR-52) updated first
+- ✅ Unit tests: script splitting/opaque detection, compound allow/deny/ask semantics, exec-policy parsing + untrusted filtering, env allowlist filtering, config validation, Process category gating
+- ✅ `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`
+- ✅ `Cargo.toml` bumped to `0.23.0`
+- ✅ Tag `v0.23.0`
+
 ### Execution-environment roadmap (planned, from the M29 review)
 Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × sandbox modes, exec-policy prefix rules), Claude Code (prefix rules, compound-command parsing, optional sandbox + network proxy, background tasks), OpenCode (per-command glob permissions) and Pi (no permissions, container assumed; tail truncation + spill).
 
@@ -1108,7 +1125,7 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 30 | ✅ OS sandbox (optional) | 3 | M29 |
 | 31 | ✅ Incremental tool output events | 1–2 | M29, M12 |
 | 32 | ✅ Background processes | 1–2 | M29 |
-| 33 | Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
+| 33 | ✅ Policy depth (exec-policy rules, env allowlist) | 2 | M29 |
 | 34 | Multimodal MCP results | 1–2 | M32a |
 | 35 | MCP OAuth (Streamable HTTP) | 2 | M32a |
 | 36 | Split `main.rs` / `react.rs` (no behaviour change) | 2–3 | — |
@@ -1163,7 +1180,9 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M29 Execution environment hardening | `0.13.0` | ✅ Complete. Minor bump (pre-1.0 convention for user-visible behaviour change): `run` now defaults to a 120 s timeout, scrubs secret env vars and closes stdin; `write`/`edit`/`delete` refuse paths outside the project root/`.git`/`.env*`; `allow-always` on `run` is command-scoped. New optional `permissions.extra_write_roots`. Not a patch bump because behaviour changes; not 1.0 because still pre-stability. |
 | M30 OS sandbox | `0.14.0` | ✅ Complete. Minor bump: additive, opt-in (`permissions.sandbox`, default `none`). |
 | M31 Incremental tool output | `0.15.0` | ✅ Complete. Minor bump: additive `tool_output` event; consumers matching `Event` exhaustively must handle it. |
-| M32–M35 | `0.16.0`+ | Planned, one minor each |
+| M32 Background processes | `0.22.0` | ✅ Complete |
+| M33 Policy depth | `0.23.0` | ✅ Complete. Minor bump: `run`/`job_kill` category `network` → `process` (visible in tool events), new optional `permissions.env_allowlist` and `exec-policy.toml` files. |
+| M34–M35 | `0.24.0`+ | Planned, one minor each |
 | M36 Monolith split | patch bump | Planned, next up. Refactor only; no user-visible change. |
 | M37 Windows sandbox spike | minor bump if shipped | Deferred; spike with explicit abandon criteria if revived. |
 

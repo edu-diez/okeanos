@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod builtin;
 pub mod cache;
+pub mod run_env;
 pub mod sandbox;
 pub mod tier;
 pub mod todo;

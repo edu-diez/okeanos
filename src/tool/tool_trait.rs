@@ -22,6 +22,8 @@ pub enum ToolCategory {
     Delete,
     /// Network operation — requires confirmation.
     Network,
+    /// Local process execution (`run`, `job_kill`) — requires confirmation.
+    Process,
 }
 
 /// JSON Schema for tool input.

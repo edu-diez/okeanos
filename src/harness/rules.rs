@@ -18,6 +18,158 @@ use serde_json::Value;
 
 pub const RUN_TOOL: &str = "run";
 
+/// POSIX-style shells whose `-c "<script>"` is analysed into simple commands.
+const SHELL_PROGRAMS: &[&str] = &["sh", "bash", "zsh", "dash", "ash", "ksh"];
+
+/// Shell builtins that neither run other programs nor touch files; dropped
+/// from a script's segments so `cd src && cargo test` is judged by `cargo test`.
+const HARMLESS_BUILTINS: &[&str] = &["cd", "pwd", "true", "false", ":", "echo"];
+
+/// Words that make a segment structured shell code rather than one command.
+const SHELL_KEYWORDS: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac",
+    "function", "select", "time", "!", "{", "}", "[[", "]]", "coproc",
+];
+
+/// Script text of `sh [-flags] -c "<script>"`, if the call has that shape.
+fn shell_script_arg<'a>(argv: &[&'a str]) -> Option<&'a str> {
+    for (i, a) in argv.iter().enumerate() {
+        let flags = a.strip_prefix('-')?;
+        if flags.is_empty() || !flags.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        if flags.contains('c') {
+            return argv.get(i + 1).copied();
+        }
+    }
+    None
+}
+
+fn parse_shell_script(argv: &[&str]) -> Option<Vec<RunCall>> {
+    let words = split_script(shell_script_arg(argv)?)?;
+    let calls: Vec<RunCall> = words
+        .into_iter()
+        .filter(|w| !HARMLESS_BUILTINS.contains(&w[0].as_str()))
+        .map(|w| RunCall::parse(&serde_json::json!({"command": w[0], "args": &w[1..]})))
+        .collect::<Option<_>>()?;
+    (!calls.is_empty()).then_some(calls)
+}
+
+/// Split a POSIX shell script into simple commands (each a list of words).
+///
+/// Handles quoting, `&&`, `||`, `;`, `|`, `&`, newlines and `#` comments.
+/// Returns `None` when the script uses anything whose effect cannot be read
+/// off the text: command substitution, subshells, redirections (except
+/// `2>&1`-style fd duplication), keywords, and variable-assignment or
+/// variable-expanded command words.
+pub fn split_script(script: &str) -> Option<Vec<Vec<String>>> {
+    fn flush(cur: &mut String, in_word: &mut bool, words: &mut Vec<String>) {
+        if std::mem::take(in_word) {
+            words.push(std::mem::take(cur));
+        }
+    }
+    fn end(words: &mut Vec<String>, segs: &mut Vec<Vec<String>>) {
+        if !words.is_empty() {
+            segs.push(std::mem::take(words));
+        }
+    }
+
+    let chars: Vec<char> = script.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let (mut segs, mut words) = (Vec::new(), Vec::new());
+    let (mut cur, mut in_word) = (String::new(), false);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                in_word = true;
+                i += 1;
+                while at(i)? != '\'' {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '"' => {
+                in_word = true;
+                i += 1;
+                while at(i)? != '"' {
+                    match chars[i] {
+                        '`' => return None,
+                        '$' if at(i + 1) == Some('(') => return None,
+                        '\\' => {
+                            i += 1;
+                            cur.push(at(i)?);
+                        }
+                        ch => cur.push(ch),
+                    }
+                    i += 1;
+                }
+            }
+            '\\' => {
+                i += 1;
+                match at(i)? {
+                    '\n' => {}
+                    ch => {
+                        in_word = true;
+                        cur.push(ch);
+                    }
+                }
+            }
+            ' ' | '\t' | '\r' => flush(&mut cur, &mut in_word, &mut words),
+            '\n' | ';' => {
+                flush(&mut cur, &mut in_word, &mut words);
+                end(&mut words, &mut segs);
+            }
+            '&' | '|' => {
+                if c == '&' && at(i + 1) == Some('>') {
+                    return None;
+                }
+                flush(&mut cur, &mut in_word, &mut words);
+                end(&mut words, &mut segs);
+                if matches!(at(i + 1), Some('&' | '|')) {
+                    i += 1;
+                }
+            }
+            '>' => {
+                // Only `2>&1` / `1>&2` style fd duplication is allowed.
+                let fd_prefix = !in_word || cur == "1" || cur == "2";
+                if !(fd_prefix
+                    && at(i + 1) == Some('&')
+                    && at(i + 2).is_some_and(|d| d.is_ascii_digit())
+                    && !at(i + 3).is_some_and(|d| d.is_alphanumeric()))
+                {
+                    return None;
+                }
+                cur.clear();
+                in_word = false;
+                i += 2;
+            }
+            '<' | '(' | ')' | '`' => return None,
+            '$' if at(i + 1) == Some('(') => return None,
+            '#' if !in_word => {
+                while at(i).is_some_and(|ch| ch != '\n') {
+                    i += 1;
+                }
+                continue;
+            }
+            ch => {
+                in_word = true;
+                cur.push(ch);
+            }
+        }
+        i += 1;
+    }
+    flush(&mut cur, &mut in_word, &mut words);
+    end(&mut words, &mut segs);
+
+    let ok = |w: &Vec<String>| {
+        let first = w[0].as_str();
+        !first.contains(['$', '=']) && !SHELL_KEYWORDS.contains(&first)
+    };
+    (!segs.is_empty() && segs.iter().all(ok)).then_some(segs)
+}
+
 /// Programs where the first non-flag argument selects the actual operation.
 const SUBCOMMAND_PROGRAMS: &[&str] = &[
     "git", "cargo", "npm", "pnpm", "yarn", "docker", "kubectl", "go", "dotnet", "pip", "uv", "gh",
@@ -200,6 +352,10 @@ pub struct RunCall {
     pub normalized_line: Option<String>,
     /// Every argument (lowercase), kept for defence in depth.
     args_lower: Vec<String>,
+    /// For `sh -c "<script>"`-style calls whose script could be analysed: the
+    /// simple commands it runs. `None` for everything else (including shell
+    /// scripts that are opaque to the analysis).
+    script: Option<Vec<RunCall>>,
 }
 
 impl RunCall {
@@ -242,13 +398,35 @@ impl RunCall {
             (None, Some(raw_line.clone()))
         };
 
+        let script = if SHELL_PROGRAMS.contains(&program.as_str()) {
+            parse_shell_script(&argv)
+        } else {
+            None
+        };
+
         Some(Self {
             program,
             sub,
             raw_line,
             normalized_line,
             args_lower,
+            script,
         })
+    }
+
+    /// The simple commands behind a parsed `sh -c "<script>"` call, with
+    /// nested shell scripts flattened. `None` when the call is not an
+    /// analysable shell script.
+    pub fn script_leaves(&self) -> Option<Vec<&RunCall>> {
+        let segments = self.script.as_ref()?;
+        let mut out = Vec::new();
+        for s in segments {
+            match s.script_leaves() {
+                Some(inner) => out.extend(inner),
+                None => out.push(s),
+            }
+        }
+        Some(out)
     }
 
     /// Session-grant / allow-rule key, e.g. `run:cargo test`. `None` when the
@@ -374,25 +552,39 @@ pub struct Subjects {
 }
 
 impl Subjects {
+    /// Subjects of a parsed `run` call. For shell scripts, `all` also holds
+    /// every simple command inside, so `deny`/`ask` rules see through
+    /// `sh -c "a && b"`; `strict` stays the call itself.
+    pub fn from_run_call(call: &RunCall) -> Self {
+        let mut all = vec![call.raw_line.clone()];
+        let mut strict = Vec::new();
+        if let Some(n) = &call.normalized_line {
+            if *n != call.raw_line {
+                all.push(n.clone());
+            }
+            strict.push(n.clone());
+        }
+        for leaf in call.script_leaves().unwrap_or_default() {
+            for line in [Some(&leaf.raw_line), leaf.normalized_line.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if !all.contains(line) {
+                    all.push(line.clone());
+                }
+            }
+        }
+        Self {
+            all,
+            strict,
+            is_path: false,
+        }
+    }
+
     /// Build the subjects of a call.
     pub fn of(tool: &str, args: &Value) -> Self {
         if tool == RUN_TOOL {
-            let Some(call) = RunCall::parse(args) else {
-                return Self::default();
-            };
-            let mut all = vec![call.raw_line.clone()];
-            let mut strict = Vec::new();
-            if let Some(n) = &call.normalized_line {
-                if *n != call.raw_line {
-                    all.push(n.clone());
-                }
-                strict.push(n.clone());
-            }
-            return Self {
-                all,
-                strict,
-                is_path: false,
-            };
+            return RunCall::parse(args).map_or_else(Self::default, |c| Self::from_run_call(&c));
         }
         let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
             return Self::default();
@@ -604,6 +796,87 @@ mod tests {
         let s = Subjects::of("run", &run("git", &["--mystery", "push"]));
         assert!(deny.matches("run", &s, false));
         assert!(!allow.matches("run", &s, true));
+    }
+
+    #[test]
+    fn split_script_handles_operators_and_quotes() {
+        let s = |x: &str| split_script(x).unwrap();
+        assert_eq!(
+            s("cargo test && git status; ls | wc -l"),
+            vec![
+                vec!["cargo", "test"],
+                vec!["git", "status"],
+                vec!["ls"],
+                vec!["wc", "-l"]
+            ]
+        );
+        assert_eq!(
+            s("echo 'a && b' \"c;d\""),
+            vec![vec!["echo", "a && b", "c;d"]]
+        );
+        assert_eq!(s("cargo build 2>&1 # note"), vec![vec!["cargo", "build"]]);
+        assert_eq!(s("a \\\n b"), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn split_script_rejects_opaque_constructs() {
+        for script in [
+            "echo $(rm -rf x)",
+            "echo `rm x`",
+            "echo \"$(rm x)\"",
+            "(cd x && rm y)",
+            "cargo test > out.txt",
+            "cat < in",
+            "cargo test &> out",
+            "FOO=1 cargo test",
+            "$CMD x",
+            "if true; then rm x; fi",
+            "echo 'unterminated",
+            "",
+            "   ",
+        ] {
+            assert!(split_script(script).is_none(), "{script}");
+        }
+    }
+
+    #[test]
+    fn shell_calls_expose_leaves() {
+        let c = RunCall::parse(&run("bash", &["-lc", "cd src && cargo test | tail"])).unwrap();
+        let leaves: Vec<_> = c
+            .script_leaves()
+            .unwrap()
+            .iter()
+            .map(|l| l.raw_line.clone())
+            .collect();
+        assert_eq!(leaves, ["cargo test", "tail"]);
+        assert!(c.is_risky());
+
+        for args in [
+            vec!["script.sh"],
+            vec!["-c"],
+            vec!["--norc", "-c", "ls"],
+            vec!["-c", "echo $(x)"],
+        ] {
+            let c = RunCall::parse(&run("sh", &args)).unwrap();
+            assert!(c.script_leaves().is_none(), "{args:?}");
+        }
+        let c = RunCall::parse(&run("bash", &["-c", "sh -c 'rm x; ls'"])).unwrap();
+        let nested: Vec<_> = c
+            .script_leaves()
+            .unwrap()
+            .iter()
+            .map(|l| l.raw_line.clone())
+            .collect();
+        assert_eq!(nested, ["rm x", "ls"]);
+    }
+
+    #[test]
+    fn deny_rule_sees_every_script_segment() {
+        let deny = Rule::parse("run:git push*").unwrap();
+        let s = Subjects::of("run", &run("sh", &["-c", "cargo test && git push --force"]));
+        assert!(deny.matches("run", &s, false));
+        let s = Subjects::of("run", &run("sh", &["-c", "cargo test && git status"]));
+        assert!(!deny.matches("run", &s, false));
     }
 
     #[test]

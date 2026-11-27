@@ -1894,7 +1894,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         // We do this after approval is granted but before execution.
         if matches!(
             spec.category,
-            ToolCategory::Write | ToolCategory::Delete | ToolCategory::Network
+            ToolCategory::Write
+                | ToolCategory::Delete
+                | ToolCategory::Network
+                | ToolCategory::Process
         ) {
             self.take_snapshot(&format!("Before {} tool", tool_call.name))
                 .await?;
@@ -2049,7 +2052,10 @@ impl<M: Model + 'static> ReactLoop<M> {
         if let Some(cache) = &mut self.tool_cache
             && matches!(
                 spec.category,
-                ToolCategory::Write | ToolCategory::Delete | ToolCategory::Network
+                ToolCategory::Write
+                    | ToolCategory::Delete
+                    | ToolCategory::Network
+                    | ToolCategory::Process
             )
         {
             use crate::tool::cache::extract_paths;

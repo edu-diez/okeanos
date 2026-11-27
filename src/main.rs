@@ -244,6 +244,21 @@ async fn run_with_prompt(cli: &Cli, prompt: Option<String>) -> anyhow::Result<()
             .map(|r| std::path::PathBuf::from(shellexpand::tilde(r).as_ref())),
     );
     let perms = config.permissions.as_ref();
+    {
+        let project_dir = okeanos::config::trust::project_dir(cli.root.as_deref());
+        let trusted = !config.project_trust.is_untrusted();
+        let (rules, dropped) = okeanos::harness::exec_policy::load_all(&project_dir, trusted)
+            .map_err(anyhow::Error::msg)
+            .context("invalid exec-policy file")?;
+        if dropped > 0 {
+            eprintln!(
+                "warning: ignored {dropped} `allow` rule(s) in the untrusted project's {} (run `okeanos trust` to enable)",
+                okeanos::harness::exec_policy::FILE_NAME
+            );
+        }
+        okeanos::harness::exec_policy::set_loaded(rules);
+    }
+    okeanos::tool::run_env::set_allowlist(perms.and_then(|p| p.env_allowlist.clone()));
     okeanos::tool::sandbox::set_policy(okeanos::tool::sandbox::SandboxPolicy {
         mode: perms
             .and_then(|p| p.sandbox.as_deref())
@@ -482,6 +497,13 @@ allow_list = ["todo", "read", "grep"]
 # Linux needs bwrap, macOS uses sandbox-exec; unsupported platforms refuse to run.
 # sandbox = "workspace-write"
 # sandbox_network = false
+# Only pass these environment variables (plus PATH, HOME, LANG, TERM, temp dirs…) to
+# `run` children; `*`/`?` globs allowed. Unset = inherit minus secret-looking variables.
+# env_allowlist = ["CARGO_*", "RUST_LOG"]
+# Extra rules can live in ~/.config/okeanos/exec-policy.toml and .okeanos/exec-policy.toml:
+#   [[rule]]
+#   action = "deny"        # allow | ask | deny
+#   pattern = "git push*"
 
 # Cost budget configuration (opt-in)
 # [cost]
@@ -2270,6 +2292,11 @@ fn build_policy(config: &Config, cli: &Cli, allow_list: Vec<String>) -> Policy {
         &list(perms.and_then(|p| p.allow.as_ref())),
     )
     .unwrap_or_default();
+    let mut rules = rules;
+    let file_rules = okeanos::harness::exec_policy::loaded();
+    rules.deny.extend(file_rules.deny);
+    rules.ask.extend(file_rules.ask);
+    rules.allow.extend(file_rules.allow);
     let mode = cli
         .permission_mode
         .as_deref()

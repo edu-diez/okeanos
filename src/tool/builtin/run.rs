@@ -1,6 +1,6 @@
 //! Built-in `run` tool — execute a local process (no shell) with bounded, ordered output.
 //!
-//! Category: Network (requires approval — local process execution is the permission boundary;
+//! Category: Process (requires approval — local process execution is the permission boundary;
 //! `Policy::check_call` scopes session grants and allow-list rules to the command).
 //!
 //! Behaviour:
@@ -80,7 +80,7 @@ impl Tool for RunTool {
                 "required": ["command"]
             }),
         )
-        .with_category(crate::tool::tool_trait::ToolCategory::Network)
+        .with_category(crate::tool::tool_trait::ToolCategory::Process)
     }
 
     async fn execute(&self, args: Value) -> Result<ToolExecutionResult, ToolError> {
@@ -530,8 +530,20 @@ pub(super) async fn terminate(child: &mut Child, guard: &TreeGuard) {
     let _ = child.kill().await;
 }
 
-/// Remove credentials from the child's environment.
+/// Restrict the child's environment: to the allowlist when one is configured,
+/// otherwise by removing credentials.
 fn scrub_env(cmd: &mut Command) {
+    if let Some(list) = crate::tool::run_env::allowlist() {
+        for (name, _) in std::env::vars_os() {
+            let allowed = name
+                .to_str()
+                .is_some_and(|n| crate::tool::run_env::is_allowed(n, &list));
+            if !allowed {
+                cmd.env_remove(&name);
+            }
+        }
+        return;
+    }
     if std::env::var("OKEANOS_RUN_INHERIT_ENV").is_ok_and(|v| v == "1") {
         return;
     }
