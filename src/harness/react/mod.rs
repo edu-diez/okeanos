@@ -34,6 +34,9 @@ mod budget;
 mod compaction_glue;
 mod dispatch;
 mod parallel;
+mod stall;
+mod verify;
+use stall::{StallDetector, Verdict};
 
 /// Errors from the ReAct loop.
 #[derive(Debug, Error)]
@@ -92,7 +95,7 @@ impl Default for FallbackConfig {
         Self {
             enabled: true,
             max_retries_per_turn: 1,
-            reduced_tool_set: vec!["todo".to_string(), "read".to_string()],
+            reduced_tool_set: vec!["read".to_string(), "grep".to_string(), "edit".to_string()],
         }
     }
 }
@@ -177,8 +180,8 @@ pub struct ReactLoop<M: Model> {
     /// Whether the approval router task has been installed.
     approval_router_started: bool,
     /// Signature of the previous tool call and its consecutive repeat count.
-    last_call_sig: Option<u64>,
-    repeat_count: u32,
+    stall: StallDetector,
+    verify: Option<verify::VerifyConfig>,
     /// Whether the last model response was cut off by the output token limit.
     last_truncated: bool,
     /// Provider-reported prompt/completion tokens summed over the loop's calls.
@@ -199,17 +202,30 @@ struct CallTiming {
     stop_reason: &'static str,
 }
 
-/// Identical consecutive tool calls before the model is told to change course.
-const DOOM_LOOP_WARN: u32 = 3;
 /// Sub-agents allowed to run at the same time.
 const MAX_PARALLEL_AGENTS: usize = 4;
+
+/// Messages after the last user message before the task is restated.
+const GOAL_REMINDER_GAP: usize = 8;
+
+/// Transient task reminder for small models: the latest user request, restated
+/// when it is `GOAL_REMINDER_GAP`+ messages behind and the last message is a tool result.
+fn goal_reminder(messages: &[ModelMessage]) -> Option<String> {
+    let last_user = messages.iter().rposition(|m| m.role == ModelRole::User)?;
+    if messages.last()?.role != ModelRole::Tool || messages.len() - last_user <= GOAL_REMINDER_GAP {
+        return None;
+    }
+    let task: String = messages[last_user].content.chars().take(600).collect();
+    Some(format!(
+        "[Reminder] The task you are working on: {task}\n\
+         Keep going until it is done, then reply with a short summary. Do not repeat steps you already finished."
+    ))
+}
 
 /// Appended to the system prompt while the permission mode is plan.
 const PLAN_MODE_NOTE: &str = "\n\nPLAN MODE ACTIVE: you cannot modify files. Investigate with \
 read-only tools (delegate broad searches to the `explore` agent), then call `exit_plan` with \
 a concrete step-by-step plan. Do not start implementing until it is approved.";
-/// Identical consecutive tool calls before the loop is stopped.
-const DOOM_LOOP_STOP: u32 = 5;
 
 /// Aborts the wrapped task when dropped so a finished `run()` doesn't leak
 /// its signal handler.
@@ -298,8 +314,8 @@ impl<M: Model + 'static> ReactLoop<M> {
             agent_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_AGENTS)),
             approval_routes: Arc::default(),
             approval_router_started: false,
-            last_call_sig: None,
-            repeat_count: 0,
+            stall: StallDetector::default(),
+            verify: None,
             last_truncated: false,
             tokens_in_total: 0,
             tokens_out_total: 0,
@@ -488,7 +504,14 @@ impl<M: Model + 'static> ReactLoop<M> {
 
     /// Set the compaction manager for context compaction.
     pub fn with_compaction(mut self, config: CompactionConfig) -> Self {
+        let config = config.scaled_for_window(self.conversation.cap().max_tokens);
         self.compaction_manager = Some(CompactionManager::new(config));
+        self
+    }
+
+    /// Run the `[verify]` command after successful edits/writes.
+    pub fn with_verify(mut self, section: Option<&crate::config::VerifySection>) -> Self {
+        self.verify = verify::VerifyConfig::from_section(section);
         self
     }
 
@@ -937,8 +960,7 @@ impl<M: Model + 'static> ReactLoop<M> {
         // Limits apply per user turn, not per session.
         self.iteration = 0;
         self.start_time = Instant::now();
-        self.last_call_sig = None;
-        self.repeat_count = 0;
+        self.stall.reset();
 
         let mut shutdown_rx = shutdown_rx;
         let mut stop_rounds = 0u32;
@@ -1675,6 +1697,18 @@ impl<M: Model + 'static> ReactLoop<M> {
             }
         }
 
+        // Small models drift on long tool chains: restate the task transiently
+        // (never persisted) once it has scrolled far behind the latest results.
+        if self.conversation.tier() == crate::model::ModelTier::Small
+            && let Some(reminder) = goal_reminder(&messages)
+        {
+            messages.push(ModelMessage {
+                role: crate::model::ModelRole::User,
+                content: reminder,
+                ..Default::default()
+            });
+        }
+
         messages
     }
 
@@ -1887,6 +1921,28 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_reminder_only_when_task_is_far_behind_a_tool_result() {
+        let msg = |role, content: &str| ModelMessage {
+            role,
+            content: content.to_string(),
+            ..Default::default()
+        };
+        let mut msgs = vec![
+            msg(ModelRole::System, "sys"),
+            msg(ModelRole::User, "rename foo"),
+        ];
+        for _ in 0..5 {
+            msgs.push(msg(ModelRole::Assistant, "a"));
+            msgs.push(msg(ModelRole::Tool, "t"));
+        }
+        let r = goal_reminder(&msgs).expect("reminder");
+        assert!(r.contains("rename foo"));
+        msgs.push(msg(ModelRole::Assistant, "done"));
+        assert!(goal_reminder(&msgs).is_none());
+        assert!(goal_reminder(&msgs[..4]).is_none());
+    }
     use crate::context::cap::ContextCap;
     use crate::model::mock::MockModel;
     use crate::tool::tool_trait::{Tool, ToolError, ToolExecutionResult, ToolSpec};

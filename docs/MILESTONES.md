@@ -1110,6 +1110,14 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | M36 | ✅ Split the two monoliths with **no behaviour change**. `src/main.rs` (~3.8k lines) → thin entrypoint + `src/commands/` modules (`doctor`, `sessions`, `stats_export_replay`, `models`, `trust`, `init`) and run-mode modules (`interactive`, `headless`, `acp`, `rpc`, `rpc_ws`) plus shared wiring (`build_active_model`, `build_policy`, `build_hooks`, MCP/skill/memory registration). `src/harness/react.rs` (~3.2k lines) → `harness/react/` (`mod.rs` loop + config, `dispatch.rs` serial tool execution, `parallel.rs` parallel read batch, `authorize.rs` policy/hooks/approval, `budget.rs` cost and expensive-call checks, `compaction_glue.rs`). | Pure moves: public API (`okeanos::harness::ReactLoop`, etc.) re-exported unchanged; no new deps; `cargo fmt`, `clippy -D warnings` and the full test suite must pass identically before and after, with tests moved beside their code. Do it in small commits (one module per commit) so each is reviewable. Patch bump (`0.x.y`), since nothing user-facing changes. |
 | M37 | **⏸ Deferred (revisit if Windows users ask for it): Windows sandbox spike → opt-in backend.** Rationale: green real-process tests only prove the attacks we thought of, a half-trusted native sandbox can give false confidence, and WSL2/containers already give Windows users the bwrap sandbox. Until then Windows `run` is guarded by approvals and path checks only, and `doctor`/the refusal message say so. Design kept below for later. Phase 1 (time-boxed spike): prototype a `Sandbox` impl for Windows behind the existing trait, using a restricted token (disabled SIDs, low integrity level) + the existing Job Object, and/or AppContainer with explicit ACL grants on the workspace roots. Phase 2 (only if the spike passes): ship it as an opt-in backend for `permissions.sandbox = "read-only" \| "workspace-write"`, with `doctor` reporting availability. | **Exit criteria for the spike** (real child processes on `windows-latest`, no mocks): writes outside the workspace roots fail; writes inside succeed; `.git`/`.env*` stay read-only; network is blocked unless `sandbox_network = true`; the process tree dies with the job. If any fails or ACL grants are flaky/leave residue, abandon: keep today's "refuse to run" behaviour and document WSL/container as the Windows path. Unsafe FFI confined to one module (`src/tool/sandbox/windows.rs`) with `// SAFETY:` comments and RAII handle wrappers. Minor bump if shipped; no bump if abandoned. |
 
+### Weak-model support milestone (M38)
+
+Goal: make the harness do the work a less capable model cannot (no "escalate to a stronger model" path — the target user has none).
+
+| Milestone | Deliverable | Notes |
+|-----------|-------------|-------|
+| M38 | FR-55…FR-61: (1) one source of truth for tier tools/prompts (dead `TierConfig` duplicates removed; prompts tool-agnostic and tier-specific; small prompt gets worked examples); (2) small tier gains `grep`/`glob` and a single-format `edit` schema; (3) fuzzy `str_replace` + closest-match hint; (4) schema-checked, actionable argument errors for native and text calls; (5) optional post-edit verification (`[verify]`); (6) oscillation/repeated-failure stall detection; (7) goal pinning for small tier; (8) window-scaled compaction budgets + per-tier tool output caps. | Minor bump (`0.26.0`): small-tier tool set and prompts change; new optional `[verify]` config. **Future (M39, not in scope):** snapshot → verify → rollback → retry loop using git snapshots, candidate sampling gated by the verifier, per-model (not just per-tier) overrides, a per-model eval baseline suite. |
+
 ---
 
 ## Milestone summary table
@@ -1162,6 +1170,7 @@ Compared against Codex (Seatbelt/bwrap/Landlock/restricted tokens, approval × s
 | 35 | MCP OAuth (Streamable HTTP) | 2 | M32a |
 | 36 | ✅ Split `main.rs` / `react.rs` (no behaviour change) | 2–3 | — |
 | 37 | ⏸ Deferred: Windows sandbox spike (opt-in backend if it passes) | 2–3 | M30 |
+| 38 | Weak-model support (tier cleanup, forgiving edits, verify, stall detection, goal pinning) | 3 | M3, M7, M11, M18 |
 
 ---
 
@@ -1218,6 +1227,7 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M35 MCP OAuth | `0.25.0` | ✅ Complete. Minor bump: `okeanos mcp login/logout`, OAuth for Streamable HTTP MCP servers. |
 | M36 Monolith split | patch bump | Planned, next up. Refactor only; no user-visible change. |
 | M37 Windows sandbox spike | minor bump if shipped | Deferred; spike with explicit abandon criteria if revived. |
+| M38 Weak-model support | `0.26.0` | Complete. Minor bump: small tier gains `grep`/`glob`; prompts change; optional `[verify]` config. |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 

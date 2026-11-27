@@ -29,7 +29,7 @@ impl EditFormat {
         match tier {
             crate::model::ModelTier::Frontier => EditFormat::Diff,
             crate::model::ModelTier::Mid => EditFormat::Diff,
-            crate::model::ModelTier::Small => EditFormat::WholeFile,
+            crate::model::ModelTier::Small => EditFormat::StrReplace,
         }
     }
 }
@@ -63,12 +63,15 @@ enum EditOp {
 pub struct EditTool {
     /// The edit format to use (can be overridden per invocation via args)
     default_format: EditFormat,
+    /// Advertise only the fields of `default_format` (one format, no `oneOf`).
+    simple_schema: bool,
 }
 
 impl EditTool {
     pub fn new() -> Self {
         Self {
             default_format: EditFormat::Diff,
+            simple_schema: false,
         }
     }
 
@@ -76,13 +79,65 @@ impl EditTool {
     pub fn with_format(format: EditFormat) -> Self {
         Self {
             default_format: format,
+            simple_schema: false,
         }
+    }
+
+    /// Advertise a minimal schema for `format` (for weaker models): only that format's
+    /// fields, no `format` selector, no `oneOf`. Other formats are still accepted.
+    pub fn simplified(mut self) -> Self {
+        self.simple_schema = true;
+        self
+    }
+
+    fn simple_spec(&self) -> ToolSpec {
+        let (description, properties, required) = match self.default_format {
+            EditFormat::StrReplace => (
+                "Replace text in a file. `old_str` must match one place in the file; copy it \
+                 exactly from the file (include a few surrounding lines if it is not unique).",
+                serde_json::json!({
+                    "path": {"type": "string", "description": "Path to the file."},
+                    "old_str": {"type": "string", "description": "Exact text to replace."},
+                    "new_str": {"type": "string", "description": "Replacement text."}
+                }),
+                serde_json::json!(["path", "old_str", "new_str"]),
+            ),
+            EditFormat::WholeFile => (
+                "Overwrite a file with new content. `content` is the complete new file.",
+                serde_json::json!({
+                    "path": {"type": "string", "description": "Path to the file."},
+                    "content": {"type": "string", "description": "Complete new file content."}
+                }),
+                serde_json::json!(["path", "content"]),
+            ),
+            EditFormat::Diff => (
+                "Edit a file with a unified diff. `content` is the diff with @@ hunk headers.",
+                serde_json::json!({
+                    "path": {"type": "string", "description": "Path to the file."},
+                    "content": {"type": "string", "description": "Unified diff."}
+                }),
+                serde_json::json!(["path", "content"]),
+            ),
+        };
+        ToolSpec::new(
+            "edit",
+            description,
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }),
+        )
+        .with_category(crate::tool::tool_trait::ToolCategory::Write)
     }
 }
 
 #[async_trait]
 impl Tool for EditTool {
     fn spec(&self) -> ToolSpec {
+        if self.simple_schema {
+            return self.simple_spec();
+        }
         ToolSpec::new(
             "edit",
             "Edit a file using diff/patch, whole-file replacement, or string replace.",
@@ -199,11 +254,14 @@ impl Tool for EditTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("read task failed: {e}")))??;
 
         // Apply the edit with preflight validation
+        let mut fuzzy = false;
         let new_content = match &op {
             EditOp::Diff(patch) => apply_diff_with_validation(&original_content, patch)?,
             EditOp::WholeFile(content) => content.clone(),
             EditOp::StrReplace { old_str, new_str } => {
-                apply_str_replace(&original_content, old_str, new_str)?
+                let (content, used_fuzzy) = replace_forgiving(&original_content, old_str, new_str)?;
+                fuzzy = used_fuzzy;
+                content
             }
         };
 
@@ -221,12 +279,15 @@ impl Tool for EditTool {
             ToolError::ExecutionFailed(format!("failed to write '{}': {e}", path.display()))
         })?;
 
-        let output = format!(
+        let mut output = format!(
             "Edited {} ({} -> {} bytes)",
             path.display(),
             original_content.len(),
             new_content.len()
         );
+        if fuzzy {
+            output.push_str("; old_str matched ignoring whitespace differences");
+        }
         let (output, truncated) = truncate_output(&output, MAX_OUTPUT_BYTES);
 
         Ok(ToolExecutionResult {
@@ -459,28 +520,142 @@ fn apply_diff<'a>(original: &str, hunks: &[DiffHunk<'a>]) -> Result<String, Tool
 }
 
 /// Apply string replace (find old_str, replace with new_str).
-fn apply_str_replace(original: &str, old_str: &str, new_str: &str) -> Result<String, ToolError> {
+/// Replace `old_str` with `new_str`, tolerating whitespace differences.
+///
+/// 1. Exact unique match.
+/// 2. Otherwise a unique line-wise match ignoring leading/trailing whitespace
+///    (the replacement is re-indented to the file's indentation).
+///
+/// Returns the new content and whether the forgiving match was used. On failure the
+/// error shows where the match is ambiguous or the closest region of the file.
+fn replace_forgiving(
+    original: &str,
+    old_str: &str,
+    new_str: &str,
+) -> Result<(String, bool), ToolError> {
     if old_str.is_empty() {
         return Err(ToolError::InvalidArgs("old_str cannot be empty".into()));
     }
 
-    if !original.contains(old_str) {
-        return Err(ToolError::InvalidArgs(format!(
-            "old_str not found in file: {:?}",
-            old_str.chars().take(100).collect::<String>()
-        )));
+    let exact: Vec<usize> = original.match_indices(old_str).map(|(i, _)| i).collect();
+    match exact.len() {
+        1 => return Ok((original.replacen(old_str, new_str, 1), false)),
+        n if n > 1 => {
+            let lines: Vec<String> = exact
+                .iter()
+                .map(|&i| (original[..i].matches('\n').count() + 1).to_string())
+                .collect();
+            return Err(ToolError::InvalidArgs(format!(
+                "old_str matches {n} times (at lines {}); replacement would be ambiguous. \
+                 Include more surrounding lines in old_str to make it unique.",
+                lines.join(", ")
+            )));
+        }
+        _ => {}
     }
 
-    // Count occurrences to ensure unambiguous replacement
-    let count = original.match_indices(old_str).count();
-    if count > 1 {
-        return Err(ToolError::InvalidArgs(format!(
-            "old_str matches {} times in file; replacement would be ambiguous",
-            count
-        )));
+    let file_lines: Vec<&str> = original.split_inclusive('\n').collect();
+    let old_lines: Vec<&str> = old_str.trim_matches('\n').lines().collect();
+    let m = old_lines.len();
+    if m == 0 || m > file_lines.len() {
+        return Err(not_found_error(&file_lines, &old_lines));
     }
 
-    Ok(original.replace(old_str, new_str))
+    let matches: Vec<usize> = (0..=file_lines.len() - m)
+        .filter(|&s| (0..m).all(|k| file_lines[s + k].trim() == old_lines[k].trim()))
+        .collect();
+    match matches.len() {
+        0 => Err(not_found_error(&file_lines, &old_lines)),
+        1 => {
+            let s = matches[0];
+            let file_indent = leading_ws(file_lines[s]);
+            let old_indent = leading_ws(old_lines[0]);
+            let mut replacement = reindent(new_str.trim_matches('\n'), old_indent, file_indent);
+            let last_had_newline = file_lines[s + m - 1].ends_with('\n');
+            if !replacement.is_empty() && last_had_newline {
+                replacement.push('\n');
+            }
+            let mut out = String::with_capacity(original.len() + replacement.len());
+            out.extend(file_lines[..s].iter().copied());
+            out.push_str(&replacement);
+            out.extend(file_lines[s + m..].iter().copied());
+            Ok((out, true))
+        }
+        n => {
+            let at: Vec<String> = matches.iter().map(|s| (s + 1).to_string()).collect();
+            Err(ToolError::InvalidArgs(format!(
+                "old_str matches {n} places ignoring whitespace (starting at lines {}); \
+                 replacement would be ambiguous. Include more surrounding lines.",
+                at.join(", ")
+            )))
+        }
+    }
+}
+
+fn leading_ws(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// Swap the `from` indentation prefix for `to` on every line that has it.
+fn reindent(text: &str, from: &str, to: &str) -> String {
+    if from == to {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|l| match l.strip_prefix(from) {
+            Some(rest) => format!("{to}{rest}"),
+            None => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Error for a failed match, showing the file region most similar to `old_lines`.
+fn not_found_error(file_lines: &[&str], old_lines: &[&str]) -> ToolError {
+    let mut msg = String::from("old_str not found in file.");
+    let m = old_lines.len();
+    if m > 0 && m <= file_lines.len() {
+        let mut best: Option<(f32, usize)> = None;
+        for s in 0..=file_lines.len() - m {
+            let score: f32 = (0..m)
+                .map(|k| line_similarity(file_lines[s + k], old_lines[k]))
+                .sum();
+            if best.is_none_or(|(b, _)| score > b) {
+                best = Some((score, s));
+            }
+        }
+        if let Some((score, s)) = best
+            && score / m as f32 >= 0.4
+        {
+            let end = (s + m).min(file_lines.len());
+            msg.push_str(&format!(
+                " Closest region in the file (lines {}-{}); copy old_str from it exactly:\n",
+                s + 1,
+                end
+            ));
+            for (i, l) in file_lines[s..end].iter().take(15).enumerate() {
+                msg.push_str(&format!("{}: {}\n", s + i + 1, l.trim_end_matches('\n')));
+            }
+            return ToolError::InvalidArgs(msg.trim_end().to_string());
+        }
+    }
+    msg.push_str(" Read the file again and copy the exact text you want to replace.");
+    ToolError::InvalidArgs(msg)
+}
+
+/// Jaccard similarity of whitespace-separated tokens (1.0 when equal ignoring whitespace).
+fn line_similarity(a: &str, b: &str) -> f32 {
+    let (a, b) = (a.trim(), b.trim());
+    if a == b {
+        return 1.0;
+    }
+    let ta: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let tb: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    let union = ta.union(&tb).count();
+    if union == 0 {
+        return 0.0;
+    }
+    ta.intersection(&tb).count() as f32 / union as f32
 }
 
 #[cfg(test)]
@@ -830,8 +1005,55 @@ mod tests {
         );
         assert_eq!(
             EditFormat::default_for_tier(crate::model::ModelTier::Small),
-            EditFormat::WholeFile
+            EditFormat::StrReplace
         );
+    }
+
+    #[test]
+    fn str_replace_matches_ignoring_whitespace_and_reindents() {
+        let file = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
+        // Model dropped the indentation and added trailing spaces.
+        let (out, fuzzy) =
+            replace_forgiving(file, "let x = 1;  \nlet y = 2;", "let x = 10;\nlet y = 20;")
+                .unwrap();
+        assert!(fuzzy);
+        assert_eq!(out, "fn a() {\n    let x = 10;\n    let y = 20;\n}\n");
+    }
+
+    #[test]
+    fn str_replace_ambiguous_lists_lines() {
+        let err = replace_forgiving("a\nb\na\n", "a", "c")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lines 1, 3"), "{err}");
+        let err = replace_forgiving("  a\nb\n a\n", "a ", "c")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn str_replace_not_found_shows_closest_region() {
+        let file = "one\nfn compute(total: u32) -> u32 {\n    total + 1\n}\n";
+        let err = replace_forgiving(file, "fn compute(count: u32) -> u32 {", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Closest region"), "{err}");
+        assert!(err.contains("2: fn compute(total: u32)"), "{err}");
+        let err = replace_forgiving(file, "zzz qqq", "x")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("Closest region"), "{err}");
+    }
+
+    #[test]
+    fn simplified_schema_has_one_format_and_no_one_of() {
+        let spec = EditTool::with_format(EditFormat::StrReplace)
+            .simplified()
+            .spec();
+        let props = spec.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("old_str") && !props.contains_key("format"));
+        assert!(spec.input_schema.get("oneOf").is_none());
     }
 
     #[tokio::test]

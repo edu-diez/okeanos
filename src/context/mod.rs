@@ -30,7 +30,7 @@ pub use selective::{
     IncludedFile, SelectiveContextConfig, SelectiveContextError, build_file_context,
     expand_mentions, find_relevant_files,
 };
-pub use tier::{TierConfig, tool_subsets};
+pub use tier::TierConfig;
 pub use tokens::{
     CostEstimate, ModelPricing, PricingProvider, TokenCounter, default_pricing_table, estimate_cost,
 };

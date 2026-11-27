@@ -349,6 +349,16 @@ These gaps are tracked in MILESTONES.md Technical Debt section and will be resol
 3. **Compaction:** instructions/memory live in the system prompt, outside the compactable history, so they are re-sent verbatim after every compaction and never summarised away.
 4. **Write:** `remember` → `Policy::check` (approval) → write `<scope dir>/<slug>.md` + upsert the index line. Takes effect next session.
 5. **Out of scope (deferred):** sub-agent inheritance of instructions/memory, background memory extraction/consolidation, session titles/search, `--continue`, dedicated todo-state log events.
+## Weak-model support (M38)
+
+- **Tier source of truth:** `tool::builtin_registry(tier, …)` decides tools; `context::tier::TierConfig` only carries generation params, selective-context limits, thinking replay and the per-tier tool output cap. Prompts under `assets/prompts/` are style/rules only (no tool lists).
+- **Edit forgiveness:** `tool/builtin/edit.rs` — exact match → whitespace-insensitive line match (unique only) → closest-region hint on failure.
+- **Argument checking:** `harness/react/dispatch.rs` validates args against the tool schema before execute (`tool::schema_check`), producing field-level errors with an example call.
+- **Verification:** `harness/react/verify.rs` runs `[verify].command` after successful write/edit and appends a bounded summary.
+- **Stall detection:** `harness/react/dispatch.rs` keeps a short window of call signatures + failure classes (oscillation, repeated failure) on top of the identical-call check.
+- **Goal pin:** `harness/react/mod.rs` appends a transient reminder message to the request (not persisted) for the small tier.
+- **Compaction scaling:** `CompactionConfig::scaled_for_window(window)` clamps token budgets to window fractions.
+
 ## Observability, tracing and evals
 
 - **Logs** go to stderr (never stdout); in TUI mode only to `OKEANOS_LOG_FILE`.

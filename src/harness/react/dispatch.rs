@@ -1,5 +1,24 @@
 use super::*;
 
+/// Error text for a call to a tool that is not registered: lists what is available
+/// and suggests the closest name (weak models often misspell or invent tools).
+pub(super) fn unknown_tool_message(name: &str, tools: &ToolRegistry) -> String {
+    let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
+    let lower = name.to_ascii_lowercase();
+    let suggestion = names
+        .iter()
+        .find(|n| {
+            let n = n.to_ascii_lowercase();
+            n == lower || lower.contains(&n) || n.contains(&lower)
+        })
+        .map(|n| format!(" Did you mean `{n}`?"))
+        .unwrap_or_default();
+    format!(
+        "unknown tool: {name}.{suggestion} Available tools: {}",
+        names.join(", ")
+    )
+}
+
 impl<M: Model + 'static> ReactLoop<M> {
     /// Execute a tool call, gated by the permission policy.
     ///
@@ -24,8 +43,14 @@ impl<M: Model + 'static> ReactLoop<M> {
         let tool = self
             .tools
             .get(&tool_call.name)
-            .ok_or_else(|| ReactError::Tool(format!("unknown tool: {}", tool_call.name)))?;
+            .ok_or_else(|| ReactError::Tool(unknown_tool_message(&tool_call.name, &self.tools)))?;
         let spec = tool.spec();
+
+        // Coerce near-miss arguments and turn the rest into actionable errors
+        // before anything (cache, approval, snapshot) sees the call.
+        let mut tool_call = tool_call;
+        crate::tool::schema_check::check_args(&spec, &mut tool_call.args)
+            .map_err(ReactError::Tool)?;
 
         // Check tool result cache for idempotent tools (read, grep) before policy/cost checks.
         // This avoids unnecessary approval prompts and cost checks for cached results.
@@ -59,7 +84,6 @@ impl<M: Model + 'static> ReactLoop<M> {
         }
 
         // Hooks, then the permission policy (and approval when required).
-        let mut tool_call = tool_call;
         self.authorize(&mut tool_call, &spec).await?;
 
         // Check expensive call confirmation before executing the tool.
@@ -170,7 +194,15 @@ impl<M: Model + 'static> ReactLoop<M> {
         exec_result: crate::tool::tool_trait::ToolExecutionResult,
         duration_ms: u64,
     ) -> ToolResult {
-        let result = tool_result_from_exec(&tool_call, exec_result.clone(), duration_ms);
+        let mut result = tool_result_from_exec(&tool_call, exec_result.clone(), duration_ms);
+
+        // Weaker tiers get a tighter per-result budget (never larger than the tool's own cap).
+        let cap = self.conversation.tool_output_cap();
+        if result.output.len() > cap {
+            let (text, _) = crate::tool::builtin::truncate_output_with_spill(&result.output, cap);
+            result.output = text;
+            result.truncated = true;
+        }
 
         // Store result in cache for idempotent tools (read, grep).
         if let Some(cache) = &mut self.tool_cache {
@@ -234,10 +266,32 @@ impl<M: Model + 'static> ReactLoop<M> {
         if let Ok(result) = &outcome {
             span.record("ok", result.ok);
         }
-        match outcome {
-            Err(ReactError::Tool(msg)) => Ok(self.error_tool_result(&tool_call, msg).await),
-            other => other,
+        let mut result = match outcome {
+            Err(ReactError::Tool(msg)) => self.error_tool_result(&tool_call, msg).await,
+            Ok(result) => result,
+            Err(e) => return Err(e),
+        };
+        match self
+            .stall
+            .observe_result(&result.name, result.ok, &result.output)
+        {
+            Verdict::Stop(reason) => return Err(ReactError::Stopped { reason }),
+            Verdict::Nudge(hint) => result.output.push_str(&format!("\n\n[hint] {hint}")),
+            Verdict::Continue => {}
         }
+        if result.ok
+            && matches!(result.name.as_str(), "write" | "edit")
+            && let Some(cfg) = &self.verify
+            && cfg.applies_to(self.conversation.tier())
+        {
+            let cwd = self
+                .project_root
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let note = verify::run(cfg, &cwd).await;
+            result.output.push_str(&format!("\n\n{note}"));
+        }
+        Ok(result)
     }
 
     /// Build an error tool result and emit the Error status event.
@@ -274,37 +328,11 @@ impl<M: Model + 'static> ReactLoop<M> {
         &mut self,
         tool_call: &ToolCall,
     ) -> Result<Option<ToolResult>, ReactError> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        tool_call.name.hash(&mut hasher);
-        tool_call.args.to_string().hash(&mut hasher);
-        let sig = hasher.finish();
-
-        if self.last_call_sig == Some(sig) {
-            self.repeat_count += 1;
-        } else {
-            self.last_call_sig = Some(sig);
-            self.repeat_count = 1;
+        match self.stall.observe_call(&tool_call.name, &tool_call.args) {
+            Verdict::Stop(reason) => Err(ReactError::Stopped { reason }),
+            Verdict::Nudge(msg) => Ok(Some(self.error_tool_result(tool_call, msg).await)),
+            Verdict::Continue => Ok(None),
         }
-
-        if self.repeat_count >= DOOM_LOOP_STOP {
-            return Err(ReactError::Stopped {
-                reason: format!(
-                    "repeated identical `{}` call {} times without progress",
-                    tool_call.name, self.repeat_count
-                ),
-            });
-        }
-        if self.repeat_count >= DOOM_LOOP_WARN {
-            let msg = format!(
-                "this exact `{}` call was already made {} times with the same arguments. \
-                 Do not repeat it; change your approach or finish.",
-                tool_call.name,
-                self.repeat_count - 1
-            );
-            return Ok(Some(self.error_tool_result(tool_call, msg).await));
-        }
-        Ok(None)
     }
 
     /// Execute all tool calls of an assistant turn in order, running runs of

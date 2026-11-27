@@ -542,14 +542,14 @@ impl Conversation {
         result
     }
 
-    /// Check if a tool is allowed for this conversation's tier.
-    pub fn allows_tool(&self, tool_name: &str) -> bool {
-        self.tier_config.allows_tool(tool_name)
+    /// Maximum tool result bytes shown to the model for this tier.
+    pub fn tool_output_cap(&self) -> usize {
+        self.tier_config.tool_output_cap
     }
 
-    /// Get allowed tool names for this tier.
-    pub fn allowed_tools(&self) -> Vec<String> {
-        self.tier_config.allowed_tool_names()
+    /// Model tier of this conversation.
+    pub fn tier(&self) -> ModelTier {
+        self.tier_config.tier
     }
 
     /// Get generation parameters for this tier.
@@ -649,11 +649,7 @@ pub fn build_system_prompt_with_context(
     Ok(prompt)
 }
 fn system_prompt_for_tier(tier: ModelTier) -> &'static str {
-    match tier {
-        ModelTier::Small => include_str!("../../assets/prompts/small_system_prompt.txt"),
-        ModelTier::Mid => include_str!("../../assets/prompts/mid_system_prompt.txt"),
-        ModelTier::Frontier => include_str!("../../assets/prompts/frontier_system_prompt.txt"),
-    }
+    crate::model::system_prompt_template(tier)
 }
 
 /// Get current Unix timestamp in milliseconds.

@@ -251,6 +251,9 @@ pub struct Config {
     pub snapshots: Option<SnapshotsSection>,
     #[serde(default)]
     pub compaction: Option<CompactionSection>,
+    /// Post-edit verification command (user-trusted; ignored in untrusted project config).
+    #[serde(default)]
+    pub verify: Option<VerifySection>,
     #[serde(default)]
     pub mcp: Option<McpSection>,
     #[serde(default)]
@@ -295,6 +298,7 @@ impl std::fmt::Debug for Config {
             .field("ui", &self.ui)
             .field("snapshots", &self.snapshots)
             .field("compaction", &self.compaction)
+            .field("verify", &self.verify)
             .field("mcp", &self.mcp)
             .field("rotation", &self.rotation)
             .field("tool_cache", &self.tool_cache)
@@ -432,6 +436,17 @@ pub struct UiSection {
 pub struct SnapshotsSection {
     /// Enable git snapshots (default: false - opt-in)
     pub enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct VerifySection {
+    /// Shell command run in the project root after each successful write/edit
+    /// (e.g. "cargo check --quiet"). Its pass/fail tail is shown to the model.
+    pub command: Option<String>,
+    /// Timeout in seconds (default: 60)
+    pub timeout_secs: Option<u64>,
+    /// Model tiers it applies to: "small", "mid", "frontier" (default: ["small"])
+    pub tiers: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -907,6 +922,22 @@ impl Config {
                     "model.reasoning must be 'off', 'low', 'medium', or 'high', got '{r}'"
                 ),
             });
+        }
+
+        // Validate verify section
+        if let Some(verify) = &self.verify {
+            if verify.timeout_secs == Some(0) {
+                return Err(ConfigError::Validation {
+                    message: "verify.timeout_secs must be > 0".to_string(),
+                });
+            }
+            for t in verify.tiers.iter().flatten() {
+                if !matches!(t.as_str(), "small" | "mid" | "frontier") {
+                    return Err(ConfigError::Validation {
+                        message: format!("verify.tiers: unknown tier '{t}'"),
+                    });
+                }
+            }
         }
 
         // Validate compaction section

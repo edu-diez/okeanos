@@ -184,6 +184,7 @@ pub(crate) async fn acp_new_session(
         .with_compaction(okeanos::context::CompactionConfig::from_section(
             config.compaction.as_ref(),
         ))
+        .with_verify(config.verify.as_ref())
         .with_agent_registry(agent_registry);
     if let Some(summarizer) = build_summarizer(config) {
         loop_ = loop_.with_summarizer_model(summarizer);

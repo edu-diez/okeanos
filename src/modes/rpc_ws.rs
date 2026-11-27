@@ -306,6 +306,7 @@ pub(crate) async fn run_rpc_ws(
         .with_compaction(okeanos::context::CompactionConfig::from_section(
             config.compaction.as_ref(),
         ))
+        .with_verify(config.verify.as_ref())
         .with_agent_registry(agent_registry.clone());
 
     if let Some(summarizer) = build_summarizer(config) {

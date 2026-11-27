@@ -256,7 +256,7 @@ pub fn default_capabilities_for_tier(tier: ModelTier) -> crate::model::ModelCapa
             temperature_supported: true,
             vision: false,
             tier: ModelTier::Small,
-            edit_format: EditFormat::WholeFile,
+            edit_format: EditFormat::StrReplace,
         },
         ModelTier::Mid => ModelCapabilities {
             tool_calling: true,

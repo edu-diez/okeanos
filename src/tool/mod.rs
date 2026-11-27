@@ -7,6 +7,7 @@ pub mod builtin;
 pub mod cache;
 pub mod run_env;
 pub mod sandbox;
+pub mod schema_check;
 pub mod tier;
 pub mod todo;
 pub mod tool_trait;

@@ -100,6 +100,20 @@ impl Default for CompactionConfig {
 }
 
 impl CompactionConfig {
+    /// Clamp the token budgets to fractions of the context window so the
+    /// 40k/15k defaults don't swallow a 32k window (compaction would never
+    /// free anything).
+    pub fn scaled_for_window(mut self, window: usize) -> Self {
+        if window == 0 {
+            return self;
+        }
+        self.reserve_tokens = self.reserve_tokens.min(window / 4);
+        self.preserve_recent_tokens = self.preserve_recent_tokens.min(window / 5);
+        self.prune_protect_tokens = self.prune_protect_tokens.min(window / 5);
+        self.prune_min_savings_tokens = self.prune_min_savings_tokens.min(window / 10);
+        self
+    }
+
     /// Build the runtime config from the (optional) `[compaction]` config section.
     pub fn from_section(section: Option<&crate::config::CompactionSection>) -> Self {
         let mut c = Self::default();
@@ -1149,6 +1163,18 @@ mod tests {
     use super::*;
     use crate::context::Conversation;
     use crate::context::cap::ContextCap;
+
+    #[test]
+    fn scaled_for_window_clamps_budgets_on_small_windows() {
+        let c = CompactionConfig::default().scaled_for_window(32_000);
+        assert_eq!(c.reserve_tokens, 8_000);
+        assert_eq!(c.preserve_recent_tokens, 6_400);
+        assert_eq!(c.prune_protect_tokens, 6_400);
+        assert_eq!(c.prune_min_savings_tokens, 3_200);
+        let big = CompactionConfig::default().scaled_for_window(1_000_000);
+        assert_eq!(big.preserve_recent_tokens, 15_000);
+        assert_eq!(big.prune_protect_tokens, 40_000);
+    }
     use crate::events::{ToolCall, ToolCallStatus};
     use crate::model::MockModel;
 
