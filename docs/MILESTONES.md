@@ -1116,7 +1116,22 @@ Goal: make the harness do the work a less capable model cannot (no "escalate to 
 
 | Milestone | Deliverable | Notes |
 |-----------|-------------|-------|
-| M38 | FR-55…FR-61: (1) one source of truth for tier tools/prompts (dead `TierConfig` duplicates removed; prompts tool-agnostic and tier-specific; small prompt gets worked examples); (2) small tier gains `grep`/`glob` and a single-format `edit` schema; (3) fuzzy `str_replace` + closest-match hint; (4) schema-checked, actionable argument errors for native and text calls; (5) optional post-edit verification (`[verify]`); (6) oscillation/repeated-failure stall detection; (7) goal pinning for small tier; (8) window-scaled compaction budgets + per-tier tool output caps. | Minor bump (`0.26.0`): small-tier tool set and prompts change; new optional `[verify]` config. **Future (M39, not in scope):** snapshot → verify → rollback → retry loop using git snapshots, candidate sampling gated by the verifier, per-model (not just per-tier) overrides, a per-model eval baseline suite. |
+| M38 | ✅ FR-55…FR-61: (1) one source of truth for tier tools/prompts (dead `TierConfig` duplicates removed; prompts tool-agnostic and tier-specific; small prompt gets worked examples); (2) small tier gains `grep`/`glob` and a single-format `edit` schema; (3) fuzzy `str_replace` + closest-match hint; (4) schema-checked, actionable argument errors for native and text calls; (5) optional post-edit verification (`[verify]`); (6) oscillation/repeated-failure stall detection; (7) goal pinning for small tier; (8) window-scaled compaction budgets + per-tier tool output caps. | Minor bump (`0.26.0`): small-tier tool set and prompts change; new optional `[verify]` config. Follow-up work is specified in M39 below. |
+
+### Weak-model support, part 2 (M39)
+
+Goal: use the git snapshots (M13), the verify hook (M38) and the eval harness (M19) so the harness can *check* a weak model's work and recover from its mistakes, and so behaviour is tuned per model rather than only per size tier. Still no dependency on a stronger model.
+
+| Milestone | Deliverable | Notes |
+|-----------|-------------|-------|
+| M39a | **Verified retry (FR-62):** `[verify] on_fail = "report" \| "retry"` (default `report`, today's behaviour). With `retry`, when verification fails `retry_after` times (default 2) in a row on the same task, the files changed since the last good point are restored from the snapshot store and the model gets a single message: what was reverted, the last failing output (bounded) and "choose a different approach". At most `max_rollbacks` (default 2) per user turn, then the loop stops with a clear reason. Requires snapshots enabled; otherwise falls back to `report` and `doctor` warns. | Reuses `SnapshotStore`; rollback touches only files the agent changed this turn (never user edits made before the turn). Every rollback is emitted as an event and shown in the UI/transcript. |
+| M39b | **Verifier-gated candidates (FR-63):** `[verify] candidates = k` (default 1 = off, max 5). After a failed verification the harness asks the model for up to `k` alternative edits (higher temperature, same context + failure output), applies each in turn from the restored state and keeps the first that passes `verify`; if none passes it restores the pre-edit state and reports. | Only active with a verify command and snapshots; bounded by `max_iterations` and the cost budget; every candidate is logged. |
+| M39c | **Per-model overrides (FR-64):** `[models."<id>"]` (exact id, then glob) overriding tier, `edit_format`, `temperature`, `tool_output_cap`, `native_tools` (force text-tool mode), `max_parallel_tools` and `verify_tiers`. Precedence: CLI > `[models."<id>"]` > classifier > tier default. `okeanos models` shows the effective values and their source. | Validation rejects unknown keys; untrusted project config may not set them (they can only be user-level) except stricter values. |
+| M39d | **Per-model eval baselines (FR-65):** `okeanos eval --suite weak-model` runs a small fixed task set (rename across files, fix failing test, add function, multi-file edit, search-and-answer) against a model, records pass rate, tool-call validity, iterations, tokens and stalls to `.okeanos/evals/<model>.json`, and `--compare` flags regressions against the stored baseline. | Runs offline against a local fixture repo; the mock provider covers CI, real models are opt-in. Used to validate every other weak-model feature. |
+| M39e | **Behaviour-based tier adjustment (FR-66):** the loop tracks the tool-call validity rate (schema failures + unknown tools + stalls over total calls) per session. If it stays below a threshold after a minimum number of calls, the effective tier is lowered for the rest of the session (tools, prompt, caps, goal pinning) and the choice is stored in the model profile cache so the next session starts there. A one-line notice tells the user, who can pin the tier with config or `/tier`. | Never raises a tier automatically; explicit config always wins. |
+
+Suggested order: M39d first (to measure), then M39c, M39a, M39e, M39b.
+
 
 ---
 
@@ -1170,7 +1185,8 @@ Goal: make the harness do the work a less capable model cannot (no "escalate to 
 | 35 | MCP OAuth (Streamable HTTP) | 2 | M32a |
 | 36 | ✅ Split `main.rs` / `react.rs` (no behaviour change) | 2–3 | — |
 | 37 | ⏸ Deferred: Windows sandbox spike (opt-in backend if it passes) | 2–3 | M30 |
-| 38 | Weak-model support (tier cleanup, forgiving edits, verify, stall detection, goal pinning) | 3 | M3, M7, M11, M18 |
+| 38 | ✅ Weak-model support (tier cleanup, forgiving edits, verify, stall detection, goal pinning) | 3 | M3, M7, M11, M18 |
+| 39 | Weak-model support, part 2 (verified retry, candidates, per-model overrides, eval baselines, behaviour-based tiers) | 4–5 | M13, M19, M38 |
 
 ---
 
@@ -1227,7 +1243,8 @@ Since `0.y.z` means "any breaking change at any time" in Cargo semver, we stay i
 | M35 MCP OAuth | `0.25.0` | ✅ Complete. Minor bump: `okeanos mcp login/logout`, OAuth for Streamable HTTP MCP servers. |
 | M36 Monolith split | patch bump | Planned, next up. Refactor only; no user-visible change. |
 | M37 Windows sandbox spike | minor bump if shipped | Deferred; spike with explicit abandon criteria if revived. |
-| M38 Weak-model support | `0.26.0` | Complete. Minor bump: small tier gains `grep`/`glob`; prompts change; optional `[verify]` config. |
+| M38 Weak-model support | `0.26.0` | ✅ Complete. Minor bump: small tier gains `grep`/`glob`; prompts change; optional `[verify]` config. |
+| M39 Weak-model support, part 2 | `0.27.0` | Planned. Minor bump: `[verify] on_fail/candidates`, `[models."<id>"]` overrides, `okeanos eval --suite weak-model`, behaviour-based tier adjustment. |
 
 **If multiple milestones land in one release cycle**, combine into a single minor bump (e.g., M18+M19 together → `0.2.0`).
 
